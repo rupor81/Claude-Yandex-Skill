@@ -74,6 +74,10 @@ environment variable at server start, not per call. Profiles are declared in
 `~/.config/yandex-mcp/config.toml` and cover both personal Yandex ID and Yandex 360
 domain accounts.
 
+**Tool names.** All tools follow `<server>_<object>_<verb>`, with the object segment
+omitted only where the server itself is the object (`disk_info`, `calendar_list`,
+`mail_send`). Governed by AD-8 in the architecture spine.
+
 **Dates.** All timestamps are ISO 8601 with explicit offsets. Date-ranged tools take
 `start` and `end`.
 
@@ -87,12 +91,12 @@ an edge case.
 | ID | Tool | Purpose | Annotation |
 |---|---|---|---|
 | FR1.1 | `calendar_list` | List available calendars | read-only |
-| FR1.2 | `events_list` | Events over a date range, recurring series expanded into concrete occurrences | read-only |
-| FR1.3 | `event_get` | Full detail for one event or one occurrence | read-only |
-| FR1.4 | `freebusy_query` | Busy intervals over a date range across selected calendars | read-only |
-| FR1.5 | `event_create` | Create an event | write |
-| FR1.6 | `event_update` | Modify an event | destructive |
-| FR1.7 | `event_delete` | Remove an event | destructive |
+| FR1.2 | `calendar_events_list` | Events over a date range, recurring series expanded into concrete occurrences | read-only |
+| FR1.3 | `calendar_event_get` | Full detail for one event or one occurrence | read-only |
+| FR1.4 | `calendar_freebusy_query` | Busy intervals over a date range across selected calendars | read-only |
+| FR1.5 | `calendar_event_create` | Create an event | write |
+| FR1.6 | `calendar_event_update` | Modify an event | destructive |
+| FR1.7 | `calendar_event_delete` | Remove an event | destructive |
 
 **FR1.2** requires `start` and `end`. Each returned occurrence carries its own start and
 end, the series UID, and a `recurrence_id` when it belongs to a series, so callers can
@@ -123,8 +127,8 @@ The mailbox spans several years, so no tool defaults to scanning all history.
 | FR2.6 | `mail_flags_set` | Set or clear read and flagged states | write |
 | FR2.7 | `mail_draft_create` | Create a draft, optionally as a reply | write |
 | FR2.8 | `mail_send` | Send a message | destructive |
-| FR2.9 | `mail_move` | Move messages between folders | destructive |
-| FR2.10 | `mail_trash` | Move messages to Trash | destructive |
+| FR2.9 | `mail_messages_move` | Move messages between folders | destructive |
+| FR2.10 | `mail_messages_trash` | Move messages to Trash | destructive |
 
 **FR2.2** requires an explicit `start` and `end`; there is no all-history default.
 Date filtering uses IMAP `SINCE` and `BEFORE`, which are dependable. Text criteria are
@@ -155,15 +159,15 @@ than a crawl.
 | ID | Tool | Purpose | Annotation |
 |---|---|---|---|
 | FR3.1 | `disk_info` | Total and used space | read-only |
-| FR3.2 | `disk_list` | Contents of one folder | read-only |
-| FR3.3 | `disk_find` | Find files by name pattern or media type across the whole disk | read-only |
-| FR3.4 | `disk_metadata_get` | Metadata for one path | read-only |
-| FR3.5 | `disk_download` | Download a file to a local path | write (local) |
-| FR3.6 | `disk_upload` | Upload a local file | write |
-| FR3.7 | `disk_mkdir` | Create a folder | write |
-| FR3.8 | `disk_copy` | Copy a path | write |
-| FR3.9 | `disk_move` | Move or rename paths | destructive |
-| FR3.10 | `disk_trash` | Move paths to Trash | destructive |
+| FR3.2 | `disk_files_list` | Contents of one folder | read-only |
+| FR3.3 | `disk_files_find` | Find files by name pattern or media type across the whole disk | read-only |
+| FR3.4 | `disk_resource_get` | Metadata for one path | read-only |
+| FR3.5 | `disk_file_download` | Download a file to a local path | write (local) |
+| FR3.6 | `disk_file_upload` | Upload a local file | write |
+| FR3.7 | `disk_folder_create` | Create a folder | write |
+| FR3.8 | `disk_resource_copy` | Copy a path | write |
+| FR3.9 | `disk_resources_move` | Move or rename paths | destructive |
+| FR3.10 | `disk_resources_trash` | Move paths to Trash | destructive |
 
 **FR3.3** enumerates via the flat file listing and filters locally on name pattern and
 `media_type`. If enumeration is truncated, the result says so per NFR3.
