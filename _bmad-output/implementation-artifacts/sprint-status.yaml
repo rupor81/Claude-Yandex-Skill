@@ -1,0 +1,95 @@
+# generated: 2026-09-04
+# last_updated: 2026-09-04
+# project: Yandex-Skills
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: {project-root}/_bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog -> in-progress: Automatically when first story is created (via create-story)
+#   - in-progress -> done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+#
+# PROJECT-SPECIFIC ORDERING:
+# ==========================
+# Epics run strictly in order. Epic 2 depends on the shared core laid down in Epic 1;
+# Epic 3 depends on the OAuth flow built in story 2-1. Within each epic, read stories
+# precede write stories and carry no forward dependencies, so they are worked in
+# numeric order. Story 2-5 deliberately revisits the shared core once a second
+# protocol exists, and story 2-10 is the project's acceptance check.
+
+generated: 2026-09-04
+last_updated: 2026-09-04
+project: Yandex-Skills
+project_key: NOKEY
+tracking_system: file-system
+story_location: '{project-root}/_bmad-output/implementation-artifacts'
+
+development_status:
+  # Epic 1: Calendar connector, end to end
+  epic-1: backlog
+  1-1-connect-a-calendar-and-list-it: backlog
+  1-2-verify-a-configured-account: backlog
+  1-3-query-events-over-a-date-range: backlog
+  1-4-read-one-event-in-full: backlog
+  1-5-inspect-busy-time: backlog
+  1-6-create-an-event: backlog
+  1-7-update-an-event-with-an-explicit-scope: backlog
+  1-8-delete-an-event-with-an-explicit-scope: backlog
+  epic-1-retrospective: optional
+
+  # Epic 2: Mail connector, end to end
+  epic-2: backlog
+  2-1-authorise-the-mailbox-and-list-its-folders: backlog
+  2-2-list-message-headers-over-a-date-range: backlog
+  2-3-read-a-message-body-with-honest-truncation: backlog
+  2-4-inspect-and-download-attachments: backlog
+  2-5-correct-the-shared-core-against-a-second-protocol: backlog
+  2-6-set-message-flags: backlog
+  2-7-create-drafts-and-replies: backlog
+  2-8-send-a-message: backlog
+  2-9-move-and-trash-messages-in-bulk: backlog
+  2-10-answer-a-real-cross-service-question: backlog
+  epic-2-retrospective: optional
+
+  # Epic 3: Disk connector, end to end
+  epic-3: backlog
+  3-1-connect-disk-and-report-space: backlog
+  3-2-browse-a-folder: backlog
+  3-3-find-files-across-the-whole-disk: backlog
+  3-4-read-metadata-for-a-path: backlog
+  3-5-download-a-file: backlog
+  3-6-upload-a-file: backlog
+  3-7-create-folders-and-copy-paths: backlog
+  3-8-move-and-trash-paths-in-bulk: backlog
+  epic-3-retrospective: optional
