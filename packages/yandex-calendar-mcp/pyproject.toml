@@ -1,0 +1,16 @@
+[project]
+name = "yandex-calendar-mcp"
+version = "0.1.0"
+description = "MCP server exposing a Yandex calendar over CalDAV."
+requires-python = ">=3.13"
+dependencies = ["yandex-core", "caldav>=3.2", "anyio>=4", "mcp>=2"]
+
+[project.scripts]
+yandex-calendar-mcp = "yandex_calendar_mcp.server:main"
+
+[tool.uv.sources]
+yandex-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,16 @@
+[project]
+name = "yandex-mcp-cli"
+version = "0.1.0"
+description = "Setup and verification CLI for the Yandex MCP connectors."
+requires-python = ">=3.13"
+dependencies = ["yandex-core"]
+
+[project.scripts]
+yandex-mcp = "yandex_mcp_cli.main:main"
+
+[tool.uv.sources]
+yandex-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
