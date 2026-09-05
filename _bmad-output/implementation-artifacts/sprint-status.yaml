@@ -49,7 +49,7 @@
 # protocol exists, and story 2-10 is the project's acceptance check.
 
 generated: 2026-09-04
-last_updated: 2026-09-04
+last_updated: 2026-09-05
 project: Yandex-Skills
 project_key: NOKEY
 tracking_system: file-system
@@ -59,7 +59,7 @@ development_status:
   # Epic 1: Calendar connector, end to end
   epic-1: in-progress
   1-1-connect-a-calendar-and-list-it: review
-  1-2-verify-a-configured-account: backlog
+  1-2-verify-a-configured-account: review
   1-3-query-events-over-a-date-range: backlog
   1-4-read-one-event-in-full: backlog
   1-5-inspect-busy-time: backlog

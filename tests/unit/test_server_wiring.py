@@ -8,6 +8,7 @@ import pytest
 from caldav.lib import error as caldav_error
 from yandex_calendar_mcp import server as server_module
 from yandex_core.config import Profile
+from yandex_core.errors import AuthError, CredentialNotFound
 from mcp.server.mcpserver.exceptions import ToolError
 
 PROFILE = Profile(name="default", login="me@yandex.ru")
@@ -81,7 +82,10 @@ def test_a_missing_credential_surfaces_as_an_actionable_error(monkeypatch):
     with pytest.raises(ToolError) as caught:
         anyio.run(lambda: server.call_tool("calendar_list", {}))
     message = str(caught.value)
-    assert "AuthError" in message
+    # The name of the concrete taxonomy class -- an AuthError subclass for the
+    # "nothing stored" case -- is what tells the caller which family this is.
+    assert "CredentialNotFound" in message
+    assert issubclass(CredentialNotFound, AuthError)
     assert "yandex-mcp setup calendar" in message
 
 

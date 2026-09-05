@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_dir
-from .errors import AuthError
+from .errors import AuthError, CredentialNotFound
 
 __all__ = [
     "KEYRING_SERVICE",
@@ -25,6 +25,7 @@ __all__ = [
     "delete_secret",
     "secret_env_var",
     "redact_mapping",
+    "redact_secret",
 ]
 
 KEYRING_SERVICE = "yandex-mcp"
@@ -66,8 +67,10 @@ def get_secret(service: str, profile: str) -> str:
     """Return the stored app password for a service and profile.
 
     Raises:
-        AuthError: if nothing is stored anywhere. The message points at setup and
-            never contains a secret.
+        CredentialNotFound: if nothing is stored anywhere. The message points at
+            setup and never contains a secret.
+        AuthError: if something is stored but cannot be used -- a fallback file
+            other users can read. That is a repair, not a setup step.
     """
     from_env = (os.environ.get(secret_env_var(service, profile)) or "").strip()
     if from_env:
@@ -81,9 +84,9 @@ def get_secret(service: str, profile: str) -> str:
     if from_file:
         return from_file
 
-    raise AuthError(
-        f"No {service} app password stored for profile {profile!r}. "
-        + _SETUP_HINT.format(service=service)
+    reason = f"No {service} app password stored for profile {profile!r}."
+    raise CredentialNotFound(
+        f"{reason} " + _SETUP_HINT.format(service=service), reason=reason
     )
 
 
@@ -149,6 +152,19 @@ def redact_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
         else:
             cleaned[key] = value
     return cleaned
+
+
+def redact_secret(text: str, secret: str | None) -> str:
+    """Replace a known secret wherever it appears in text.
+
+    Nothing in this project puts a password into a message on purpose, but a
+    library below us can: a transport error that quotes the URL it dialled will
+    carry the credential if it was ever embedded there. Rendering an error
+    verbatim is therefore not safe on its own.
+    """
+    if not secret:
+        return text
+    return text.replace(secret, REDACTED)
 
 
 def _keyring_get(service: str, profile: str) -> str | None:

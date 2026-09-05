@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .errors import ProtocolError
+from .errors import NotConfigured, ProtocolError
 
 __all__ = [
     "Profile",
@@ -73,25 +73,37 @@ def load_profile(name: str | None = None) -> Profile:
     """Load one profile.
 
     Raises:
-        ProtocolError: if the config file, or the named profile, is absent or
-            malformed. The message points at setup rather than at a stack trace.
+        NotConfigured: if nothing is set up yet -- no config file, or a file with
+            no profiles in it. Callers treat this as "you have not done setup",
+            which is not a failure.
+        ProtocolError: if configuration exists but is broken: unreadable, not
+            valid TOML, or missing the profile that was explicitly asked for.
+            That is an error, not an empty machine.
     """
     path = config_path()
     if not path.exists():
-        raise ProtocolError(f"No profile configuration at {path}. {_SETUP_HINT}")
+        reason = f"No profile configuration at {path}."
+        raise NotConfigured(f"{reason} {_SETUP_HINT}", reason=reason)
 
     document = _read_document()
     profiles = document.get("profiles")
     if not isinstance(profiles, dict) or not profiles:
-        raise ProtocolError(f"No profiles defined in {path}. {_SETUP_HINT}")
+        reason = f"No profiles defined in {path}."
+        raise NotConfigured(f"{reason} {_SETUP_HINT}", reason=reason)
 
     resolved = name or selected_profile_name()
     entry = profiles.get(resolved)
     if entry is None:
         available = ", ".join(sorted(profiles)) or "none"
-        raise ProtocolError(
+        message = (
             f"Profile {resolved!r} is not defined in {path} (defined: {available})."
         )
+        # Asking for a profile by name and not finding it is an operator error:
+        # the file is set up, just not with that profile. Only a default nobody
+        # named is the "nothing set up yet" case.
+        if name is not None:
+            raise ProtocolError(message)
+        raise NotConfigured(f"{message} {_SETUP_HINT}", reason=message)
     if not isinstance(entry, dict):
         raise ProtocolError(f"Profile {resolved!r} in {path} is not a table.")
 
@@ -99,9 +111,7 @@ def load_profile(name: str | None = None) -> Profile:
     # so the resolved name wins and the table never supplies it.
     fields = {key: value for key, value in entry.items() if key != "name"}
     if "login" not in fields:
-        raise ProtocolError(
-            f"Profile {resolved!r} in {path} has no `login`. {_SETUP_HINT}"
-        )
+        raise ProtocolError(f"Profile {resolved!r} in {path} has no `login`.")
 
     try:
         return Profile(name=resolved, **fields)
