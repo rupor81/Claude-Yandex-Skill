@@ -3,7 +3,17 @@ name = "yandex-calendar-mcp"
 version = "0.1.0"
 description = "MCP server exposing a Yandex calendar over CalDAV."
 requires-python = ">=3.13"
-dependencies = ["yandex-core", "caldav>=3.2", "anyio>=4", "mcp>=2"]
+# icalendar and recurring-ical-events are imported directly by client/recurrence.py.
+# They arrive transitively with caldav today, but a caldav release that drops that
+# extra would break this server at import, so they are named here in their own right.
+dependencies = [
+    "yandex-core",
+    "caldav>=3.2",
+    "icalendar>=6",
+    "recurring-ical-events>=3",
+    "anyio>=4",
+    "mcp>=2",
+]
 
 [project.scripts]
 yandex-calendar-mcp = "yandex_calendar_mcp.server:main"

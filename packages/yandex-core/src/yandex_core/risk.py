@@ -43,6 +43,7 @@ class RiskClass(Enum):
 #: Every tool this project may register, and nothing else.
 RISK_REGISTRY: dict[str, RiskClass] = {
     "calendar_list": RiskClass.READ,
+    "calendar_events_list": RiskClass.READ,
 }
 
 _ANNOTATIONS: dict[RiskClass, dict[str, bool]] = {

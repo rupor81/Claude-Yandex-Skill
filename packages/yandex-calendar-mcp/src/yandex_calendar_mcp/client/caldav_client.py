@@ -19,6 +19,7 @@ Two translation hazards are handled deliberately:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import anyio.to_thread
 import caldav
@@ -37,7 +38,12 @@ try:  # pragma: no cover - import shape depends on the installed caldav
 except ImportError:  # pragma: no cover
     from requests import exceptions as http_error  # type: ignore[no-redef]
 
-__all__ = ["CalendarRef", "CalDAVCalendarClient"]
+from .recurrence import CalendarSource, Expansion, SortKey
+from .recurrence import DEFAULT_CEILING as EXPANSION_CEILING
+from .recurrence import expand as expand_occurrences
+from .recurrence import with_unreadable_calendars
+
+__all__ = ["CalendarRef", "CalDAVCalendarClient", "EXPANSION_CEILING"]
 
 _APP_PASSWORD_HINT = (
     "Yandex CalDAV rejects OAuth tokens; the credential must be an app password "
@@ -81,6 +87,50 @@ class CalDAVCalendarClient:
         """Every calendar on the principal, in the order the server returns them."""
         return await anyio.to_thread.run_sync(self._list_calendars_blocking)
 
+    async def list_occurrences(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        calendar_url: str | None = None,
+        ceiling: int = EXPANSION_CEILING,
+        after: SortKey | None = None,
+    ) -> Expansion:
+        """Concrete occurrences between ``start`` and ``end``.
+
+        The only server-side filter used is CalDAV's ``time-range``: it is the
+        one Yandex can be relied on for.  There is deliberately no text
+        parameter -- ``text-match`` cannot be shown never to under-return, and a
+        short answer that looks complete is the failure mode this project exists
+        to avoid.  Series are expanded here rather than by the server, because
+        an occurrence the server declines to expand is simply invisible.
+
+        Args:
+            start: inclusive, timezone-aware.
+            end: exclusive, timezone-aware.
+            calendar_url: one calendar, or every calendar when omitted.
+            ceiling: most occurrences to return before reporting truncation,
+                counted over what remains after ``after``.
+            after: resume strictly after this sort key, so a caller paging into
+                a truncated tail can always make progress.
+
+        A calendar that cannot be read -- a 403 on one shared collection, say --
+        is counted in ``unreadable_calendars`` and the others are still
+        returned.  When *every* calendar fails there is nothing to return, and
+        the failure is raised rather than dressed up as an empty success.
+        """
+
+        def run() -> Expansion:
+            return self._list_occurrences_blocking(
+                start=start,
+                end=end,
+                calendar_url=calendar_url,
+                ceiling=ceiling,
+                after=after,
+            )
+
+        return await anyio.to_thread.run_sync(run)
+
     # -- blocking half -----------------------------------------------------
 
     def _list_calendars_blocking(self) -> list[CalendarRef]:
@@ -99,8 +149,91 @@ class CalDAVCalendarClient:
                     for calendar in principal.calendars()
                 ]
 
+    def _list_occurrences_blocking(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        calendar_url: str | None,
+        ceiling: int,
+        after: SortKey | None,
+    ) -> Expansion:
+        sources: list[CalendarSource] = []
+        unreadable_calendars = 0
+
+        with self._translated():
+            with caldav.DAVClient(
+                url=self._url,
+                username=self._username,
+                password=self._password,
+                timeout=self._timeout,
+            ) as client:
+                calendars = self._calendars_for(client, calendar_url)
+
+                first_failure: Exception | None = None
+                for calendar in calendars:
+                    url = str(getattr(calendar, "url", "") or calendar_url or "")
+                    try:
+                        name = _display_name(calendar)
+                        objects = list(
+                            calendar.search(
+                                start=start, end=end, event=True, expand=False
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # One unreadable calendar is a counted loss, exactly as
+                        # one unreadable document is. Aborting the whole fetch
+                        # for it would throw away every other calendar's answer.
+                        unreadable_calendars += 1
+                        if first_failure is None:
+                            first_failure = exc
+                        continue
+                    for obj in objects:
+                        sources.append(
+                            CalendarSource(
+                                ics=_object_data(obj), calendar_url=url, calendar_name=name
+                            )
+                        )
+
+                if calendars and unreadable_calendars == len(calendars):
+                    # Nothing survived. An empty page here would read as "your
+                    # calendar is empty", which is the one answer we refuse.
+                    assert first_failure is not None
+                    raise first_failure
+
+        # Expansion is pure and needs no connection, so it happens after the
+        # client is closed -- but still inside client/, so no RRULE escapes.
+        expansion = expand_occurrences(
+            sources, start=start, end=end, ceiling=ceiling, after=after
+        )
+        return with_unreadable_calendars(expansion, unreadable_calendars)
+
+    def _calendars_for(self, client: object, calendar_url: str | None) -> list:
+        """The calendars one query covers, named or all of them.
+
+        A named calendar is looked up in the principal's own listing so that it
+        carries the same display name an all-calendars query would give it;
+        labelling the same events differently depending on how they were asked
+        for is a difference the caller cannot explain. A URL the listing does
+        not know is still addressed directly, so the failure comes from the
+        query against the server rather than from a guess made here.
+        """
+        principal_calendars = list(client.principal().calendars())  # type: ignore[attr-defined]
+        if calendar_url is None:
+            return principal_calendars
+        wanted = _normalised_url(calendar_url)
+        for calendar in principal_calendars:
+            if _normalised_url(str(getattr(calendar, "url", ""))) == wanted:
+                return [calendar]
+        return [client.calendar(url=calendar_url)]  # type: ignore[attr-defined]
+
     def _translated(self) -> "_Translator":
         return _Translator(self._credential_name, self._url)
+
+
+def _normalised_url(url: str) -> str:
+    """A collection URL compared without caring about one trailing slash."""
+    return url.rstrip("/")
 
 
 def _display_name(calendar: object) -> str:
@@ -115,6 +248,25 @@ def _display_name(calendar: object) -> str:
     if name:
         return str(name)
     return str(getattr(calendar, "url", "")).rstrip("/").rsplit("/", 1)[-1] or "(unnamed)"
+
+
+def _object_data(obj: object) -> str:
+    """The raw iCalendar text of one fetched object.
+
+    Returned as text rather than as a parsed component: a document this server
+    cannot parse must be counted as unreadable by the expansion, not raised as a
+    failure of the whole query.
+    """
+    data = getattr(obj, "data", None)
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, (bytes, bytearray)):
+        # str() on bytes yields "b'BEGIN:VCALENDAR...'", which parses as
+        # nothing at all and would count every event in it unreadable.
+        return bytes(data).decode("utf-8", errors="replace")
+    return str(data)
 
 
 class _Translator:

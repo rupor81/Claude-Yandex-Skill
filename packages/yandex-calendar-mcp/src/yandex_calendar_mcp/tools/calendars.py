@@ -12,7 +12,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 from yandex_core.errors import ProtocolError
-from yandex_core.paging import decode_cursor, encode_cursor
+from yandex_core.paging import checked_limit, decode_cursor, encode_cursor
 from yandex_core.results import Page
 
 from ..client.caldav_client import CalDAVCalendarClient
@@ -75,7 +75,7 @@ def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaita
         Returns at most `limit` calendars. If more exist, `complete` is false and
         `next_cursor` carries the remainder.
         """
-        checked_limit = _checked_limit(limit)
+        limit_used = checked_limit(limit, minimum=MIN_LIMIT, maximum=MAX_LIMIT)
         offset = _offset_from(cursor)
         client = await client_provider()
         calendars = await client.list_calendars()
@@ -89,7 +89,7 @@ def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaita
                 "issued. Start again without a cursor."
             )
 
-        window = calendars[offset : offset + checked_limit]
+        window = calendars[offset : offset + limit_used]
         remaining = len(calendars) - (offset + len(window))
         complete = remaining <= 0
 
@@ -105,21 +105,6 @@ def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaita
 
     calendar_list.__name__ = TOOL_NAME
     return calendar_list
-
-
-def _checked_limit(limit: object) -> int:
-    """Enforce the limit range here, not only in the JSON schema.
-
-    The schema binds a model calling over the protocol; it binds nothing when the
-    function is called directly, and the bound has to hold either way.
-    """
-    if isinstance(limit, bool) or not isinstance(limit, int):
-        raise ProtocolError(f"`limit` must be an integer, not {type(limit).__name__}.")
-    if not MIN_LIMIT <= limit <= MAX_LIMIT:
-        raise ProtocolError(
-            f"`limit` must be between {MIN_LIMIT} and {MAX_LIMIT}; got {limit}."
-        )
-    return limit
 
 
 def _offset_from(cursor: str | None) -> int:

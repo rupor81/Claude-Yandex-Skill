@@ -14,3 +14,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-1-connect-a-calendar-and-list-it.md`
   summary: On macOS the editable-install .pth files under .venv intermittently acquire the UF_HIDDEN flag, which Python 3.13 skips, breaking every import until chflags nohidden is run.
   evidence: Reproduced directly — console scripts and imports failed in a clean environment, and unhiding fixed them. Tests are made independent of this via pytest's pythonpath, but console entry points remain exposed. A permanent fix (non-editable installs, or documented remedy) needs a decision beyond this story.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-query-events-over-a-date-range.md`
+  summary: Every page of an event query re-opens a TLS connection and re-fetches the whole range, so paging a wide range at a small limit repeats the full account-wide fetch once per page.
+  evidence: Correct but wasteful, and invisible at present scale — a 60-day window over the real account returns 422 occurrences in one page. It becomes load-bearing for wide ranges or a small limit; a short-lived expansion cache keyed by the cursor's query stamp is the natural fix, and the stamp needed for it already exists.

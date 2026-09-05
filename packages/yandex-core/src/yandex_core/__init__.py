@@ -15,7 +15,7 @@ from .errors import (
     TransportError,
     YandexError,
 )
-from .paging import decode_cursor, encode_cursor
+from .paging import checked_limit, decode_cursor, encode_cursor
 from .results import Page
 
 __all__ = [
@@ -30,4 +30,5 @@ __all__ = [
     "Page",
     "encode_cursor",
     "decode_cursor",
+    "checked_limit",
 ]

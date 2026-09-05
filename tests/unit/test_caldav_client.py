@@ -1,14 +1,19 @@
 """Every protocol exception is translated before it can leave `client/`.
 
-The fakes stand in for `caldav.DAVClient`, so no socket is opened.
+The fakes stand in for `caldav.DAVClient`, so no socket is opened. They live in
+`conftest.py`, shared with the other suites that need them.
 """
 
 from __future__ import annotations
+
+import inspect
+from datetime import datetime, timedelta, timezone
 
 import anyio
 import caldav
 import pytest
 from caldav.lib import error as caldav_error
+from conftest import FakeCalendar, install_fake_dav_client
 from niquests import exceptions as http_error
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_core.errors import (
@@ -25,45 +30,12 @@ PASSWORD = "hunter2-app-password"
 URL = "https://caldav.yandex.ru"
 
 
-class FakeCalendar:
-    def __init__(self, name, url):
-        self.name = name
-        self.url = url
-
-
 class FakePrincipal:
     def __init__(self, calendars):
         self._calendars = calendars
 
     def calendars(self):
         return self._calendars
-
-
-def install_fake_dav_client(monkeypatch, *, calendars=None, raises=None, on_principal=None):
-    """Replace `caldav.DAVClient` with a fake that answers or fails as asked."""
-
-    closed = []
-
-    class FakeDAVClient:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            if raises is not None:
-                raise raises
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc_info):
-            closed.append(True)
-            return False
-
-        def principal(self):
-            if on_principal is not None:
-                raise on_principal
-            return FakePrincipal(calendars or [])
-
-    monkeypatch.setattr(caldav, "DAVClient", FakeDAVClient)
-    return closed
 
 
 def make_client() -> CalDAVCalendarClient:
@@ -273,3 +245,274 @@ def test_client_is_constructed_directly_with_the_given_credentials(monkeypatch):
     assert captured["username"] == "me@yandex.ru"
     assert captured["password"] == PASSWORD
     assert captured["timeout"] > 0, "a request without a timeout can hang forever"
+
+
+# -- the range fetch -------------------------------------------------------
+
+MOSCOW = timezone(timedelta(hours=3))
+RANGE_START = datetime(2026, 6, 1, tzinfo=MOSCOW)
+RANGE_END = datetime(2026, 6, 30, tzinfo=MOSCOW)
+
+STANDUP = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:standup-1\r\nSUMMARY:Standup\r\n"
+    "DTSTART;TZID=Europe/Moscow:20260608T090000\r\n"
+    "DTEND;TZID=Europe/Moscow:20260608T091500\r\n"
+    "RRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+
+WEEKLY = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:weekly-1\r\nSUMMARY:Weekly\r\n"
+    "DTSTART;TZID=Europe/Moscow:20260609T140000\r\n"
+    "DTEND;TZID=Europe/Moscow:20260609T150000\r\n"
+    "RRULE:FREQ=WEEKLY;COUNT=2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+
+def fetch(client, **kwargs):
+    async def run():
+        return await client.list_occurrences(
+            start=RANGE_START, end=RANGE_END, **kwargs
+        )
+
+    return anyio.run(run)
+
+
+def test_the_range_fetch_expands_series_locally(monkeypatch):
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    result = fetch(make_client())
+
+    assert len(result.occurrences) == 3
+    assert result.unreadable == 0
+    assert result.truncated is False
+    assert {o.calendar_name for o in result.occurrences} == {"Personal"}
+
+
+def test_the_only_server_side_filter_is_the_time_range(monkeypatch):
+    """Server-side expansion and text-match are both refused deliberately."""
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    fetch(make_client())
+
+    assert calendar.searched == {
+        "start": RANGE_START,
+        "end": RANGE_END,
+        "event": True,
+        "expand": False,
+    }
+
+
+def test_the_range_fetch_takes_no_text_parameter():
+    parameters = set(inspect.signature(CalDAVCalendarClient.list_occurrences).parameters)
+    assert not parameters & {"title", "title_contains", "text", "summary", "query"}
+
+
+def test_every_calendar_is_searched_when_none_is_named(monkeypatch):
+    calendars = [
+        FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP]),
+        FakeCalendar("Work", f"{URL}/c/work/", [STANDUP]),
+    ]
+    install_fake_dav_client(monkeypatch, calendars=calendars)
+
+    result = fetch(make_client())
+
+    assert len(result.occurrences) == 6
+    assert {o.calendar_name for o in result.occurrences} == {"Personal", "Work"}
+
+
+def test_one_named_calendar_is_searched_alone(monkeypatch):
+    calendars = [
+        FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP]),
+        FakeCalendar("Work", f"{URL}/c/work/", [STANDUP]),
+    ]
+    install_fake_dav_client(monkeypatch, calendars=calendars)
+
+    result = fetch(make_client(), calendar_url=f"{URL}/c/work/")
+
+    assert {o.calendar_name for o in result.occurrences} == {"Work"}
+    assert calendars[0].searched is None
+
+
+def test_every_occurrence_carries_the_url_of_the_calendar_it_came_from(monkeypatch):
+    """Blanking `calendar_url` must not pass: it is how a caller addresses one."""
+    calendars = [
+        FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP]),
+        FakeCalendar("Work", f"{URL}/c/work/", [WEEKLY]),
+    ]
+    install_fake_dav_client(monkeypatch, calendars=calendars)
+
+    result = fetch(make_client())
+
+    by_url = {}
+    for occurrence in result.occurrences:
+        by_url.setdefault(occurrence.calendar_url, set()).add(occurrence.uid)
+    assert by_url == {
+        f"{URL}/c/personal/": {"standup-1"},
+        f"{URL}/c/work/": {"weekly-1"},
+    }
+
+
+def test_a_single_calendar_query_labels_occurrences_with_that_calendar(monkeypatch):
+    """One calendar asked for by URL must be labelled as the listing labels it.
+
+    A query for one calendar and a query for all of them describe the same
+    events; labelling them differently is a difference no caller can explain.
+    """
+    calendars = [
+        FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP]),
+        FakeCalendar("Work", f"{URL}/c/work/", [STANDUP]),
+    ]
+    install_fake_dav_client(monkeypatch, calendars=calendars)
+
+    named = fetch(make_client(), calendar_url=f"{URL}/c/work/")
+    everything = fetch(make_client())
+
+    assert {(o.calendar_url, o.calendar_name) for o in named.occurrences} == {
+        (f"{URL}/c/work/", "Work")
+    }
+    assert {(o.calendar_url, o.calendar_name) for o in everything.occurrences} >= {
+        (f"{URL}/c/work/", "Work")
+    }
+
+
+def test_an_unknown_calendar_url_is_a_not_found(monkeypatch):
+    install_fake_dav_client(monkeypatch, calendars=[])
+    with pytest.raises(NotFound):
+        fetch(make_client(), calendar_url=f"{URL}/c/gone/")
+
+
+def test_one_unreadable_calendar_does_not_lose_the_others(monkeypatch):
+    """A 403 on one shared calendar is a counted loss, not the end of the query."""
+    calendars = [
+        FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP]),
+        FakeCalendar(
+            "Shared",
+            f"{URL}/c/shared/",
+            raises=caldav_error.AuthorizationError(url=URL, reason="Forbidden"),
+        ),
+    ]
+    install_fake_dav_client(monkeypatch, calendars=calendars)
+
+    result = fetch(make_client())
+
+    assert len(result.occurrences) == 3
+    assert {o.calendar_name for o in result.occurrences} == {"Personal"}
+    assert result.unreadable_calendars == 1
+
+
+def test_object_data_arriving_as_bytes_is_decoded_not_stringified(monkeypatch):
+    """`str(b"BEGIN:...")` parses as nothing and would lose every event in it."""
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP.encode("utf-8")])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    result = fetch(make_client())
+
+    assert len(result.occurrences) == 3
+    assert result.unreadable == 0
+
+
+def test_a_failure_during_the_search_is_translated(monkeypatch):
+    calendar = FakeCalendar(
+        "Personal",
+        f"{URL}/c/personal/",
+        raises=caldav_error.AuthorizationError(url=URL, reason="Unauthorized"),
+    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    with pytest.raises(AuthError):
+        fetch(make_client())
+
+
+def test_transport_failures_during_a_range_fetch_are_translated(monkeypatch):
+    install_fake_dav_client(monkeypatch, raises=http_error.ConnectionError("no route"))
+    with pytest.raises(TransportError):
+        fetch(make_client())
+
+
+def test_no_caldav_exception_escapes_the_range_fetch(monkeypatch):
+    calendar = FakeCalendar(
+        "Personal",
+        f"{URL}/c/personal/",
+        raises=caldav_error.PropfindError(url=URL, reason="Bad Gateway"),
+    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    with pytest.raises(YandexError):
+        fetch(make_client())
+
+
+def test_an_unreadable_object_is_counted_rather_than_failing_the_query(monkeypatch):
+    calendar = FakeCalendar(
+        "Personal", f"{URL}/c/personal/", [STANDUP, "this is not iCalendar"]
+    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    result = fetch(make_client())
+
+    assert len(result.occurrences) == 3
+    assert result.unreadable == 1
+
+
+def test_the_connection_is_closed_after_a_range_fetch(monkeypatch):
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP])
+    closed = install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    fetch(make_client())
+
+    assert closed, "the TLS connection pool was left to the garbage collector"
+
+
+def test_a_query_where_every_calendar_fails_raises_rather_than_returning_nothing(
+    monkeypatch,
+):
+    """An empty page here would read as "your calendar is empty"."""
+    calendars = [
+        FakeCalendar(
+            "Personal",
+            f"{URL}/c/personal/",
+            raises=caldav_error.AuthorizationError(url=URL, reason="Forbidden"),
+        ),
+        FakeCalendar(
+            "Work",
+            f"{URL}/c/work/",
+            raises=caldav_error.AuthorizationError(url=URL, reason="Forbidden"),
+        ),
+    ]
+    install_fake_dav_client(monkeypatch, calendars=calendars)
+
+    with pytest.raises(PolicyError):
+        fetch(make_client())
+
+
+def test_a_ceiling_below_one_is_refused_by_name(monkeypatch):
+    """Zero or negative would mark every non-empty answer truncated."""
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    for ceiling in (0, -1):
+        with pytest.raises(ProtocolError) as caught:
+            fetch(make_client(), ceiling=ceiling)
+        assert "ceiling" in str(caught.value)
+
+
+def test_the_ceiling_applies_after_the_resume_point(monkeypatch):
+    """Otherwise everything past the ceiling would be unreachable for ever."""
+    from yandex_calendar_mcp.client.recurrence import occurrence_sort_key
+
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [STANDUP])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    first = fetch(make_client(), ceiling=1)
+    assert first.truncated is True
+    assert len(first.occurrences) == 1
+
+    second = fetch(
+        make_client(), ceiling=1, after=occurrence_sort_key(first.occurrences[0])
+    )
+    assert len(second.occurrences) == 1
+    assert second.occurrences[0].start > first.occurrences[0].start

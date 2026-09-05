@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from yandex_core.errors import ProtocolError
-from yandex_core.paging import decode_cursor, encode_cursor
+from yandex_core.paging import (
+    decode_cursor,
+    decode_position_cursor,
+    encode_cursor,
+    encode_position_cursor,
+)
 from yandex_core.results import Page
 
 
@@ -61,3 +66,89 @@ def test_the_same_tool_still_reads_its_own_cursor():
         assert decode_cursor(encode_cursor({"offset": 1}, tool=tool), tool=tool) == {
             "offset": 1
         }
+
+
+# -- position cursors ------------------------------------------------------
+
+POSITION_FIELDS = ("start", "uid", "recurrence_id")
+
+
+def position(**overrides):
+    base = {"start": "2026-06-08T09:00:00+03:00", "uid": "standup-1", "recurrence_id": None}
+    base.update(overrides)
+    return base
+
+
+def test_a_position_cursor_names_the_item_rather_than_an_offset():
+    """The point of the shape: a derived set can shift without invalidating it."""
+    cursor = encode_position_cursor(position(), tool="calendar_events_list")
+
+    decoded = decode_position_cursor(
+        cursor, tool="calendar_events_list", fields=POSITION_FIELDS
+    )
+
+    assert decoded == position()
+    assert "offset" not in decode_cursor(cursor, tool="calendar_events_list")
+
+
+def test_a_position_cursor_is_opaque():
+    cursor = encode_position_cursor(position(), tool="calendar_events_list")
+    assert "standup-1" not in cursor
+
+
+def test_a_position_cursor_still_carries_its_issuing_tool():
+    cursor = encode_position_cursor(position(), tool="calendar_events_list")
+    with pytest.raises(ProtocolError):
+        decode_position_cursor(cursor, tool="calendar_list", fields=POSITION_FIELDS)
+
+
+def test_an_index_cursor_is_not_accepted_as_a_position():
+    cursor = encode_cursor({"offset": 3}, tool="calendar_events_list")
+    with pytest.raises(ProtocolError):
+        decode_position_cursor(
+            cursor, tool="calendar_events_list", fields=POSITION_FIELDS
+        )
+
+
+def test_a_position_cursor_of_a_different_shape_is_refused():
+    """A cursor from another version of the tool resumes from nowhere trustworthy."""
+    cursor = encode_position_cursor({"uid": "standup-1"}, tool="calendar_events_list")
+    with pytest.raises(ProtocolError):
+        decode_position_cursor(
+            cursor, tool="calendar_events_list", fields=POSITION_FIELDS
+        )
+
+
+def test_a_non_string_position_field_is_refused_at_encoding():
+    with pytest.raises(ProtocolError):
+        encode_position_cursor({"uid": 7}, tool="calendar_events_list")
+
+
+# -- the shared limit check ------------------------------------------------
+
+
+def test_checked_limit_accepts_the_documented_range():
+    from yandex_core.paging import checked_limit
+
+    assert checked_limit(1, minimum=1, maximum=200) == 1
+    assert checked_limit(200, minimum=1, maximum=200) == 200
+
+
+@pytest.mark.parametrize("bad", [0, 201, -1, "10", True, 1.0, None])
+def test_checked_limit_refuses_anything_else(bad):
+    from yandex_core.paging import checked_limit
+
+    with pytest.raises(ProtocolError):
+        checked_limit(bad, minimum=1, maximum=200)
+
+
+def test_both_listing_tools_use_the_one_limit_check():
+    """It was copied verbatim between them; a copy drifts, a shared one cannot."""
+    import inspect
+
+    from yandex_calendar_mcp.tools import calendars, events
+
+    for module in (calendars, events):
+        source = inspect.getsource(module)
+        assert "def _checked_limit" not in source
+        assert "checked_limit(" in source
