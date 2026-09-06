@@ -17,7 +17,7 @@ from yandex_core.errors import YandexError
 
 from .client.caldav_client import CalDAVCalendarClient
 from .tools.calendars import build_calendar_list
-from .tools.events import build_calendar_events_list
+from .tools.events import build_calendar_event_get, build_calendar_events_list
 
 __all__ = ["SERVICE", "build_calendar_server", "main"]
 
@@ -25,10 +25,12 @@ SERVICE = "calendar"
 
 INSTRUCTIONS = (
     "Read a Yandex calendar over CalDAV. This server is read-only: it can list "
-    "the calendars on the configured account and the event occurrences in a "
-    "date range, and nothing else -- it cannot create, change, or delete "
-    "anything. Recurring series are returned already expanded into concrete "
-    "occurrences, never as recurrence rules. Listing tools are bounded: a "
+    "the calendars on the configured account, the event occurrences in a date "
+    "range, and one event in full by its UID, and nothing else -- it cannot "
+    "create, change, or delete anything. Recurring series are returned already "
+    "expanded into concrete occurrences, never as recurrence rules. An event "
+    "is read by addressing its UID, so a UID that is not on the account is an "
+    "error naming it rather than an empty result. Listing tools are bounded: a "
     "result with `complete: false` was cut short and its `next_cursor` must be "
     "passed back to see the rest. A page can also be irrecoverably short: when "
     "events or whole calendars could not be read, they are counted rather than "
@@ -60,6 +62,7 @@ def build_calendar_server(profile: Profile | None = None):
     server = build_server(name="yandex-calendar-mcp", instructions=INSTRUCTIONS)
     register_tool(server, build_calendar_list(client_provider))
     register_tool(server, build_calendar_events_list(client_provider))
+    register_tool(server, build_calendar_event_get(client_provider))
     return server
 
 

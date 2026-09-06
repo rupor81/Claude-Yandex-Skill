@@ -86,6 +86,14 @@ def test_a_duplicate_tool_name_is_refused(monkeypatch):
     assert "probe_dup" in str(caught.value)
 
 
+def test_calendar_event_get_is_registered_read_only():
+    """Reading one event must be annotated as harmless, or a caller will gate it."""
+    annotations = annotations_for("calendar_event_get")
+    assert annotations.read_only_hint is True
+    assert annotations.destructive_hint is False
+    assert annotations.idempotent_hint is True
+
+
 def test_calendar_events_list_is_registered_read_only():
     """An unregistered tool cannot be registered at all, so this is load-bearing."""
     annotations = annotations_for("calendar_events_list")

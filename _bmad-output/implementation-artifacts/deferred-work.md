@@ -19,3 +19,7 @@
   between pages silently omitted an entry. The "cursor past the end" error is gone with
   it — that rule existed only to compensate for an index that could not tell a shrunken
   list from a finished one.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-4-read-one-event-in-full.md`
+  summary: A recurring series whose master and whose RECURRENCE-ID override are stored at unrelated hrefs cannot be read completely, so such an instance returns the series' unmodified time.
+  evidence: A genuine platform limit rather than an omission. Enumerating every object sharing a UID needs a UID search, and this server's UID search returns the entire calendar — 1759 objects for one UID, measured. The library's by-UID lookup returns exactly one object by construction. The addressed href plus that lookup covers every shape seen on the live account; only an override filed under an unrelated href escapes, and no safe mechanism reaches it.

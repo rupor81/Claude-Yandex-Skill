@@ -6,6 +6,9 @@ the operator's real keychain or config. Both are cut off here for every test.
 
 from __future__ import annotations
 
+import re
+import urllib.parse
+
 import pytest
 from yandex_core import config as config_module
 
@@ -44,28 +47,177 @@ def no_credential_env(monkeypatch):
 # its twin is a test that passes for a reason the other one does not.
 
 
-class FakeObject:
-    """One fetched CalDAV object, carrying its raw iCalendar text."""
+#: Distinguishes "the keyword was not passed" from "it was passed as None".
+_UNSET = object()
 
-    def __init__(self, data):
+
+class FakeObject:
+    """One fetched CalDAV object, carrying its raw iCalendar text.
+
+    The three spellings of an ETag are kept apart deliberately, because on the
+    real account they disagree: the library's cached ``etag`` attribute is
+    empty, the GET response header carries a ``--gzip`` suffix, and only the
+    DAV property gives the bare value story 1.7 must send back. A fake that
+    made all three the same would let code read the wrong one and still pass.
+    """
+
+    def __init__(self, data, *, url=None, etag=None, cached_etag=None,
+                 header_etag=None, property_error=None, legacy_property=False):
         self.data = data
+        self.url = url
+        #: What `caldav` caches on the object; empty on the real account.
+        self.etag = cached_etag
+        self.headers = {"Etag": header_etag} if header_etag is not None else {}
+        self._property_etag = etag
+        self._property_error = property_error
+        #: An older `caldav` whose `get_property` has no `use_cached` keyword.
+        self._legacy_property = legacy_property
+
+    def get_property(self, prop, use_cached=_UNSET, **kwargs):
+        """Stand in for a PROPFIND of one DAV property.
+
+        Only the property actually asked for is answered.  A fake that returned
+        the ETag whatever it was asked would let code PROPFIND the wrong DAV
+        property and still pass, which is precisely the mistake this object
+        exists to make visible.
+        """
+        if self._legacy_property and use_cached is not _UNSET:
+            raise TypeError(
+                "get_property() got an unexpected keyword argument 'use_cached'"
+            )
+        if self._property_error is not None:
+            raise self._property_error
+        from caldav.elements import dav
+
+        if getattr(prop, "tag", None) != dav.GetEtag().tag:
+            return None
+        return self._property_etag
 
 
 class FakeCalendar:
-    """A calendar collection, as `principal.calendars()` hands them over."""
+    """A calendar collection, as `principal.calendars()` hands them over.
 
-    def __init__(self, name, url, objects=(), raises=None):
+    Objects are addressed the way the real server names them -- one href per
+    UID, `<calendar>/<uid>.ics` -- so a caller that tries to *search* for a UID
+    instead of addressing it is visible in `searched`.
+
+    An entry of `objects` is either the raw iCalendar text -- stored under the
+    href the client would construct for its UID -- or an explicit
+    `(href, text)` pair.  The pair form is what makes a mismatch between the
+    constructed href and the one the server really used *possible* to test: a
+    fake that always derived the href the same way the code does would only
+    ever validate the code against itself.
+    """
+
+    def __init__(
+        self,
+        name,
+        url,
+        objects=(),
+        raises=None,
+        fetch_raises=None,
+        etags=None,
+        cached_etags=None,
+        header_etags=None,
+        property_error=None,
+        legacy_property=False,
+    ):
         self.name = name
         self.url = url
-        self._objects = list(objects)
+        self._entries = [
+            entry if isinstance(entry, tuple) else (None, entry) for entry in objects
+        ]
         self._raises = raises
+        self._fetch_raises = fetch_raises
+        self._etags = dict(etags or {})
+        self._cached_etags = dict(cached_etags or {})
+        self._header_etags = dict(header_etags or {})
+        self._property_error = property_error
+        self._legacy_property = legacy_property
         self.searched = None
+        self.fetched = []
+        self.asked_by_uid = []
+
+    @property
+    def _objects(self):
+        return [data for _, data in self._entries]
 
     def search(self, **kwargs):
         self.searched = kwargs
         if self._raises is not None:
             raise self._raises
         return [FakeObject(data) for data in self._objects]
+
+    def href_for(self, uid):
+        base = str(self.url)
+        if not base.endswith("/"):
+            base += "/"
+        return base + urllib.parse.quote(uid, safe="") + ".ics"
+
+    def _href_of(self, entry):
+        href, data = entry
+        if href is not None:
+            return href
+        uid = uid_of(data)
+        return self.href_for(uid) if uid is not None else None
+
+    def _wrap(self, href, data):
+        uid = uid_of(data)
+        return FakeObject(
+            data,
+            url=str(href),
+            etag=self._etags.get(uid, f"etag-{uid}"),
+            cached_etag=self._cached_etags.get(uid),
+            header_etag=self._header_etags.get(uid),
+            property_error=self._property_error,
+            legacy_property=self._legacy_property,
+        )
+
+    def event_by_url(self, href, data=None):
+        self.fetched.append(str(href))
+        if self._fetch_raises is not None:
+            raise self._fetch_raises
+        from caldav.lib import error as caldav_error
+
+        for entry in self._entries:
+            stored = self._href_of(entry)
+            if stored is not None and _same_href(href, stored):
+                return self._wrap(href, entry[1])
+        raise caldav_error.NotFoundError(url=str(href), reason="Not Found")
+
+    def object_by_uid(self, uid, *args, **kwargs):
+        """What `caldav` does when the constructed href misses.
+
+        The library verifies the UID client-side, so this never answers with an
+        object holding some other event -- which is why it is not the forbidden
+        "search fallback".
+        """
+        self.asked_by_uid.append(uid)
+        if self._fetch_raises is not None:
+            raise self._fetch_raises
+        from caldav.lib import error as caldav_error
+
+        for entry in self._entries:
+            if uid_of(entry[1]) == uid:
+                return self._wrap(self._href_of(entry), entry[1])
+        raise caldav_error.NotFoundError(url=str(self.url), reason="Not Found")
+
+
+def uid_of(document):
+    """The first UID in an iCalendar document, as text, or None."""
+    match = re.search(r"^UID:(.*)$", document, flags=re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _same_href(left, right):
+    """Compared exactly, byte for byte, as a real server compares a request URL.
+
+    Unquoting both sides first would make every encoding choice the client makes
+    correct by construction: the fake would agree with the code because it was
+    written from the same assumption, and a href the server never used would
+    still be "found".
+    """
+    return str(left) == str(right)
 
 
 class FakePrincipal:
@@ -98,6 +250,22 @@ class FakeAddressedCalendar:
         for calendar in self._calendars:
             if str(calendar.url).rstrip("/") == str(self.url).rstrip("/"):
                 return calendar.search(**kwargs)
+        raise caldav_error.NotFoundError(url=str(self.url), reason="Not Found")
+
+    def event_by_url(self, href, data=None):
+        from caldav.lib import error as caldav_error
+
+        for calendar in self._calendars:
+            if str(calendar.url).rstrip("/") == str(self.url).rstrip("/"):
+                return calendar.event_by_url(href, data)
+        raise caldav_error.NotFoundError(url=str(href), reason="Not Found")
+
+    def object_by_uid(self, uid, *args, **kwargs):
+        from caldav.lib import error as caldav_error
+
+        for calendar in self._calendars:
+            if str(calendar.url).rstrip("/") == str(self.url).rstrip("/"):
+                return calendar.object_by_uid(uid, *args, **kwargs)
         raise caldav_error.NotFoundError(url=str(self.url), reason="Not Found")
 
 

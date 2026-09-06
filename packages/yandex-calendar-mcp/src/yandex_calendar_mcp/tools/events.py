@@ -41,7 +41,12 @@ from yandex_core.results import Page
 
 from ..client.caldav_client import CalDAVCalendarClient
 from ..client.recurrence import (
+    SCOPE_OCCURRENCE,
+    SCOPE_SERIES,
+    SCOPE_SINGLE,
+    EventRecord,
     Occurrence,
+    Participant,
     format_instant,
     parse_instant,
     position_sort_key,
@@ -54,7 +59,18 @@ __all__ = [
     "MAX_LIMIT",
     "MIN_LIMIT",
     "MAX_RANGE_DAYS",
+    "Attendee",
+    "EventDetail",
     "TOOL_NAME",
+    "GET_TOOL_NAME",
+    "SCOPE_SINGLE",
+    "SCOPE_SERIES",
+    "SCOPE_OCCURRENCE",
+    "NO_ETAG_NOTE",
+    "ETAG_UNREADABLE_NOTE",
+    "DESCRIPTION_TRUNCATED_NOTE",
+    "MAX_DESCRIPTION_CHARS",
+    "build_calendar_event_get",
     "MORE_PAGES",
     "RANGE_TRUNCATED",
     "UNREADABLE_DATA",
@@ -65,12 +81,44 @@ DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 MIN_LIMIT = 1
 
+#: How much of an invitation body one answer may carry.  A meeting description
+#: is routinely thousands of characters of quoted mail; every other listing in
+#: this server is bounded and says so, and an unbounded one here would be the
+#: single place a caller could not predict the size of an answer.
+MAX_DESCRIPTION_CHARS = 2000
+
 #: The widest span one call may ask for.  A range beyond this is refused by
 #: name rather than narrowed: a quietly shortened window returns an answer that
 #: looks complete for a question nobody asked.
 MAX_RANGE_DAYS = 366
 
 TOOL_NAME = "calendar_events_list"
+GET_TOOL_NAME = "calendar_event_get"
+
+#: What the answer says when the server supplied no ETag.  The field is null and
+#: this note explains the consequence, because an invented value would make a
+#: later conditional update overwrite somebody else's edit.
+NO_ETAG_NOTE = (
+    "The server supplied no ETag for this object, so `etag` is null. Nothing "
+    "was invented in its place: a later update cannot use this read as a "
+    "precondition, and would have to be made without one."
+)
+
+#: What the answer says when the ETag property existed but could not be read.
+#: Deliberately not the same sentence: "the server sent none" is settled, while
+#: this one may well succeed on a retry, and the event itself was read fine.
+ETAG_UNREADABLE_NOTE = (
+    "The ETag of this object could not be read -- which is not the same as the "
+    "server supplying none -- so `etag` is null and nothing was invented in its "
+    "place. The event itself was read in full. Retry to obtain an ETag; until "
+    "one is read, a later update cannot use this read as a precondition."
+)
+
+#: What the answer says when the invitation body was longer than the cap.
+DESCRIPTION_TRUNCATED_NOTE = (
+    f"`description` was longer than {MAX_DESCRIPTION_CHARS} characters and has "
+    "been cut to that length; the rest is not in this answer."
+)
 
 #: The three reasons a page may not be the whole answer.
 MORE_PAGES = "more_pages"
@@ -505,3 +553,387 @@ def _check_range(start: datetime, end: datetime) -> None:
             "maximum for one query. Ask for a narrower range; it is not narrowed "
             "for you, because a shortened window would answer a different question."
         )
+
+
+# -- one event, in full ---------------------------------------------------
+
+
+class Attendee(BaseModel):
+    """One person on an event, as the invitation records them."""
+
+    email: str | None = Field(
+        description=(
+            "Address of the participant, or null when the line carried none."
+        )
+    )
+    name: str | None = Field(
+        description=(
+            "Display name, or null when the invitation gave only an address. "
+            "Never derived from the address: a name nobody chose is worse than "
+            "no name."
+        )
+    )
+    response_status: str | None = Field(
+        description=(
+            "Whether they have replied, as iCalendar spells it -- ACCEPTED, "
+            "DECLINED, TENTATIVE, NEEDS-ACTION -- or null when unstated."
+        )
+    )
+    role: str | None = Field(
+        description=(
+            "REQ-PARTICIPANT, OPT-PARTICIPANT, CHAIR, and so on, or null when "
+            "unstated."
+        )
+    )
+
+
+class EventDetail(BaseModel):
+    """One event -- a series, or one instance of one -- with everything on it.
+
+    Everything the invitation records that this server can read: who is coming
+    and how they replied, where it is and how to join it, how a series recurs,
+    and the version of the object for a later conditional update. The one bound
+    is `description`, which is capped and says so when it was cut.
+    """
+
+    uid: str = Field(
+        description=(
+            "Identifier of the event, shared by every instance of a series."
+        )
+    )
+    recurrence_id: str | None = Field(
+        description=(
+            "Which instance this is, as an ISO 8601 timestamp, or null when "
+            "this is the series itself or a one-off event."
+        )
+    )
+    is_series: bool = Field(
+        description="True when this event recurs; false for a one-off event."
+    )
+    scope: str = Field(
+        description=(
+            f"What was returned. `{SCOPE_SINGLE}`: a one-off event. "
+            f"`{SCOPE_SERIES}`: the series itself, not one of its instances -- "
+            "its `start` and `end` are the series' own, and the other instances "
+            "are elsewhere in the series. "
+            f"`{SCOPE_OCCURRENCE}`: exactly the instance named by "
+            "`recurrence_id`, with any override applied."
+        )
+    )
+    cancelled: bool = Field(
+        description=(
+            "True when this event or instance is cancelled and is not "
+            "happening. A cancelled instance is reported, not hidden, and never "
+            "returned as a live meeting."
+        )
+    )
+    status: str | None = Field(
+        description=(
+            "CONFIRMED, TENTATIVE or CANCELLED as the event states it, or null "
+            "when it states nothing."
+        )
+    )
+    summary: str | None = Field(description="Title, or null when it has none.")
+    description: str | None = Field(
+        description=(
+            "Body of the invitation, or null when it has none. Capped at "
+            f"{MAX_DESCRIPTION_CHARS} characters -- a meeting body is routinely "
+            "thousands of characters of quoted mail. When it was cut, "
+            "`description_truncated` is true and `description_note` says so; "
+            "the rest is not retrievable through this tool."
+        )
+    )
+    description_truncated: bool = Field(
+        default=False,
+        description=(
+            f"True when `description` was longer than {MAX_DESCRIPTION_CHARS} "
+            "characters and has been cut to that length. Never true silently: "
+            "`description_note` carries the same statement in words."
+        ),
+    )
+    description_note: str | None = Field(
+        default=None,
+        description="Why `description` is short, or null when it is whole.",
+    )
+    location: str | None = Field(description="Location, or null when unset.")
+    join_url: str | None = Field(
+        default=None,
+        description=(
+            "Where to join this meeting, read from the invitation's conference "
+            "property or, failing that, the first link in its location or body. "
+            "Null when the invitation carried none; never assembled from "
+            "anything the invitation did not contain."
+        ),
+    )
+    recurrence_summary: str | None = Field(
+        default=None,
+        description=(
+            "How this series repeats, in a sentence -- for example \"Repeats "
+            "daily, 5 times in all.\" Null for a one-off event. The recurrence "
+            "rule itself is never returned; use `calendar_events_list` to see "
+            "the concrete instances."
+        ),
+    )
+    organizer: Attendee | None = Field(
+        description=(
+            "Who called the meeting, or null when unstated. When an invitation "
+            "carries more than one organizer line this is the first; all of them "
+            "are in `organizers`, and none is dropped."
+        )
+    )
+    organizers: list[Attendee] = Field(
+        default_factory=list,
+        description=(
+            "Every organizer line on the invitation, in the order it recorded "
+            "them. Usually one; more than one is unusual but is reported rather "
+            "than silently reduced to the first."
+        ),
+    )
+    attendees: list[Attendee] = Field(
+        description="Everyone invited, with their response status."
+    )
+    start: datetime | date = Field(
+        description=(
+            "Start: a timestamp with an explicit offset, or a plain date when "
+            "`all_day` is true. For an instance, that instance's own start."
+        )
+    )
+    end: datetime | date = Field(description="End, in the same form as `start`.")
+    all_day: bool = Field(
+        description="True when this is an all-day event, whose bounds are dates."
+    )
+    etag: str | None = Field(
+        description=(
+            "Version of this object on the server, for use as a precondition "
+            "when it is later changed. Null when the server supplied none -- "
+            "see `etag_note`; a value is never invented."
+        )
+    )
+    etag_note: str | None = Field(
+        default=None,
+        description=(
+            "Why `etag` is null, or null when an ETag was returned. It "
+            "distinguishes the two reasons, which need different responses: the "
+            "server supplied no ETag for this object, or the ETag property "
+            "could not be read -- the latter may succeed on a retry."
+        ),
+    )
+    calendar_url: str = Field(
+        description=(
+            "CalDAV URL of the calendar it lives in. The same `uid` can exist "
+            "in more than one calendar; when no `calendar_url` was given, this "
+            "is the first calendar in `calendar_list` order that held it, and "
+            "the remaining calendars were not searched. Pass `calendar_url` to "
+            "choose which one answers."
+        )
+    )
+    calendar_name: str = Field(description="Display name of that calendar.")
+
+
+def build_calendar_event_get(
+    client_provider: ClientProvider,
+) -> Callable[..., Awaitable[EventDetail]]:
+    """Bind ``calendar_event_get`` to a source of clients."""
+
+    async def calendar_event_get(
+        uid: Annotated[
+            str,
+            Field(
+                description=(
+                    "Identifier of the event, as `calendar_events_list` "
+                    "returned it. The event is addressed by this UID, never "
+                    "searched for."
+                )
+            ),
+        ],
+        recurrence_id: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Which instance of a series to read, as "
+                    "`calendar_events_list` returned it: an ISO 8601 timestamp "
+                    "with an explicit offset, or a plain date for an all-day "
+                    "series. Omit it to read the series itself."
+                ),
+            ),
+        ] = None,
+        calendar_url: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Restrict the lookup to one calendar, by the URL "
+                    "`calendar_list` or `calendar_events_list` returned. Omit, "
+                    "or pass an empty string, to try every calendar until the "
+                    "event is found."
+                ),
+            ),
+        ] = None,
+    ) -> EventDetail:
+        """Read one event in full: attendees, description, location and its ETag.
+
+        The event is addressed by `uid`, never searched for. Give
+        `recurrence_id` to read one instance of a series -- with any override
+        applied -- or omit it to read the series itself; `scope` says which you
+        got. A cancelled instance is returned with `cancelled: true` rather than
+        as a live meeting.
+
+        The same `uid` can exist in more than one calendar -- a routine
+        duplicate on a shared account. Without `calendar_url` the calendars are
+        tried in `calendar_list` order and the first one holding the `uid`
+        answers; the rest are not searched, and `calendar_url` in the answer
+        says which one it was. Pass `calendar_url` to choose.
+
+        A `uid` nothing on the account holds is an error naming it, never an
+        empty result, and an instance that is not in the series is a different
+        error from a `uid` that is not there. If a calendar could not be read
+        while the account was searched, a miss says the search was incomplete
+        rather than claiming the event does not exist, and a `calendar_url` that
+        is not a calendar on this account is reported as that rather than as a
+        missing event.
+
+        `description` is capped and declares it; `join_url` and, for a series,
+        `recurrence_summary` are the two things a caller usually needs next.
+
+        `etag` is this version of the object, for a later conditional update. It
+        is null when the server supplied none or when it could not be read, and
+        `etag_note` says which; no value is ever invented.
+        """
+        wanted_uid = _checked_uid(uid)
+        instance = _checked_recurrence_id(recurrence_id)
+        wanted_calendar = _checked_calendar_url(calendar_url)
+
+        client = await client_provider()
+        fetched = await client.get_event(
+            uid=wanted_uid,
+            recurrence_id=instance,
+            calendar_url=wanted_calendar,
+        )
+        return _to_detail(
+            fetched.record,
+            etag=fetched.etag,
+            etag_unreadable=fetched.etag_unreadable,
+        )
+
+    calendar_event_get.__name__ = GET_TOOL_NAME
+    return calendar_event_get
+
+
+def _to_detail(
+    record: EventRecord, *, etag: str | None, etag_unreadable: bool = False
+) -> EventDetail:
+    description, truncated = _bounded(record.description)
+    return EventDetail(
+        uid=record.uid,
+        recurrence_id=record.recurrence_id,
+        is_series=record.is_series,
+        scope=record.scope,
+        cancelled=record.cancelled,
+        status=record.status,
+        summary=record.summary,
+        description=description,
+        description_truncated=truncated,
+        description_note=DESCRIPTION_TRUNCATED_NOTE if truncated else None,
+        location=record.location,
+        join_url=record.join_url,
+        recurrence_summary=record.recurrence_summary,
+        organizer=_to_attendee(record.organizer),
+        organizers=[_to_attendee(person) for person in record.organizers],
+        attendees=[_to_attendee(person) for person in record.attendees],
+        start=record.start,
+        end=record.end,
+        all_day=record.all_day,
+        etag=etag,
+        etag_note=_etag_note(etag, etag_unreadable),
+        calendar_url=record.calendar_url,
+        calendar_name=record.calendar_name,
+    )
+
+
+def _etag_note(etag: str | None, unreadable: bool) -> str | None:
+    """Which of the two reasons `etag` is null, or nothing when it is not."""
+    if etag:
+        return None
+    return ETAG_UNREADABLE_NOTE if unreadable else NO_ETAG_NOTE
+
+
+def _bounded(description: str | None) -> tuple[str | None, bool]:
+    """The invitation body, cut to the cap, and whether cutting was needed."""
+    if description is None or len(description) <= MAX_DESCRIPTION_CHARS:
+        return description, False
+    return description[:MAX_DESCRIPTION_CHARS], True
+
+
+def _to_attendee(person: Participant | None) -> Attendee | None:
+    if person is None:
+        return None
+    return Attendee(
+        email=person.email,
+        name=person.name,
+        response_status=person.response_status,
+        role=person.role,
+    )
+
+
+def _checked_uid(uid: object) -> str:
+    """A UID that actually names something.
+
+    A blank UID would be addressed as a real href and answered with a not-found
+    about the empty string, which tells the caller nothing about their mistake.
+    """
+    if not isinstance(uid, str):
+        raise ProtocolError(f"`uid` must be a string, not {type(uid).__name__}.")
+    trimmed = uid.strip()
+    if not trimmed:
+        raise ProtocolError(
+            "`uid` is blank. Give the `uid` of an event, as "
+            "`calendar_events_list` returned it."
+        )
+    return trimmed
+
+
+def _checked_recurrence_id(recurrence_id: object) -> date | datetime | None:
+    """Which instance, validated before anything is sent.
+
+    A blank string is refused rather than read as "the series": the two are
+    different questions, and answering the wrong one silently is exactly the
+    quiet mismatch this project refuses. A naive timestamp is refused for the
+    same reason it is everywhere else -- a moment with no offset names a
+    different instance to every reader.
+    """
+    if recurrence_id is None:
+        return None
+    if isinstance(recurrence_id, (datetime, date)):
+        value: date | datetime = recurrence_id
+    else:
+        if not isinstance(recurrence_id, str):
+            raise ProtocolError(
+                "`recurrence_id` must be an ISO 8601 timestamp, not "
+                f"{type(recurrence_id).__name__}."
+            )
+        trimmed = recurrence_id.strip()
+        if not trimmed:
+            raise ProtocolError(
+                "`recurrence_id` is blank. Omit it entirely to read the series "
+                "itself; a blank value would answer a different question from "
+                "the one asked."
+            )
+        try:
+            value = parse_instant(trimmed)
+        except ValueError as exc:
+            raise ProtocolError(
+                f"`recurrence_id` is not an ISO 8601 timestamp with an explicit "
+                f"UTC offset: {recurrence_id!r}. Pass back the `recurrence_id` "
+                "`calendar_events_list` returned, for example "
+                "2026-06-09T09:00:00+03:00."
+            ) from exc
+    if isinstance(value, datetime) and (
+        value.tzinfo is None or value.utcoffset() is None
+    ):
+        raise ProtocolError(
+            "`recurrence_id` has no UTC offset. Give an explicit one, for "
+            "example 2026-06-09T09:00:00+03:00; a naive timestamp names a "
+            "different instance to every reader."
+        )
+    return value

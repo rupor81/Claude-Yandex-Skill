@@ -23,11 +23,16 @@ from yandex_calendar_mcp.tools.calendars import build_calendar_list
 from yandex_calendar_mcp.tools.events import (
     MORE_PAGES,
     RANGE_TRUNCATED,
+    SCOPE_OCCURRENCE,
+    SCOPE_SERIES,
+    SCOPE_SINGLE,
     UNREADABLE_DATA,
+    build_calendar_event_get,
     build_calendar_events_list,
 )
 from yandex_core.config import load_profile
 from yandex_core.credentials import get_secret
+from yandex_core.errors import NotFound
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("YANDEX_MCP_LIVE_TESTS") != "1",
@@ -132,6 +137,71 @@ def test_paging_a_real_range_terminates_and_never_dead_ends():
         cursor = page.next_cursor
 
     assert len(seen) == len(set(seen)), "an occurrence was returned on two pages"
+
+
+def test_reading_one_real_event_by_uid_returns_it_with_an_etag():
+    """A UID taken from a real listing, fetched in full, with a usable ETag.
+
+    The ETag is the point: story 1.7 sends it back as a precondition, and it is
+    read as a DAV property rather than from the GET header, whose value on this
+    server carries a `--gzip` suffix the property does not.
+    """
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=30)
+    end = start + timedelta(days=60)
+
+    listed = anyio.run(
+        lambda: build_calendar_events_list(_provider())(start=start, end=end, limit=10)
+    )
+    if not listed.items:
+        pytest.skip("the configured account has no events in the sampled range")
+
+    occurrence = listed.items[0]
+    get = build_calendar_event_get(_provider())
+    detail = anyio.run(
+        lambda: get(uid=occurrence.uid, calendar_url=occurrence.calendar_url)
+    )
+
+    assert detail.uid == occurrence.uid
+    assert detail.calendar_url == occurrence.calendar_url
+    assert detail.scope in {SCOPE_SINGLE, SCOPE_SERIES}
+    assert detail.etag, "the server supplied no ETag; story 1.7 cannot be made safe"
+    assert "--gzip" not in detail.etag, "the ETag came from the header, not the property"
+    assert detail.etag_note is None
+    assert isinstance(detail.attendees, list)
+
+
+def test_reading_one_real_instance_of_a_real_series():
+    """A recurrence id from a real listing must address that instance."""
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=30)
+    end = start + timedelta(days=60)
+
+    listed = anyio.run(
+        lambda: build_calendar_events_list(_provider())(start=start, end=end, limit=50)
+    )
+    instances = [item for item in listed.items if item.recurrence_id]
+    if not instances:
+        pytest.skip("the configured account has no recurring events in the range")
+
+    occurrence = instances[0]
+    get = build_calendar_event_get(_provider())
+    detail = anyio.run(
+        lambda: get(
+            uid=occurrence.uid,
+            recurrence_id=occurrence.recurrence_id,
+            calendar_url=occurrence.calendar_url,
+        )
+    )
+    assert detail.scope == SCOPE_OCCURRENCE
+    assert detail.recurrence_id == occurrence.recurrence_id
+    assert _as_moment(detail.start) == _as_moment(occurrence.start)
+
+
+def test_an_unknown_uid_is_a_not_found_against_the_real_account():
+    """The one answer that must never come back is an empty success."""
+    get = build_calendar_event_get(_provider())
+    with pytest.raises(NotFound) as caught:
+        anyio.run(lambda: get(uid="no-such-event-yandex-mcp-live-test"))
+    assert "no-such-event-yandex-mcp-live-test" in str(caught.value)
 
 
 def _as_moment(value):

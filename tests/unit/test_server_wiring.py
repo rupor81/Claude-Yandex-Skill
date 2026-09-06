@@ -42,6 +42,7 @@ def test_the_registered_tools_are_the_read_only_ones(monkeypatch):
     server = build(monkeypatch)
     tools = anyio.run(server.list_tools)
     assert sorted(tool.name for tool in tools) == [
+        "calendar_event_get",
         "calendar_events_list",
         "calendar_list",
     ]
@@ -49,11 +50,66 @@ def test_the_registered_tools_are_the_read_only_ones(monkeypatch):
     assert all(tool.annotations.destructive_hint is False for tool in tools)
 
 
-def test_page_is_the_declared_output_schema(monkeypatch):
+#: The tools that return a collection, and so must say whether it is whole.
+LISTING_TOOLS = {"calendar_list", "calendar_events_list"}
+
+
+def test_page_is_the_declared_output_schema_of_every_listing_tool(monkeypatch):
     server = build(monkeypatch)
+    listed = set()
     for tool in anyio.run(server.list_tools):
+        if tool.name not in LISTING_TOOLS:
+            continue
+        listed.add(tool.name)
         required = set(tool.output_schema["required"])
         assert {"items", "complete", "next_cursor"} <= required
+    assert listed == LISTING_TOOLS, "a listing tool vanished; this test went vacuous"
+
+
+def test_reading_one_event_declares_the_etag_and_says_it_may_be_absent(monkeypatch):
+    """Story 1.7 needs the ETag; a caller must be told it can legitimately be null."""
+    server = build(monkeypatch)
+    (tool,) = [
+        tool
+        for tool in anyio.run(server.list_tools)
+        if tool.name == "calendar_event_get"
+    ]
+    assert "uid" in set(tool.input_schema["required"])
+    schema = tool.output_schema
+    assert "etag" in schema["properties"]
+    assert "null" in str(schema["properties"]["etag"]).lower()
+
+    # The type union alone says only "this may be null", which every optional
+    # field says. What this test exists to pin is the *explanation*: that a
+    # null is never an invented version, and that `etag_note` says which of the
+    # two reasons applies -- the server sent none, or it could not be read.
+    described = schema["properties"]["etag"]["description"].lower()
+    assert "never invented" in described or "is never invented" in described
+    assert "etag_note" in described
+    note = schema["properties"]["etag_note"]["description"].lower()
+    assert "supplied" in note, "the note must cover an ETag the server never sent"
+    assert "could not be read" in note, "and one this server failed to read"
+
+
+def test_calling_the_event_get_tool_returns_one_event_in_full(monkeypatch):
+    server = build(
+        monkeypatch,
+        calendars=[
+            FakeCalendar(
+                "Personal", "https://caldav.yandex.ru/c/personal/", [EVENT_DOCUMENT]
+            )
+        ],
+    )
+    result = anyio.run(
+        lambda: server.call_tool("calendar_event_get", {"uid": "standup-1"})
+    )
+    payload = result.structuredContent if hasattr(result, "structuredContent") else None
+    if payload is None:
+        payload = result.structured_content
+    assert payload["uid"] == "standup-1"
+    assert payload["summary"] == "Standup"
+    assert payload["etag"]
+    assert payload["scope"] == "series"
 
 
 def test_the_event_range_is_required_by_the_declared_input_schema(monkeypatch):

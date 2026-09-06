@@ -34,9 +34,10 @@ Five deliberate choices:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import icalendar
 import recurring_ical_events
@@ -52,6 +53,14 @@ __all__ = [
     "position_sort_key",
     "format_instant",
     "parse_instant",
+    "EventNotInDocument",
+    "InstanceNotInSeries",
+    "Participant",
+    "EventRecord",
+    "SCOPE_SINGLE",
+    "SCOPE_SERIES",
+    "SCOPE_OCCURRENCE",
+    "read_event",
 ]
 
 
@@ -285,11 +294,7 @@ def _expand_one_series(
             # contract is about where the occurrence *starts*.
             continue
 
-        occurrence_end = _instant(expanded, "DTEND")
-        if occurrence_end is None:
-            # No DTEND and no usable DURATION: a zero-length occurrence is the
-            # only honest reading, and is never guessed wider.
-            occurrence_end = occurrence_start
+        occurrence_end = _end_instant(expanded, occurrence_start)
 
         summary = expanded.get("SUMMARY")
         yield Occurrence(
@@ -450,6 +455,36 @@ def _instant(component: icalendar.Event, name: str) -> date | datetime | None:
     raise ValueError(f"{name} is not a date or datetime")
 
 
+def _duration_property(component: icalendar.Event) -> timedelta | None:
+    """The ``DURATION`` of one component, when it carries a readable one."""
+    field = component.get("DURATION")
+    if field is None:
+        return None
+    value = getattr(field, "dt", field)
+    return value if isinstance(value, timedelta) else None
+
+
+def _end_instant(
+    component: icalendar.Event, start: date | datetime
+) -> date | datetime:
+    """When this component ends: ``DTEND``, else ``DTSTART`` plus ``DURATION``.
+
+    ``DURATION`` is the other legal spelling of how long a meeting lasts, and it
+    is the one Yandex writes for some events.  Reading only ``DTEND`` reports a
+    45-minute meeting as instantaneous -- and worse, the listing tool resolves
+    ``DURATION`` through the expansion library, so the two tools would report
+    different ends for the same meeting.  With neither property, zero length is
+    the only honest reading and is never guessed wider.
+    """
+    end = _instant(component, "DTEND")
+    if end is not None:
+        return end
+    duration = _duration_property(component)
+    if duration is not None:
+        return start + duration
+    return start
+
+
 def _is_all_day(value: date | datetime) -> bool:
     """An all-day value is a date. ``datetime`` subclasses ``date``, so order matters."""
     return not isinstance(value, datetime)
@@ -511,3 +546,589 @@ def parse_instant(text: str) -> date | datetime:
             raise ValueError("datetime has no offset")
         return value
     return date.fromisoformat(text)
+
+
+# -- one event, in full ---------------------------------------------------
+#
+# Listing answers "what is on my calendar"; this half answers "what is this
+# meeting". It shares the expansion above rather than reimplementing it, because
+# selecting one instance and listing them all must agree about what an override
+# means, when an instance is cancelled, and where a series' boundaries are.
+
+#: A one-off event: it has no instances, so `recurrence_id` never applies.
+SCOPE_SINGLE = "single"
+
+#: The series itself, not one of its instances.
+SCOPE_SERIES = "series"
+
+#: One instance of a series, selected by its recurrence id.
+SCOPE_OCCURRENCE = "occurrence"
+
+
+class EventNotInDocument(Exception):
+    """The fetched document does not hold the requested ``UID``.
+
+    Addressing an object by URL can land on a document that exists but is not
+    the event asked for.  That is a miss for this UID, not a failure, so the
+    caller may keep looking in the next calendar.
+    """
+
+
+class InstanceNotInSeries(Exception):
+    """The ``UID`` was found, but the series has no such instance.
+
+    Deliberately distinct from :class:`EventNotInDocument`: "the meeting is not
+    on this account" and "that day is not part of this series" need different
+    corrections from the caller, and one dressed as the other sends them looking
+    in the wrong place.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class Participant:
+    """One ``ORGANIZER`` or ``ATTENDEE`` line, read rather than interpreted.
+
+    ``name`` is ``None`` when the line carried no ``CN``: an address with no
+    name is routine, and inventing one from the local part would put a name in
+    front of a human that nobody chose.
+    """
+
+    email: str | None
+    name: str | None
+    response_status: str | None
+    role: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EventRecord:
+    """One event -- a series, or one instance of one -- with its full detail."""
+
+    uid: str
+    recurrence_id: str | None
+    is_series: bool
+    scope: str
+    cancelled: bool
+    status: str | None
+    summary: str | None
+    description: str | None
+    location: str | None
+    organizer: Participant | None
+    organizers: tuple[Participant, ...]
+    attendees: tuple[Participant, ...]
+    join_url: str | None
+    recurrence_summary: str | None
+    start: date | datetime
+    end: date | datetime
+    all_day: bool
+    calendar_url: str
+    calendar_name: str
+
+
+def read_event(
+    sources: CalendarSource | Sequence[CalendarSource],
+    *,
+    uid: str,
+    recurrence_id: date | datetime | None = None,
+) -> EventRecord:
+    """Read one event out of the fetched documents that hold it, in full.
+
+    Several documents are accepted, and their components are gathered by ``UID``
+    across all of them before anything is read -- exactly as the listing path
+    groups them.  A ``RECURRENCE-ID`` override is frequently a CalDAV object of
+    its own: reading one document at a time returns a moved instance at the
+    series' unmodified time, and turns a document that holds only an override
+    into a not-found for an instance that plainly exists.
+
+    Args:
+        sources: the documents the server returned for this UID, in the order
+            they were fetched.  The first one that holds the ``UID`` names the
+            calendar the answer is attributed to.
+        uid: the event asked for.  A document holding some *other* event is a
+            miss, not a match: addressing by URL can land anywhere.
+        recurrence_id: which instance of a series, or ``None`` for the series
+            itself.
+
+    Raises:
+        EventNotInDocument: no document holds a component with this ``UID``.
+        InstanceNotInSeries: the ``UID`` is here but has no such instance --
+            including the case where the event is not a series at all.
+        ProtocolError: a document could not be parsed, the event carries a
+            timestamp with no offset, only overrides were found, or the instance
+            is superseded by a ``RANGE=THISANDFUTURE`` override this server does
+            not resolve.  None of these is a missing event, and reporting any of
+            them as one would be a claim about the account rather than the data.
+    """
+    if isinstance(sources, CalendarSource):
+        sources = [sources]
+
+    parsed: list[tuple[icalendar.Calendar, CalendarSource]] = []
+    unparseable = 0
+    for source in sources:
+        try:
+            parsed.append((icalendar.Calendar.from_ical(source.ics), source))
+        except Exception:  # noqa: BLE001 - counted below, never silently dropped
+            unparseable += 1
+
+    holders = [
+        (document, source, found)
+        for document, source in parsed
+        if (found := _components_with_uid(document, uid))
+    ]
+    if not holders:
+        if unparseable:
+            # The event may well be in the document that would not parse, so
+            # this is a fault in the data, not an absence on the account.
+            raise ProtocolError(
+                f"The calendar object for event {uid!r} could not be read: the "
+                "server returned something this parser does not recognise as "
+                "iCalendar. The event may well exist."
+            )
+        raise EventNotInDocument(uid)
+
+    source = holders[0][1]
+    documents = tuple(document for document, _, _ in holders)
+    components = [component for _, _, found in holders for component in found]
+
+    master = _master_of(components)
+    overrides = [c for c in components if c.get("RECURRENCE-ID") is not None]
+    is_series = _is_series(components)
+
+    try:
+        if recurrence_id is None:
+            if master is None:
+                # Every component here overrides one instance of a series whose
+                # own definition was not among the objects read. One instance's
+                # start, end, summary and location are not the series'.
+                raise ProtocolError(
+                    f"Event {uid!r} was found only as RECURRENCE-ID overrides: "
+                    "the component that defines the series itself is not in the "
+                    "objects read, so there is nothing to report as the series. "
+                    "One instance's times are not the series' times. Ask for a "
+                    "particular instance with `recurrence_id` instead."
+                )
+            return _record(
+                master,
+                uid=uid,
+                source=source,
+                recurrence_id=None,
+                is_series=is_series,
+                scope=SCOPE_SERIES if is_series else SCOPE_SINGLE,
+                start=_required_start(master, uid),
+                recurrence_summary=(
+                    _recurrence_summary(master) if is_series else None
+                ),
+            )
+
+        if not is_series:
+            # Answering with the event itself would hide the caller's mistake
+            # behind a plausible result.
+            raise InstanceNotInSeries(uid)
+
+        return _select_instance(
+            uid=uid,
+            source=source,
+            documents=documents,
+            master=master,
+            overrides=overrides,
+            components=components,
+            recurrence_id=recurrence_id,
+        )
+    except _NaiveTimestamp as exc:
+        raise ProtocolError(
+            f"Event {uid!r} carries a timestamp with no timezone, so it cannot "
+            "be reported with an explicit offset. Guessing one would move the "
+            "event for every reader at a different offset."
+        ) from exc
+
+
+def _components_with_uid(
+    document: icalendar.Calendar, uid: str
+) -> list[icalendar.Event]:
+    return [
+        component
+        for component in document.walk("VEVENT")
+        if str(component.get("UID") or "").strip() == uid
+    ]
+
+
+def _select_instance(
+    *,
+    uid: str,
+    source: CalendarSource,
+    documents: Sequence[icalendar.Calendar],
+    master: "icalendar.Event | None",
+    overrides: Sequence[icalendar.Event],
+    components: Sequence[icalendar.Event],
+    recurrence_id: date | datetime,
+) -> EventRecord:
+    """One instance of a series: an override, a cancellation, or an expansion."""
+    target = _as_instant(recurrence_id)
+    summary = _recurrence_summary(master) if master is not None else None
+
+    # An override wins outright: it *is* that instance, in its modified form.
+    for component in overrides:
+        moment = _instant(component, "RECURRENCE-ID")
+        if moment is not None and _as_instant(moment) == target:
+            return _record(
+                component,
+                uid=uid,
+                source=source,
+                recurrence_id=format_instant(moment),
+                is_series=True,
+                scope=SCOPE_OCCURRENCE,
+                start=_required_start(component, uid),
+                cancelled=_is_cancelled(component),
+                recurrence_summary=summary,
+            )
+
+    superseding = _superseded_from(overrides, target)
+    if superseding is not None:
+        # RANGE=THISANDFUTURE rewrites this instance and every later one. This
+        # server does not resolve it, and the unmodified time it would otherwise
+        # return is known to be wrong -- so the instance is reported as
+        # unresolved rather than answered with a value that sends people late.
+        raise ProtocolError(
+            f"Event {uid!r} has a RECURRENCE-ID;RANGE=THISANDFUTURE override at "
+            f"{superseding}, which supersedes this instance and every later one. "
+            "This server does not resolve THISANDFUTURE overrides, so the "
+            "instance could not be resolved; the unmodified time is known to be "
+            "wrong and is not returned. Use `calendar_events_list` over the day "
+            "in question, which expands the series through the same library the "
+            "server itself uses."
+        )
+
+    if master is None:
+        raise InstanceNotInSeries(uid)
+
+    # An EXDATE instance is not in the expansion at all -- the library removes
+    # it. Reported as cancelled rather than as missing, because "this meeting is
+    # off" and "there was never a meeting then" are different answers.
+    for excluded in _exdates(master):
+        if _as_instant(excluded) == target:
+            duration = _duration_of(master)
+            return _record(
+                master,
+                uid=uid,
+                source=source,
+                recurrence_id=format_instant(excluded),
+                is_series=True,
+                scope=SCOPE_OCCURRENCE,
+                start=excluded,
+                end=excluded + duration if duration is not None else excluded,
+                cancelled=True,
+                status="CANCELLED",
+                recurrence_summary=summary,
+            )
+
+    # The whole documents are carried across, not just the components: a `TZID`
+    # the events refer to resolves through the `VTIMEZONE` beside them, and
+    # dropping it would make the expansion fail on a series it can read.
+    group = _Group(
+        calendar_url=source.calendar_url,
+        uid=uid,
+        components=tuple(components),
+        documents=tuple(documents),
+        source=source,
+    )
+    # A day either side: enough for the instance itself and for an all-day value
+    # that sorts at midnight UTC, and narrow enough that a long series is not
+    # expanded wholesale to answer a question about one day.
+    window_start = target - timedelta(days=1)
+    window_end = target + timedelta(days=2)
+    for expanded in recurring_ical_events.of(
+        _calendar_with(group), components=["VEVENT"]
+    ).between(window_start, window_end):
+        moment = _instant(expanded, "RECURRENCE-ID") or _instant(expanded, "DTSTART")
+        if moment is None or _as_instant(moment) != target:
+            continue
+        return _record(
+            expanded,
+            uid=uid,
+            source=source,
+            recurrence_id=format_instant(moment),
+            is_series=True,
+            scope=SCOPE_OCCURRENCE,
+            start=_required_start(expanded, uid),
+            cancelled=_is_cancelled(expanded),
+            recurrence_summary=summary,
+        )
+
+    raise InstanceNotInSeries(uid)
+
+
+def _superseded_from(
+    overrides: Sequence[icalendar.Event], target: datetime
+) -> str | None:
+    """The ``RANGE=THISANDFUTURE`` override, if any, that rewrites ``target``.
+
+    Such an override replaces its own instance *and every later one*.  Ignoring
+    the parameter returns later instances at times the organiser has already
+    changed, which is the one kind of wrong answer that reads as right.
+    """
+    for component in overrides:
+        field = component.get("RECURRENCE-ID")
+        if field is None:
+            continue
+        if str(_parameter(field, "RANGE") or "").upper() != "THISANDFUTURE":
+            continue
+        try:
+            moment = _instant(component, "RECURRENCE-ID")
+        except _NaiveTimestamp:
+            # An unreadable boundary cannot rule the supersession out.
+            return "an unreadable time"
+        if moment is not None and _as_instant(moment) <= target:
+            return format_instant(moment)
+    return None
+
+
+def _master_of(components: Sequence[icalendar.Event]) -> "icalendar.Event | None":
+    """The component that defines the series, as opposed to overriding one instance."""
+    for component in components:
+        if component.get("RECURRENCE-ID") is None:
+            return component
+    return None
+
+
+def _required_start(component: icalendar.Event, uid: str) -> date | datetime:
+    start = _instant(component, "DTSTART")
+    if start is None:
+        raise ProtocolError(
+            f"Event {uid!r} has no start time, so there is nothing to report as "
+            "one. The object exists but is not a usable event."
+        )
+    return start
+
+
+def _duration_of(component: icalendar.Event) -> timedelta | None:
+    """How long one instance of this series lasts, when that can be read."""
+    try:
+        start = _instant(component, "DTSTART")
+        if start is None:
+            return None
+        end = _end_instant(component, start)
+    except _NaiveTimestamp:
+        return None
+    if isinstance(start, datetime) != isinstance(end, datetime):
+        return None
+    return end - start
+
+
+def _exdates(component: icalendar.Event) -> list[date | datetime]:
+    """Every excluded instance of a series, however the property was spelled.
+
+    ``EXDATE`` may appear once with several values or several times with one
+    each, and ``icalendar`` represents the two differently.
+
+    The values go through the same rule as every other instant here: a floating
+    one is refused rather than decorated.  Read raw, a floating ``EXDATE`` came
+    back as a naive ``start`` and a naive ``recurrence_id`` -- a value this
+    tool's own validator rejects if the caller passes it back.
+    """
+    field = component.get("EXDATE")
+    if field is None:
+        return []
+    fields = field if isinstance(field, list) else [field]
+    values: list[date | datetime] = []
+    for entry in fields:
+        dates = getattr(entry, "dts", None)
+        items = [entry] if dates is None else list(dates)
+        for item in items:
+            value = getattr(item, "dt", None if dates is None else item)
+            if isinstance(value, datetime):
+                if value.tzinfo is None or value.utcoffset() is None:
+                    raise _NaiveTimestamp(
+                        "EXDATE has no timezone; a floating exclusion cannot be "
+                        "reported with an explicit offset."
+                    )
+                values.append(value)
+            elif isinstance(value, date):
+                values.append(value)
+    return values
+
+
+#: The first absolute link in a text field, when a property did not carry one.
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _join_url(component: icalendar.Event) -> str | None:
+    """Where to join this meeting, when the invitation says so.
+
+    Read from the properties that exist to carry it -- ``CONFERENCE`` and the
+    ``X-`` spellings clients write -- and only then from ``LOCATION`` and
+    ``DESCRIPTION``, which is where Yandex and most clients actually put a
+    Telemost or meeting link.  ``None`` when nothing on the event carried one:
+    a link is never assembled from anything but text the invitation contained.
+    """
+    for name in ("CONFERENCE", "X-GOOGLE-CONFERENCE", "X-TELEMOST-URL"):
+        field = component.get(name)
+        if field is None:
+            continue
+        entry = field[0] if isinstance(field, list) and field else field
+        text = str(entry).strip()
+        if text.lower().startswith(("http://", "https://")):
+            return text
+    for name in ("LOCATION", "DESCRIPTION"):
+        text = _text(component, name)
+        if not text:
+            continue
+        found = _URL_IN_TEXT.search(text)
+        if found:
+            return found.group(0).rstrip(".,;)")
+    return None
+
+
+#: How each ``FREQ`` reads in a sentence, singular and plural.
+_FREQUENCIES = {
+    "SECONDLY": ("every second", "seconds"),
+    "MINUTELY": ("every minute", "minutes"),
+    "HOURLY": ("hourly", "hours"),
+    "DAILY": ("daily", "days"),
+    "WEEKLY": ("weekly", "weeks"),
+    "MONTHLY": ("monthly", "months"),
+    "YEARLY": ("yearly", "years"),
+}
+
+
+def _recurrence_summary(component: icalendar.Event) -> str | None:
+    """How this series recurs, in a sentence, or ``None`` when it does not.
+
+    A caller reading one event wants to know how it repeats; ``is_series: true``
+    alone tells them it does without telling them anything they can plan around.
+    The rule itself is deliberately not returned -- above this module nothing
+    knows what an ``RRULE`` is.
+    """
+    rule = component.get("RRULE")
+    if rule is None:
+        if component.get("RDATE") is not None:
+            return "Repeats on individual dates listed on the event."
+        return None
+    if not hasattr(rule, "get"):
+        return None
+
+    frequency = str(_first_value(rule.get("FREQ")) or "").upper()
+    words = _FREQUENCIES.get(frequency)
+    if words is None:
+        return None
+    every, plural = words
+
+    try:
+        interval = int(_first_value(rule.get("INTERVAL")) or 1)
+    except (TypeError, ValueError):
+        interval = 1
+    parts = [f"Repeats every {interval} {plural}" if interval > 1 else f"Repeats {every}"]
+
+    byday = rule.get("BYDAY")
+    if byday:
+        days = byday if isinstance(byday, (list, tuple)) else [byday]
+        parts.append("on " + ", ".join(str(day) for day in days))
+
+    count = _first_value(rule.get("COUNT"))
+    until = _first_value(rule.get("UNTIL"))
+    if count:
+        parts.append(f"{int(count)} times in all")
+    elif until is not None:
+        moment = getattr(until, "dt", until)
+        if isinstance(moment, (date, datetime)):
+            parts.append(f"until {format_instant(moment)}")
+    return ", ".join(parts) + "."
+
+
+def _first_value(value: object) -> object:
+    """One value from a property that ``icalendar`` may hand over as a list."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _participants(component: icalendar.Event, name: str) -> list[Participant]:
+    """``ATTENDEE`` or ``ORGANIZER`` lines, read as addresses and parameters."""
+    field = component.get(name)
+    if field is None:
+        return []
+    fields = field if isinstance(field, list) else [field]
+    people: list[Participant] = []
+    for entry in fields:
+        people.append(
+            Participant(
+                email=_address_of(entry),
+                name=_parameter(entry, "CN"),
+                response_status=_parameter(entry, "PARTSTAT"),
+                role=_parameter(entry, "ROLE"),
+            )
+        )
+    return people
+
+
+def _address_of(entry: object) -> str | None:
+    """The address behind a ``mailto:``, or whatever else the line carried."""
+    text = str(entry).strip()
+    if not text:
+        return None
+    if text.lower().startswith("mailto:"):
+        text = text[len("mailto:") :].strip()
+    return text or None
+
+
+def _parameter(entry: object, name: str) -> str | None:
+    """One parameter of a property line, or ``None`` when it was not given."""
+    params = getattr(entry, "params", None)
+    if params is None:
+        return None
+    try:
+        value = params.get(name)
+    except Exception:  # noqa: BLE001 - an unreadable parameter is an absent one
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _text(component: icalendar.Event, name: str) -> str | None:
+    value = component.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _record(
+    component: icalendar.Event,
+    *,
+    uid: str,
+    source: CalendarSource,
+    recurrence_id: str | None,
+    is_series: bool,
+    scope: str,
+    start: date | datetime,
+    end: date | datetime | None = None,
+    cancelled: bool | None = None,
+    status: str | None = None,
+    recurrence_summary: str | None = None,
+) -> EventRecord:
+    """Build the record for one component, given the instant it stands for."""
+    if end is None:
+        end = _end_instant(component, start)
+    organizers = _participants(component, "ORGANIZER")
+    read_status = status if status is not None else _text(component, "STATUS")
+    return EventRecord(
+        uid=uid,
+        recurrence_id=recurrence_id,
+        is_series=is_series,
+        scope=scope,
+        cancelled=_is_cancelled(component) if cancelled is None else cancelled,
+        status=read_status.upper() if read_status else None,
+        summary=_text(component, "SUMMARY"),
+        description=_text(component, "DESCRIPTION"),
+        location=_text(component, "LOCATION"),
+        organizer=organizers[0] if organizers else None,
+        organizers=tuple(organizers),
+        attendees=tuple(_participants(component, "ATTENDEE")),
+        join_url=_join_url(component),
+        recurrence_summary=recurrence_summary,
+        start=start,
+        end=end,
+        all_day=_is_all_day(start),
+        calendar_url=source.calendar_url,
+        calendar_name=source.calendar_name,
+    )
