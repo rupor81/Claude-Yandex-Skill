@@ -720,13 +720,22 @@ def parse_instant(text: str) -> date | datetime:
 
     A value with a time component is a datetime and must carry an offset; one
     without is a date and stays one.
+
+    Which of the two it is comes from :meth:`date.fromisoformat`, which accepts
+    a date and nothing else, rather than from looking for a literal ``"T"``.
+    ``datetime.fromisoformat`` also accepts ``2026-06-08 09:00:00+03:00`` and a
+    lowercase ``t``; both are ISO 8601 timestamps with an offset, and rejecting
+    them with a message that says they are not was a refusal of something this
+    server had promised to take.
     """
-    if "T" in text:
-        value = datetime.fromisoformat(text)
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("datetime has no offset")
-        return value
-    return date.fromisoformat(text)
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    value = datetime.fromisoformat(text)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime has no offset")
+    return value
 
 
 # -- one event, in full ---------------------------------------------------

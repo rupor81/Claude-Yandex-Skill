@@ -28,6 +28,7 @@ from caldav.elements import dav
 from caldav.lib import error as caldav_error
 from yandex_core.errors import (
     AuthError,
+    Conflict,
     NotFound,
     PolicyError,
     ProtocolError,
@@ -53,10 +54,12 @@ from .recurrence import DEFAULT_CEILING as EXPANSION_CEILING
 from .recurrence import expand as expand_occurrences
 from .recurrence import read_event
 from .recurrence import with_unreadable_calendars
+from .compose import EventDraft, build_event_document, new_uid, written_boundary
 
 __all__ = [
     "CalendarRef",
     "CalDAVCalendarClient",
+    "CreatedEvent",
     "FetchedEvent",
     "EXPANSION_CEILING",
 ]
@@ -102,6 +105,41 @@ class FetchedEvent:
     server could not read it" call for different next steps, and a failure to
     read one must never turn a fetched event into a missing one.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedEvent:
+    """One event that now exists on the server, and what is known about it.
+
+    ``record`` is what the server *holds*, read back after the write rather than
+    echoed from the request: this server adjusts stored values, and a caller
+    told what it asked for has been told nothing.  It is ``None`` only when the
+    readback itself failed, which is a smaller loss than it looks: the event
+    exists either way, and ``readback_error`` says what could not be confirmed.
+
+    ``href`` is the object the readback actually found.  It is the constructed
+    ``<calendar>/<uid>.ics`` when that is where the object is, and the href the
+    server really filed it under when the by-UID fallback found it elsewhere --
+    which is what a later conditional update must be aimed at.  When the
+    readback failed there was nothing to observe, so it is the constructed one
+    and ``readback_error`` says the object was never seen.
+
+    ``sent_start`` and ``sent_end`` are the boundaries as they were *written*,
+    not as they were asked for: composing a document truncates microseconds, and
+    comparing the stored values against the caller's originals would blame the
+    server for an edit this code made.
+    """
+
+    uid: str
+    href: str
+    calendar_url: str
+    calendar_name: str
+    etag: str | None
+    sent_start: date | datetime
+    sent_end: date | datetime
+    etag_unreadable: bool = False
+    record: EventRecord | None = None
+    readback_error: str | None = None
 
 
 class CalDAVCalendarClient:
@@ -219,6 +257,90 @@ class CalDAVCalendarClient:
         def run() -> FetchedEvent:
             return self._get_event_blocking(
                 uid=uid, recurrence_id=recurrence_id, calendar_url=calendar_url
+            )
+
+        return await anyio.to_thread.run_sync(run)
+
+    async def create_event(
+        self,
+        *,
+        calendar_url: str,
+        summary: str,
+        start: date | datetime,
+        end: date | datetime,
+        description: str | None = None,
+        location: str | None = None,
+    ) -> CreatedEvent:
+        """Write one new event into one named calendar, and read it back.
+
+        The calendar is named by the caller and never chosen here -- required by
+        this layer in its own right, not only by the tool above it.  This module
+        is usable from a plain script, and a script that named no calendar had
+        the account's first one picked for it, which on this account is the
+        operator's personal calendar.  The URL that
+        names it is only a *selector*: the address written to is the calendar's
+        own href as the principal's listing gives it.  Measured on the live
+        account, a URL this server returns from creating a calendar is not that
+        calendar's address -- writes aimed at it went elsewhere and a delete
+        aimed at it answered success while removing nothing -- so a URL the
+        listing does not know is a not-found here, before anything is written.
+
+        The write carries ``If-None-Match: *``: the server itself refuses to
+        replace an object that is already at that href.  A guard made of a
+        prior read would have a gap between the read and the write, and this one
+        does not.
+
+        Args:
+            calendar_url: which calendar, from ``list_calendars``.
+            summary: the event's title; an untitled event is refused.
+            start: timezone-aware, or a date for an all-day event.
+            end: exclusive, in the same form as ``start``.
+            description: invitation body, or ``None``.
+            location: where it is, or ``None``.
+
+        Returns:
+            What was created, with the values the *server* now holds and the
+            ETag of the stored object.  When the write succeeded but the event
+            could not be read back, the record is ``None`` and
+            ``readback_error`` says why: an event that exists is never reported
+            as a failure.
+
+        Raises:
+            ProtocolError: ``calendar_url`` is missing or blank, or the composed
+                event is not one that can be written. Nothing was written.
+            NotFound: ``calendar_url`` is not a calendar on this account.
+                Nothing was written.
+            Conflict: an object already exists at the event's href; nothing was
+                replaced.
+            PolicyError: the calendar refused the write.
+            TransportError: the connection failed. When it failed *during* the
+                write, the message says the outcome is unknown and names the
+                UID to check, because a blind retry could create the event a
+                second time.
+        """
+        if not isinstance(calendar_url, str) or not calendar_url.strip():
+            raise ProtocolError(
+                "`calendar_url` is required: no calendar is chosen for you. This "
+                "account has several and the server marks none of them as the "
+                "default, so an event written into a guessed one would be "
+                "somewhere nobody looks. Take the URL from `list_calendars`."
+            )
+
+        draft = EventDraft(
+            uid=new_uid(),
+            summary=summary,
+            start=start,
+            end=end,
+            description=description,
+            location=location,
+        )
+        # Composed before the connection is opened, so a draft that cannot be
+        # written is refused without a request being made at all.
+        document = build_event_document(draft)
+
+        def run() -> CreatedEvent:
+            return self._create_event_blocking(
+                draft=draft, document=document, calendar_url=calendar_url
             )
 
         return await anyio.to_thread.run_sync(run)
@@ -360,7 +482,7 @@ class CalDAVCalendarClient:
                     tried += 1
                     url = str(getattr(calendar, "url", "") or calendar_url or "")
                     try:
-                        sources, etag, etag_unreadable = _fetch_sources(
+                        sources, etag, etag_unreadable, _found_at = _fetch_sources(
                             calendar,
                             url=url,
                             uid=uid,
@@ -429,6 +551,182 @@ class CalDAVCalendarClient:
             )
         )
 
+    def _create_event_blocking(
+        self,
+        *,
+        draft: EventDraft,
+        document: str,
+        calendar_url: str,
+    ) -> CreatedEvent:
+        with self._translated():
+            with caldav.DAVClient(
+                url=self._url,
+                username=self._username,
+                password=self._password,
+                timeout=self._timeout,
+                # ``DAVClient.request`` catches 429 and 503, sleeps, and
+                # re-issues the same request -- PUT included. If the first
+                # attempt landed, the retry meets the guard and answers 412, and
+                # this code would report "nothing was created" for an event that
+                # exists. The rule is "never retry a write blindly", so the
+                # retry is turned off here rather than trusted not to fire.
+                rate_limit_handle=False,
+            ) as client:
+                calendars, unlisted = self._calendars_for(client, calendar_url)
+                if unlisted or not calendars:
+                    # Nothing is written to a URL the account does not list. A
+                    # write aimed at a URL that is not a calendar does not fail
+                    # loudly on this server; it goes somewhere nobody can find.
+                    raise NotFound(_not_a_calendar(calendar_url))
+                calendar = calendars[0]
+                # The listing's own URL, never the caller's string: the two
+                # differ on this server, and the difference is where a write
+                # goes missing.
+                real_url = str(getattr(calendar, "url", "") or calendar_url)
+                name = _display_name(calendar)
+                href = _object_href(real_url, draft.uid)
+
+                try:
+                    response = client.put(  # type: ignore[attr-defined]
+                        href,
+                        document,
+                        {
+                            "Content-Type": "text/calendar; charset=utf-8",
+                            # The guard is the write's own, so there is no gap
+                            # between checking and writing for anybody to slip
+                            # through.
+                            "If-None-Match": "*",
+                        },
+                    )
+                except http_error.RequestException as exc:
+                    # The request left this process. Whether the server acted on
+                    # it is unknown, and a retry could create it twice.
+                    raise TransportError(
+                        _write_outcome_unknown(draft.uid, calendar_url=real_url, exc=exc)
+                    ) from exc
+                except caldav_error.RateLimitError as exc:
+                    # The library's own retry is off, so this reaches here on
+                    # the first refusal. A 429 usually means nothing was stored,
+                    # but "usually" is not knowledge, and the wrong guess here
+                    # is a second copy of somebody's meeting.
+                    raise RateLimited(
+                        _write_outcome_unknown(
+                            draft.uid,
+                            calendar_url=real_url,
+                            exc=exc,
+                            what="Yandex answered the write by rate limiting it",
+                        )
+                    ) from exc
+                except caldav_error.AuthorizationError as exc:
+                    raise self._write_refused(exc, calendar=real_url, name=name) from exc
+
+                _check_write_status(
+                    _status_of(response), uid=draft.uid, href=href, calendar=real_url
+                )
+
+                # Success is not claimed from the write's own answer. It is
+                # confirmed by reading the object back -- through the same
+                # reader every other event goes through, so a created event and
+                # a read one cannot describe themselves differently.
+                record: EventRecord | None = None
+                etag: str | None = None
+                etag_unreadable = False
+                readback_error: str | None = None
+                try:
+                    sources, etag, etag_unreadable, found_at = _fetch_sources(
+                        calendar, url=real_url, uid=draft.uid, gather_overrides=False
+                    )
+                    if found_at:
+                        # Where the object really is, which is not always the
+                        # href this code built: a later conditional update has
+                        # to be aimed at the one the server used.
+                        href = found_at
+                    if not sources:
+                        readback_error = (
+                            "the server accepted the write but did not return the "
+                            "object when it was read back"
+                        )
+                    else:
+                        record = read_event(sources, uid=draft.uid)
+                except Exception as exc:  # noqa: BLE001 - reported, or re-raised
+                    if _is_transport_failure(exc) or isinstance(
+                        exc, caldav_error.AuthorizationError
+                    ):
+                        # Not a fact about the readback: the account itself has
+                        # become unusable, and every later call fails the same
+                        # way. Reporting it as an unexplained note under a
+                        # successful create hides the one thing that needs
+                        # fixing -- so it is raised as itself, saying plainly
+                        # that the event was nonetheless created.
+                        raise self._readback_broke_off(
+                            exc, uid=draft.uid, calendar=real_url
+                        ) from exc
+                    # Otherwise: the event exists. The server said so and
+                    # nothing here can unsay it. Failing now would send somebody
+                    # to create it a second time.
+                    record = None
+                    etag, etag_unreadable = None, False
+                    readback_error = f"the readback failed ({type(exc).__name__}: {exc})"
+
+                return CreatedEvent(
+                    uid=draft.uid,
+                    href=href,
+                    calendar_url=real_url,
+                    calendar_name=name,
+                    etag=etag,
+                    sent_start=written_boundary(draft.start),
+                    sent_end=written_boundary(draft.end),
+                    etag_unreadable=etag_unreadable,
+                    record=record,
+                    readback_error=readback_error,
+                )
+
+    def _readback_broke_off(
+        self, exc: BaseException, *, uid: str, calendar: str
+    ) -> Exception:
+        """A readback that failed for a reason bigger than the readback.
+
+        The taxonomy class is the one the failure really is -- a rejected
+        credential is an ``AuthError``, an unreachable host a ``TransportError``
+        -- so a caller that branches on the type is not told the wrong thing.
+        The message carries the one fact that must not be lost with it: the
+        event was created, and creating it again would make two.
+        """
+        translated = self._translated()._translate(exc)
+        return type(translated)(
+            f"Event {uid!r} WAS created in {calendar} -- the server accepted the "
+            f"write -- but reading it back failed: {translated} Its stored "
+            "values are therefore unknown. Do not create it again; read it with "
+            f"`calendar_event_get` for uid {uid!r} once the cause is fixed."
+        )
+
+    def _write_refused(
+        self, exc: BaseException, *, calendar: str, name: str
+    ) -> Exception:
+        """A refused write, told apart from a refused account.
+
+        A 403 on one PUT is a calendar this account may read and not write --
+        a subscribed or shared collection. Reporting it as the organisation
+        policy that disables app passwords would send an operator to an
+        administrator who can do nothing, so this one names the calendar
+        instead. A 401, and a refusal that cannot be classified, stay what they
+        are: the translator says the credential may be the cause, and that must
+        not be softened into a fact about one collection.
+        """
+        try:
+            forbidden = _is_forbidden(exc)
+        except _Undecidable:
+            return exc
+        if not forbidden:
+            return exc
+        return PolicyError(
+            f"The calendar {name!r} at {calendar} refused the write with 403. "
+            "The credential was accepted, so this is a permission on that "
+            "calendar -- a shared or subscribed collection this account may "
+            "read but not write to. Nothing was created. Create the event in a "
+            "calendar this account owns, from `calendar_list`."
+        )
+
     def _calendars_for(
         self, client: object, calendar_url: str | None
     ) -> tuple[list, bool]:
@@ -477,7 +775,7 @@ def _fetch_sources(
     url: str,
     uid: str,
     gather_overrides: bool,
-) -> tuple[list[CalendarSource], str | None, bool]:
+) -> tuple[list[CalendarSource], str | None, bool, str | None]:
     """Every object in one calendar that can be addressed for this ``UID``.
 
     The object is *addressed*, never searched for: the href the server names it
@@ -496,13 +794,16 @@ def _fetch_sources(
       read together, so a moved instance is not returned at the series' time.
 
     Returns:
-        the documents found, the ETag of the addressed object, and whether
-        reading that ETag failed.
+        the documents found, the ETag of the addressed object, whether reading
+        that ETag failed, and the href that object was actually found at --
+        which is the constructed one when the constructed one answered, and the
+        server's own when the by-UID fallback did.
     """
     sources: list[CalendarSource] = []
     hrefs: set[str] = set()
     etag: str | None = None
     etag_unreadable = False
+    found_at: str | None = None
     name: str | None = None
 
     def keep(obj: object) -> None:
@@ -529,6 +830,7 @@ def _fetch_sources(
     if addressed is not None:
         keep(addressed)
         etag, etag_unreadable = _etag_of(addressed)
+        found_at = str(getattr(addressed, "url", "") or "") or _object_href(url, uid)
 
     if addressed is None or gather_overrides:
         other = _object_by_uid(calendar, uid)
@@ -537,8 +839,9 @@ def _fetch_sources(
             keep(other)
             if addressed is None and len(sources) > before:
                 etag, etag_unreadable = _etag_of(other)
+                found_at = str(getattr(other, "url", "") or "") or None
 
-    return sources, etag, etag_unreadable
+    return sources, etag, etag_unreadable, found_at
 
 
 def _object_by_uid(calendar: object, uid: str) -> object | None:
@@ -656,6 +959,107 @@ def _no_such_event(
             "calendar with `calendar_url`."
         )
     return f"No event with UID {uid!r} exists in {where}."
+
+
+def _not_a_calendar(calendar_url: str) -> str:
+    """The message for a write aimed at a URL the account does not list."""
+    return (
+        f"{calendar_url!r} is not one of the calendars this account lists, so "
+        "nothing was created. A URL this server hands back is not always the "
+        "address of the thing it names, and a write aimed at one that is not a "
+        "calendar is not reliably refused -- it simply goes somewhere nothing "
+        "will find it. Use `calendar_list` to get the URL of a calendar on this "
+        "account."
+    )
+
+
+def _write_outcome_unknown(
+    uid: str,
+    *,
+    calendar_url: str,
+    exc: BaseException,
+    what: str = "The connection failed",
+) -> str:
+    """The message for a write whose fate nobody knows.
+
+    The one thing that must not happen next is a blind retry: if the server did
+    act on the request, retrying creates the meeting twice, and two identical
+    meetings on somebody's calendar is a mess a caller cannot undo without being
+    told which one is which.
+    """
+    return (
+        f"{what} while creating event {uid!r} in {calendar_url} "
+        f"({type(exc).__name__}), so the outcome is unknown: the event may or "
+        "may not have been created. Do not retry blindly -- check first with "
+        f"`calendar_event_get` for uid {uid!r}, and create it again only if it "
+        "is not there."
+    )
+
+
+def _status_of(response: object) -> int | None:
+    """The numeric status of a write response, or ``None`` when it gave none."""
+    for field in ("status", "status_code"):
+        value = getattr(response, field, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _check_write_status(
+    status: int | None, *, uid: str, href: str, calendar: str
+) -> None:
+    """Turn a write's status into either silence or the taxonomy.
+
+    Only 201 is a creation.  A 2xx is *not* good enough: on a PUT, 200 and 204
+    both mean an object already at that href was **replaced** -- exactly the
+    outcome ``If-None-Match: *`` exists to prevent -- so a server that ignored
+    the guard would otherwise have this code report "created" over a meeting it
+    had just destroyed.  There is no 403 branch: ``caldav`` raises
+    ``AuthorizationError`` for 401 and 403 before a response is ever returned,
+    so a second, weaker message here could only compete with the one
+    :meth:`CalDAVCalendarClient._write_refused` gives.
+
+    Raises:
+        Conflict: 412 or 409 -- the guard held and something is already there.
+        NotFound: 404 from a calendar the principal listed a moment ago.
+        ProtocolError: 200 or 204 (a replacement), and any other answer,
+            including one with no status at all: "the server said nothing" is
+            not "the event was created".
+    """
+    if status == 201:
+        return
+    if status in (409, 412):
+        raise Conflict(
+            f"An object already exists at {href}, so event {uid!r} was not "
+            f"created and nothing was replaced (the write carried a guard that "
+            "refuses to overwrite). Create it again to be given a new "
+            "identifier."
+        )
+    if status in (200, 204):
+        raise ProtocolError(
+            f"Yandex answered the write of event {uid!r} with {status}, which on "
+            "a PUT means an object already at that href was REPLACED, not "
+            "created. The write carried a guard forbidding exactly that, so the "
+            "server ignored it: something that was at "
+            f"{href} may have been destroyed, and this server will not report "
+            f"that as a creation. Read {href} with `calendar_event_get` for uid "
+            f"{uid!r} to see what is there now."
+        )
+    if status == 404:
+        raise NotFound(
+            f"Yandex answered the write of event {uid!r} with 404, so nothing "
+            f"was created. The calendar at {calendar} was in this account's own "
+            "listing a moment before the write, so this is not a URL that was "
+            "never a calendar: it has most likely been removed or renamed since "
+            "it was listed. Re-read `calendar_list` and create the event in a "
+            "calendar that is still there."
+        )
+    raise ProtocolError(
+        f"Yandex answered the write of event {uid!r} with "
+        f"{status if status is not None else 'no status at all'}, which this "
+        "server cannot read as success. The event may or may not exist: check "
+        f"with `calendar_event_get` for uid {uid!r} before trying again."
+    )
 
 
 def _no_such_instance(uid: str, recurrence_id: date | datetime | None) -> str:

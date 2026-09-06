@@ -19,15 +19,25 @@
   between pages silently omitted an entry. The "cursor past the end" error is gone with
   it — that rule existed only to compensate for an index that could not tell a shrunken
   list from a finished one.
-
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-4-read-one-event-in-full.md`
   summary: A recurring series whose master and whose RECURRENCE-ID override are stored at unrelated hrefs cannot be read completely, so such an instance returns the series' unmodified time.
   evidence: A genuine platform limit rather than an omission. Enumerating every object sharing a UID needs a UID search, and this server's UID search returns the entire calendar — 1759 objects for one UID, measured. The library's by-UID lookup returns exactly one object by construction. The addressed href plus that lookup covers every shape seen on the live account; only an override filed under an unrelated href escapes, and no safe mechanism reaches it.
-
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-5-inspect-busy-time.md`
   summary: An all-day event's busy interval is anchored to the offset of the range the caller asked with, and for a login written without a domain the account's own domains are inferred from the CalDAV host rather than read from the principal.
   evidence: Both are defensible defaults with no better source available today. A profile carries a login and a URL, not a timezone, so inventing a config field would create a value nothing verifies. The principal's calendar-user-address-set is the authoritative answer to "which addresses are this account" and would replace the host-derived guess; it is one extra request at connect time and worth doing when a second connector needs the same answer.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-6-create-an-event.md`
+  summary: Creating an event cannot invite attendees and cannot create a recurring series; both were deliberately excluded from the first write story.
+  evidence: Inviting sends mail on the operator's behalf, which is a different kind of act from writing to their own calendar and deserves its own decision. Recurrence multiplies the validation surface — RRULE, EXDATE, overrides — and the reading side of that took a whole story to get right. Neither is blocked by anything in the code; both are scope held back on purpose.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-6-create-an-event.md`
+  summary: A write whose outcome is unknown names the UID and tells the caller to check, but nothing yet performs that check for them.
+  evidence: Correct and honest as far as it goes — the alternative, retrying blindly, is what creates duplicate meetings. A follow-up could read by UID and report whether the write landed, turning "check this yourself" into an answer. That belongs with the update story, which needs the same read-then-decide shape.
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-query-events-over-a-date-range.md`
-  summary: The live paging test fails intermittently when run after the rest of the live suite and passes on its own, because it makes about thirty sequential account-wide queries into a server with aggressive rate limiting.
-  evidence: Observed twice. The code is not at fault — the same test passes in isolation in about 100 seconds — but a test that is red in the suite and green alone teaches everyone to stop reading red, which costs more than the coverage is worth. Walking fewer pages would check the same three properties (it terminates, never dead-ends, never repeats) without provoking the limit; that is a change to the test's cost, not to what it asserts.
+## Resolved
+
+- The live suite's rate-limit flake (raised in story 1.5, closed 2026-09-06). It was not one
+  bad test: the whole live suite shares one budget with this server, and whichever test ran
+  last paid for the others. Two sixty-day windows and a five-item page size were doing the
+  spending. Narrowing them to what each question actually needs cut the suite from three
+  minutes to ninety seconds and made two consecutive full runs green. Disabling the caldav
+  library's automatic retry for writes, done for correctness in story 1.6, is what moved the
+  symptom onto the write test and made the aggregate cause visible.

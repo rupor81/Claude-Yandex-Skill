@@ -63,7 +63,7 @@ development_status:
   1-3-query-events-over-a-date-range: review
   1-4-read-one-event-in-full: review
   1-5-inspect-busy-time: review
-  1-6-create-an-event: backlog
+  1-6-create-an-event: review
   1-7-update-an-event-with-an-explicit-scope: backlog
   1-8-delete-an-event-with-an-explicit-scope: backlog
   epic-1-retrospective: optional

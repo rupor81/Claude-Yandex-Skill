@@ -142,6 +142,27 @@ class FakeCalendar:
     def _objects(self):
         return [data for _, data in self._entries]
 
+    def holds(self, href):
+        """Whether this collection already has an object at that href."""
+        return any(
+            self._href_of(entry) is not None and _same_href(href, self._href_of(entry))
+            for entry in self._entries
+        )
+
+    def add(self, href, data):
+        """Store one object, replacing whatever was at that href.
+
+        Replacing rather than appending is deliberate: an unguarded PUT onto an
+        occupied href *does* destroy what was there, and a fake that quietly
+        kept both copies would let a missing collision guard pass this suite.
+        """
+        for index, entry in enumerate(self._entries):
+            stored = self._href_of(entry)
+            if stored is not None and _same_href(href, stored):
+                self._entries[index] = (str(href), data)
+                return
+        self._entries.append((str(href), data))
+
     def search(self, **kwargs):
         self.searched = kwargs
         if self._raises is not None:
@@ -269,17 +290,58 @@ class FakeAddressedCalendar:
         raise caldav_error.NotFoundError(url=str(self.url), reason="Not Found")
 
 
+class FakeResponse:
+    """What `DAVClient.put` hands back: a status code, and nothing inferred.
+
+    The status is the only thing the code may read to decide whether a write
+    happened; an ETag from a PUT response header is deliberately absent, because
+    on this server it is spelled differently from the DAV property a later
+    update must send back.
+    """
+
+    def __init__(self, status, headers=None):
+        self.status = status
+        self.headers = dict(headers or {})
+
+
 def install_fake_dav_client(
-    monkeypatch, *, calendars=None, raises=None, on_principal=None
+    monkeypatch,
+    *,
+    calendars=None,
+    raises=None,
+    on_principal=None,
+    puts=None,
+    put_raises=None,
+    put_status=_UNSET,
 ):
     """Replace `caldav.DAVClient` with a fake that answers or fails as asked.
 
     Returns a list that gains an entry every time a client is closed, so a
     leaked TLS pool is visible to the test that cares about it.
+
+    Args:
+        puts: a list the fake appends one entry to per PUT, so a test can see
+            the href, body and headers a write really used -- and see that a
+            refused write sent none at all.
+        put_raises: raised instead of answering, for a connection lost mid-write
+            or a server that refuses the method outright.
+        put_status: answered instead of storing anything, for a server that
+            refuses this particular write.  Passing it as ``None`` explicitly is
+            a response carrying no status at all -- distinct from not passing
+            it, which lets the fake answer the write normally.
     """
     import caldav
 
     closed = []
+
+    def _collection_for(url):
+        for calendar in calendars or []:
+            base = str(calendar.url)
+            if not base.endswith("/"):
+                base += "/"
+            if str(url).startswith(base):
+                return calendar
+        return None
 
     class FakeDAVClient:
         def __init__(self, **kwargs):
@@ -301,6 +363,31 @@ def install_fake_dav_client(
 
         def calendar(self, url=None):
             return FakeAddressedCalendar(url, calendars or [])
+
+        def put(self, url, body, headers=None):
+            """A PUT, honouring `If-None-Match: *` the way the real server does.
+
+            Without the guard header an occupied href is overwritten and
+            answered 204, which is exactly the outcome the guard exists to
+            prevent -- so a test can tell the two apart.
+            """
+            sent = dict(headers or {})
+            if puts is not None:
+                puts.append({"url": str(url), "body": body, "headers": sent})
+            if put_raises is not None:
+                raise put_raises
+            if put_status is not _UNSET:
+                return FakeResponse(put_status)
+            collection = _collection_for(url)
+            if collection is None:
+                return FakeResponse(404)
+            if collection.holds(url):
+                if sent.get("If-None-Match") == "*":
+                    return FakeResponse(412)
+                collection.add(url, body)
+                return FakeResponse(204)
+            collection.add(url, body)
+            return FakeResponse(201)
 
     monkeypatch.setattr(caldav, "DAVClient", FakeDAVClient)
     return closed

@@ -35,6 +35,7 @@ from yandex_calendar_mcp.tools.events import (
     SCOPE_SERIES,
     SCOPE_SINGLE,
     UNREADABLE_DATA,
+    build_calendar_event_create,
     build_calendar_event_get,
     build_calendar_events_list,
 )
@@ -124,9 +125,14 @@ def test_paging_a_real_range_terminates_and_never_dead_ends():
     cursor = None
     pages = 0
 
+    # A page size of 50 still crosses several page boundaries on a real month
+    # while making roughly a tenth of the requests. Every page re-fetches and
+    # re-expands the whole account, and this server rate-limits hard enough
+    # that a smaller size made this test fail more often than it passed --
+    # which taught everyone to stop reading the live suite's red.
     while True:
         page = anyio.run(
-            lambda c=cursor: tool(start=start, end=end, limit=5, cursor=c)
+            lambda c=cursor: tool(start=start, end=end, limit=50, cursor=c)
         )
         pages += 1
         assert pages < 200, "paging a month of a real calendar did not terminate"
@@ -154,8 +160,12 @@ def test_reading_one_real_event_by_uid_returns_it_with_an_etag():
     read as a DAV property rather than from the GET header, whose value on this
     server carries a `--gzip` suffix the property does not.
     """
-    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=30)
-    end = start + timedelta(days=60)
+    # Three weeks is enough to meet a recurring series on any working
+    # calendar, and costs a third of the requests. The whole live suite
+    # shares one rate-limit budget, so a window wider than the question
+    # needs is paid for by whichever test happens to run last.
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=7)
+    end = start + timedelta(days=21)
 
     listed = anyio.run(
         lambda: build_calendar_events_list(_provider())(start=start, end=end, limit=10)
@@ -180,8 +190,12 @@ def test_reading_one_real_event_by_uid_returns_it_with_an_etag():
 
 def test_reading_one_real_instance_of_a_real_series():
     """A recurrence id from a real listing must address that instance."""
-    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=30)
-    end = start + timedelta(days=60)
+    # Three weeks is enough to meet a recurring series on any working
+    # calendar, and costs a third of the requests. The whole live suite
+    # shares one rate-limit budget, so a window wider than the question
+    # needs is paid for by whichever test happens to run last.
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=7)
+    end = start + timedelta(days=21)
 
     listed = anyio.run(
         lambda: build_calendar_events_list(_provider())(start=start, end=end, limit=50)
@@ -360,3 +374,175 @@ def test_a_real_range_beyond_the_maximum_is_refused_before_the_network():
     with pytest.raises(ProtocolError) as caught:
         anyio.run(lambda: tool(start=start, end=start + timedelta(days=400)))
     assert "366" in str(caught.value)
+
+
+# -- the first live test that writes --------------------------------------
+#
+# Everything above reads. This one creates an event on the real account, so it
+# does it inside a calendar it makes for itself and removes afterwards, and it
+# proves the account it started with is the account it left.
+#
+# One measured hazard shapes all of it: the URL this server returns from
+# *creating* a calendar is not that calendar's address. Writes aimed at it go
+# elsewhere, and -- worse -- a DELETE aimed at it answered 200 while removing
+# nothing. So every address used here comes from the principal's own listing,
+# looked up after the fact by display name, and never from the creation call.
+
+
+def _dav_client():
+    import caldav
+
+    profile = load_profile()
+    return caldav.DAVClient(
+        url=profile.caldav_url,
+        username=profile.login,
+        password=get_secret("calendar", profile.name),
+    )
+
+
+def _listed_calendars():
+    """Every calendar on the account, as (name, url), from the listing."""
+    with _dav_client() as client:
+        return [
+            (str(calendar.name or ""), str(calendar.url))
+            for calendar in client.principal().calendars()
+        ]
+
+
+def _real_url_of(name):
+    """The address of the calendar with this display name, from the listing.
+
+    Never the URL the creation call returned: that one is a hint, and acting on
+    it silently does the wrong thing.
+    """
+    matches = [url for listed, url in _listed_calendars() if listed == name]
+    assert len(matches) <= 1, f"two calendars are called {name!r}; refusing to guess"
+    return matches[0] if matches else None
+
+
+def test_creating_a_real_event_reports_what_the_server_stored_and_leaves_no_trace():
+    """One real create, in a calendar made for it, removed afterwards.
+
+    What is asserted is the contract -- that the event exists, that the answer
+    reports stored values and an ETag -- plus the one fact about the operator's
+    account that this test is allowed to assert: that it is unchanged when the
+    test is over.
+    """
+    import uuid
+
+    before = _listed_calendars()
+    scratch_name = f"yandex-mcp-live-{uuid.uuid4().hex[:8]}"
+
+    with _dav_client() as client:
+        client.principal().make_calendar(name=scratch_name)
+
+    scratch_url = _real_url_of(scratch_name)
+    assert scratch_url, "the throwaway calendar was created but is not in the listing"
+
+    try:
+        # On a whole minute: measured, this server stores an event to the
+        # minute and drops the seconds, and the sub-minute case is asserted
+        # deliberately further down rather than tripped over here.
+        start = datetime.now(timezone.utc).replace(second=0, microsecond=0) + timedelta(
+            days=1
+        )
+        end = start + timedelta(hours=1)
+        create = build_calendar_event_create(_provider())
+        created = anyio.run(
+            lambda: create(
+                calendar_url=scratch_url,
+                summary="yandex-mcp live create",
+                start=start.isoformat(),
+                end=end.isoformat(),
+                description="Written by the live test suite; safe to delete.",
+                location="Nowhere",
+            )
+        )
+
+        assert created.created is True
+        assert created.uid
+        assert created.calendar_url.rstrip("/") == scratch_url.rstrip("/")
+        assert created.etag, "no ETag was returned, so story 1.7 cannot be made safe"
+        assert "--gzip" not in created.etag, "the ETag came from a header, not the property"
+        assert created.stored is not None, created.stored_note
+        assert created.stored.all_day is False
+        assert created.stored.start.utcoffset() is not None
+        assert created.stored.end.utcoffset() is not None
+        # What the server holds, not what was asked for. Whether it adjusted
+        # anything is its business; what this asserts is that the two are
+        # reconciled honestly -- equal and said to be equal, or different and
+        # said to be different.
+        assert created.difference_note
+        if created.differs_from_request:
+            assert created.differences
+        else:
+            assert created.stored.start == start
+            assert created.stored.end == end
+            assert created.stored.summary == "yandex-mcp live create"
+
+        # Independently confirmed through the read path, not the write's answer.
+        detail = anyio.run(
+            lambda: build_calendar_event_get(_provider())(
+                uid=created.uid, calendar_url=scratch_url
+            )
+        )
+        assert detail.uid == created.uid
+        assert detail.summary == created.stored.summary
+        assert detail.location == created.stored.location
+
+        # Two things at once, in one write. A second create with the same
+        # values is a second event, never a replacement -- nothing this tool
+        # does overwrites what is there. And its start carries seconds, which
+        # this server is measured to drop: the answer must say the stored value
+        # differs from the request rather than echoing back what was asked for.
+        odd_start = start + timedelta(seconds=41)
+        second = anyio.run(
+            lambda: create(
+                calendar_url=scratch_url,
+                summary="yandex-mcp live create",
+                start=odd_start.isoformat(),
+                end=(odd_start + timedelta(hours=1)).isoformat(),
+            )
+        )
+        assert second.uid != created.uid
+        assert second.stored is not None, second.stored_note
+        if second.stored.start != odd_start:
+            assert second.differs_from_request is True, (
+                "the server stored a different instant and the answer hid it"
+            )
+            assert any("start" in line for line in second.differences)
+    finally:
+        # Addressed by the listing's URL, and only ever the calendar this test
+        # made: a delete aimed at the wrong address answers success and removes
+        # nothing, which would leave the account changed and the test green.
+        target = _real_url_of(scratch_name)
+        if target is not None:
+            with _dav_client() as client:
+                client.calendar(url=target).delete()
+
+    after = _listed_calendars()
+    assert scratch_name not in [name for name, _ in after], (
+        "the throwaway calendar is still on the account"
+    )
+    assert sorted(after) == sorted(before), (
+        "the account's calendars are not what they were before this test"
+    )
+
+
+def test_a_real_write_into_a_url_that_is_not_a_calendar_writes_nothing():
+    """The measured hazard, asserted: a plausible URL is refused, not written to."""
+    profile = load_profile()
+    bogus = profile.caldav_url.rstrip("/") + "/no-such-calendar-yandex-mcp-live/"
+    create = build_calendar_event_create(_provider())
+    start = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)
+
+    with pytest.raises(NotFound) as caught:
+        anyio.run(
+            lambda: create(
+                calendar_url=bogus,
+                summary="yandex-mcp live create that must not happen",
+                start=start.isoformat(),
+                end=(start + timedelta(hours=1)).isoformat(),
+            )
+        )
+    assert "no-such-calendar-yandex-mcp-live" in str(caught.value)

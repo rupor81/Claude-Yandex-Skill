@@ -26,7 +26,7 @@ The decisions worth reading twice:
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Annotated
 
 from pydantic import BaseModel, Field
@@ -34,7 +34,7 @@ from yandex_core.errors import ProtocolError
 from yandex_core.paging import checked_limit, encode_position_cursor
 from yandex_core.results import Page
 
-from ..client.caldav_client import CalDAVCalendarClient
+from ..client.caldav_client import CalDAVCalendarClient, CreatedEvent
 from ..client.recurrence import (
     SCOPE_OCCURRENCE,
     SCOPE_SERIES,
@@ -78,7 +78,14 @@ __all__ = [
     "ETAG_UNREADABLE_NOTE",
     "DESCRIPTION_TRUNCATED_NOTE",
     "MAX_DESCRIPTION_CHARS",
+    "MAX_SUMMARY_CHARS",
+    "MAX_LOCATION_CHARS",
+    "MAX_DESCRIPTION_INPUT_CHARS",
     "build_calendar_event_get",
+    "CREATE_TOOL_NAME",
+    "StoredEvent",
+    "EventCreated",
+    "build_calendar_event_create",
     "MORE_PAGES",
     "RANGE_TRUNCATED",
     "UNREADABLE_DATA",
@@ -93,6 +100,16 @@ MAX_LIMIT = 200
 #: this server is bounded and says so, and an unbounded one here would be the
 #: single place a caller could not predict the size of an answer.
 MAX_DESCRIPTION_CHARS = 2000
+
+#: What a caller may *send*.  Nothing composed here is bounded by the protocol,
+#: so without these a megabyte description would be composed and PUT, and the
+#: 413 that came back would surface as "the event may or may not exist" -- a
+#: write of unknown outcome caused by a value that could have been refused
+#: before the connection was opened.  They are deliberately generous: they exist
+#: to stop the absurd, not to have an opinion about long invitations.
+MAX_SUMMARY_CHARS = 500
+MAX_LOCATION_CHARS = 500
+MAX_DESCRIPTION_INPUT_CHARS = 20_000
 
 TOOL_NAME = "calendar_events_list"
 GET_TOOL_NAME = "calendar_event_get"
@@ -841,3 +858,564 @@ def _checked_recurrence_id(recurrence_id: object) -> date | datetime | None:
             "different instance to every reader."
         )
     return value
+
+
+# -- creating one event ---------------------------------------------------
+
+
+class StoredEvent(BaseModel):
+    """What the server holds after the write -- never what was asked for.
+
+    This server adjusts values on write, so every field here was read back off
+    the server afterwards. A caller comparing these against its request is
+    comparing against reality; a caller told its own request back has been told
+    nothing.
+    """
+
+    summary: str | None = Field(description="Title, as stored.")
+    description: str | None = Field(
+        description=(
+            "Invitation body as stored, or null when it has none. Capped at "
+            f"{MAX_DESCRIPTION_CHARS} characters like everywhere else in this "
+            "server; `description_truncated` says when it was cut."
+        )
+    )
+    description_truncated: bool = Field(
+        default=False,
+        description=(
+            f"True when `description` was longer than {MAX_DESCRIPTION_CHARS} "
+            "characters and this answer carries only that much of it. The event "
+            "on the server is whole; this field is about the answer."
+        ),
+    )
+    location: str | None = Field(description="Location as stored, or null.")
+    start: datetime | date = Field(
+        description=(
+            "Start as stored: a timestamp with an explicit offset, or a plain "
+            "date for an all-day event."
+        )
+    )
+    end: datetime | date = Field(description="End as stored, in the same form.")
+    all_day: bool = Field(
+        description="True when the server stored this as an all-day event."
+    )
+    status: str | None = Field(
+        default=None,
+        description="CONFIRMED, TENTATIVE or CANCELLED as stored, or null.",
+    )
+    is_series: bool = Field(
+        default=False,
+        description=(
+            "True if the stored event recurs. This tool creates one-off events "
+            "only, so a true here means the server made it something else."
+        ),
+    )
+
+
+class EventCreated(BaseModel):
+    """One event that now exists, described by what the server holds."""
+
+    created: bool = Field(
+        description=(
+            "Always true when this answer is returned: the server accepted the "
+            "write. A write that did not happen is an error, never this model "
+            "with `created: false` -- and a write whose outcome is unknown is an "
+            "error that says so and names the UID to check."
+        )
+    )
+    uid: str = Field(
+        description=(
+            "Identifier of the new event. Pass it to `calendar_event_get` to "
+            "read it, and keep it: it is how this event is addressed from now on."
+        )
+    )
+    href: str = Field(
+        description=(
+            "CalDAV URL of the object that holds the new event, as the readback "
+            "found it -- which is not always the address the write was aimed at, "
+            "because this server may file an object under an href of its own. "
+            "When the readback failed there was nothing to observe and this is "
+            "the address written to; `stored_note` says so."
+        )
+    )
+    calendar_url: str = Field(
+        description=(
+            "The calendar it was written into, as that calendar's own listing "
+            "gives its URL -- which is not always the URL it was asked for by."
+        )
+    )
+    calendar_name: str = Field(description="Display name of that calendar.")
+    etag: str | None = Field(
+        description=(
+            "Version of the new object, for use as a precondition when it is "
+            "later changed. Null when the server supplied none or it could not "
+            "be read -- see `etag_note`; a value is never invented."
+        )
+    )
+    etag_note: str | None = Field(
+        default=None,
+        description="Why `etag` is null, or null when an ETag was returned.",
+    )
+    stored: StoredEvent | None = Field(
+        default=None,
+        description=(
+            "What the server holds, read back after the write. Null only when "
+            "the readback failed, which does not mean the write did: see "
+            "`stored_note`."
+        ),
+    )
+    stored_note: str | None = Field(
+        default=None,
+        description=(
+            "Why `stored` is null, or null when it was read. The event exists "
+            "either way -- this says only that its stored values could not be "
+            "confirmed."
+        ),
+    )
+    differs_from_request: bool = Field(
+        description=(
+            "True when at least one stored value is not what was asked for. "
+            "False when they match -- or, when the readback failed, when there "
+            "was nothing to compare: `difference_note` says which."
+        )
+    )
+    differences: list[str] = Field(
+        default_factory=list,
+        description=(
+            "One line per value the server stored differently, naming the field, "
+            "what was asked for and what is there."
+        ),
+    )
+    difference_note: str | None = Field(
+        default=None,
+        description=(
+            "What the comparison established, in words: that the stored values "
+            "match the request, that they differ, or that they could not be "
+            "compared at all."
+        ),
+    )
+
+
+CREATE_TOOL_NAME = "calendar_event_create"
+
+#: What the answer says when the event exists but its stored values are unknown.
+READBACK_FAILED_NOTE = (
+    "The event was created -- the server accepted the write -- but it could not "
+    "be read back, so this answer carries no stored values: {reason}. Do not "
+    "create it again; read it with `calendar_event_get` using the `uid` above."
+)
+
+#: What the answer says when there was nothing to compare against.
+NO_COMPARISON_NOTE = (
+    "The stored values could not be read back, so nothing was compared: this is "
+    "not a statement that the server stored what was asked for."
+)
+
+MATCHES_NOTE = "The server stored every value as it was requested."
+
+DIFFERS_NOTE = (
+    "The server stored at least one value differently from the request; "
+    "`differences` names each one. The stored values are what exists."
+)
+
+#: What the answer says about an ETag on a created object that was not read.
+CREATE_ETAG_UNREADABLE_NOTE = (
+    "The new object's ETag could not be read, so `etag` is null and nothing was "
+    "invented in its place. The event was created. Read it with "
+    "`calendar_event_get` to obtain an ETag before changing it."
+)
+
+
+def build_calendar_event_create(
+    client_provider: ClientProvider,
+) -> Callable[..., Awaitable[EventCreated]]:
+    """Bind ``calendar_event_create`` to a source of clients."""
+
+    async def calendar_event_create(
+        calendar_url: Annotated[
+            str,
+            Field(
+                description=(
+                    "Which calendar to create the event in, by the URL "
+                    "`calendar_list` returned. Required, and never guessed: "
+                    "this account has several calendars, the server marks none "
+                    "of them as the default, and a meeting written into the "
+                    "wrong one is not obviously recoverable."
+                )
+            ),
+        ],
+        summary: Annotated[
+            str,
+            Field(
+                description=(
+                    "Title of the event. Required and never blank: an untitled "
+                    f"event cannot be found again. At most {MAX_SUMMARY_CHARS} "
+                    "characters; a longer one is refused rather than cut."
+                )
+            ),
+        ],
+        start: Annotated[
+            str,
+            Field(
+                description=(
+                    "When it starts. ISO 8601 with an explicit offset, e.g. "
+                    "2026-06-08T09:00:00+03:00 -- or a plain date, e.g. "
+                    "2026-06-08, to create an all-day event. A timestamp "
+                    "without an offset is refused."
+                )
+            ),
+        ],
+        end: Annotated[
+            str,
+            Field(
+                description=(
+                    "When it ends, exclusive, in the same form as `start`: both "
+                    "timestamps, or both dates. For a single all-day event this "
+                    "is the following date. Must be after `start`."
+                )
+            ),
+        ],
+        description: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Body of the invitation. Omit it entirely for none; a blank "
+                    "string is refused rather than stored as an empty body. At "
+                    f"most {MAX_DESCRIPTION_INPUT_CHARS} characters."
+                ),
+            ),
+        ] = None,
+        location: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Where it is. Omit it entirely for none; a blank string is "
+                    f"refused. At most {MAX_LOCATION_CHARS} characters."
+                ),
+            ),
+        ] = None,
+    ) -> EventCreated:
+        """Create one event in a named calendar and report what the server stored.
+
+        This is a write: it adds an event to the operator's calendar. It creates
+        one-off events only -- no recurrence -- and invites nobody: attendees are
+        deliberately not offered, because inviting sends mail on the operator's
+        behalf.
+
+        `calendar_url` is required. No calendar is chosen for you: the account
+        has several, none is marked default, and an event in the wrong calendar
+        is not obviously recoverable. A URL that is not one of this account's
+        calendars is an error and nothing is written.
+
+        Nothing existing is ever replaced. The write refuses to overwrite an
+        object that is already at the new event's address, and says so rather
+        than silently taking its place.
+
+        The answer reports what the *server* holds, read back after the write,
+        not what was asked for -- this server adjusts stored values, and
+        `differences` names any that came back changed. If the event could not be
+        read back afterwards it is still reported as created, with `stored_note`
+        explaining: it exists, and creating it again would make two.
+
+        `etag` is the new object's version, for a later conditional change.
+        """
+        wanted_calendar = _required_calendar_url(calendar_url)
+        title = _checked_summary(summary)
+        begins = _checked_boundary(start, "start")
+        finishes = _checked_boundary(end, "end")
+        _check_event_bounds(begins, finishes)
+        body = _checked_optional_text(description, "description")
+        where = _checked_optional_text(location, "location")
+
+        client = await client_provider()
+        created = await client.create_event(
+            calendar_url=wanted_calendar,
+            summary=title,
+            start=begins,
+            end=finishes,
+            description=body,
+            location=where,
+        )
+
+        stored = _to_stored(created.record)
+        differences = (
+            _differences(
+                created.record,
+                summary=title,
+                # What was written, not what was typed: the document carries
+                # whole seconds, and a microsecond this server dropped is not a
+                # value the server changed.
+                start=created.sent_start,
+                end=created.sent_end,
+                description=body,
+                location=where,
+            )
+            if created.record is not None
+            else []
+        )
+        return EventCreated(
+            created=True,
+            uid=created.uid,
+            href=created.href,
+            calendar_url=created.calendar_url,
+            calendar_name=created.calendar_name,
+            etag=created.etag,
+            etag_note=_create_etag_note(created),
+            stored=stored,
+            stored_note=(
+                READBACK_FAILED_NOTE.format(
+                    reason=created.readback_error or "the reason was not reported"
+                )
+                if stored is None
+                else None
+            ),
+            differs_from_request=bool(differences),
+            differences=differences,
+            difference_note=(
+                NO_COMPARISON_NOTE
+                if stored is None
+                else (DIFFERS_NOTE if differences else MATCHES_NOTE)
+            ),
+        )
+
+    calendar_event_create.__name__ = CREATE_TOOL_NAME
+    return calendar_event_create
+
+
+def _create_etag_note(created: CreatedEvent) -> str | None:
+    """Why a created object has no ETag, or nothing when it has one."""
+    if created.etag:
+        return None
+    if created.record is None or created.etag_unreadable:
+        return CREATE_ETAG_UNREADABLE_NOTE
+    return NO_ETAG_NOTE
+
+
+def _to_stored(record: EventRecord | None) -> StoredEvent | None:
+    if record is None:
+        return None
+    description, truncated = _bounded(record.description)
+    return StoredEvent(
+        summary=record.summary,
+        description=description,
+        description_truncated=truncated,
+        location=record.location,
+        start=record.start,
+        end=record.end,
+        all_day=record.all_day,
+        status=record.status,
+        is_series=record.is_series,
+    )
+
+
+#: A status the request did not ask for but which changes nothing about the
+#: event.  Anything else -- CANCELLED above all, which puts a meeting on nobody's
+#: calendar -- is a difference the caller has to be told about.
+_UNREMARKABLE_STATUSES = (None, "CONFIRMED")
+
+
+def _differences(
+    record: EventRecord,
+    *,
+    summary: str,
+    start: date | datetime,
+    end: date | datetime,
+    description: str | None,
+    location: str | None,
+) -> list[str]:
+    """Every value the server stored differently from the request.
+
+    Every field :class:`StoredEvent` exposes is compared. Anything left out
+    would let the answer say "the server stored every value as it was requested"
+    while showing, in the same object, a value that was not: a one-off stored as
+    a recurring series is the case that made this explicit.
+
+    ``start`` and ``end`` are the boundaries as they were *written*, not as the
+    caller spelled them: composing the document truncates microseconds, and
+    blaming the server for that would accuse Yandex of an edit this server made.
+
+    Instants are compared as instants, not as text: this server is free to
+    re-spell a moment -- a different offset, a trailing Z -- and reporting that
+    as a change would bury a real one in noise. A date is never equal to a
+    timestamp here, so an all-day event turned into a timed one is reported.
+    """
+    differences: list[str] = []
+
+    def note(field: str, requested: object, stored: object) -> None:
+        differences.append(
+            f"{field}: requested {requested!r}, stored {stored!r}"
+        )
+
+    if (record.summary or "") != summary:
+        note("summary", summary, record.summary)
+    if not _same_moment(record.start, start):
+        note("start", format_instant(start), format_instant(record.start))
+    if not _same_moment(record.end, end):
+        note("end", format_instant(end), format_instant(record.end))
+    if (record.description or None) != description:
+        note("description", description, record.description)
+    if (record.location or None) != location:
+        note("location", location, record.location)
+    all_day = not isinstance(start, datetime)
+    if record.all_day != all_day:
+        note("all_day", all_day, record.all_day)
+    if record.is_series:
+        # This tool creates one-off events only, so any series at all is the
+        # server having made something other than what was asked for.
+        note("is_series", False, True)
+    if record.status not in _UNREMARKABLE_STATUSES:
+        note("status", "CONFIRMED (unstated, so confirmed)", record.status)
+    return differences
+
+
+def _same_moment(stored: date | datetime, requested: date | datetime) -> bool:
+    """Whether two boundaries name the same point, spelling aside.
+
+    The type check is not redundant with the equality: a date and a timestamp
+    are never the same boundary here, and comparing them directly raises rather
+    than answering.  Two timestamps compare as instants, so a re-spelled offset
+    is not a difference.
+    """
+    if isinstance(stored, datetime) != isinstance(requested, datetime):
+        return False
+    return stored == requested
+
+
+def _required_calendar_url(calendar_url: object) -> str:
+    """The one calendar this event goes into, never guessed."""
+    if not isinstance(calendar_url, str):
+        raise ProtocolError(
+            "`calendar_url` must be the URL of a calendar, not "
+            f"{type(calendar_url).__name__}. Use `calendar_list` to get one."
+        )
+    trimmed = calendar_url.strip()
+    if not trimmed:
+        raise ProtocolError(
+            "`calendar_url` is required: no calendar is chosen for you. This "
+            "account has several and the server marks none of them as the "
+            "default, so an event written into a guessed one would be somewhere "
+            "nobody looks. Use `calendar_list` and name the calendar."
+        )
+    return trimmed
+
+
+def _checked_summary(summary: object) -> str:
+    """A title that will make the event findable later."""
+    if not isinstance(summary, str):
+        raise ProtocolError(
+            f"`summary` must be a string, not {type(summary).__name__}."
+        )
+    trimmed = summary.strip()
+    if not trimmed:
+        raise ProtocolError(
+            "`summary` is blank. An event needs a title: an untitled event is "
+            "not findable later, and nobody meant to create one."
+        )
+    _check_length(trimmed, "summary", MAX_SUMMARY_CHARS)
+    return trimmed
+
+
+#: How long each free-text field may be on the way in.
+_INPUT_CAPS = {
+    "description": MAX_DESCRIPTION_INPUT_CHARS,
+    "location": MAX_LOCATION_CHARS,
+}
+
+
+def _check_length(value: str, name: str, cap: int) -> None:
+    """Refuse a value too large to be meant, before anything is composed.
+
+    Raised here rather than left to the server: an oversized document is
+    answered with a 413 *after* the request has left, and a write whose outcome
+    is unknown is a far worse answer than a refusal that names the field.
+    """
+    if len(value) > cap:
+        raise ProtocolError(
+            f"`{name}` is {len(value)} characters, beyond the {cap}-character "
+            "maximum this server will write. It is not shortened for you: a "
+            "silently truncated value would be stored as though it were what "
+            "was meant. Shorten it and create the event again."
+        )
+
+
+def _checked_optional_text(value: object, name: str) -> str | None:
+    """An optional field: given and meaningful, or omitted entirely."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ProtocolError(f"`{name}` must be a string, not {type(value).__name__}.")
+    trimmed = value.strip()
+    if not trimmed:
+        raise ProtocolError(
+            f"`{name}` is blank. Omit it entirely for none; a blank value would "
+            "store an empty field that reads as though something was meant."
+        )
+    cap = _INPUT_CAPS.get(name)
+    if cap is not None:
+        _check_length(trimmed, name, cap)
+    return trimmed
+
+
+def _checked_boundary(value: object, name: str) -> date | datetime:
+    """One end of a new event: an instant with an offset, or a plain date.
+
+    Refused before any request is made. A timestamp with no offset names a
+    different moment to every reader, and an event written from one is wrong on
+    somebody's calendar until they notice.
+    """
+    if isinstance(value, (datetime, date)):
+        parsed: date | datetime = value
+    else:
+        if not isinstance(value, str):
+            raise ProtocolError(
+                f"`{name}` must be an ISO 8601 timestamp or date, not "
+                f"{type(value).__name__}."
+            )
+        trimmed = value.strip()
+        if not trimmed:
+            raise ProtocolError(
+                f"`{name}` is blank. Give a timestamp with an explicit offset, "
+                "for example 2026-06-08T09:00:00+03:00, or a plain date such as "
+                "2026-06-08 for an all-day event."
+            )
+        try:
+            parsed = parse_instant(trimmed)
+        except ValueError as exc:
+            raise ProtocolError(
+                f"`{name}` is not an ISO 8601 timestamp with an explicit UTC "
+                f"offset, nor a plain date: {value!r}. For example "
+                "2026-06-08T09:00:00+03:00, or 2026-06-08 for an all-day event."
+            ) from exc
+    if isinstance(parsed, datetime) and (
+        parsed.tzinfo is None or parsed.utcoffset() is None
+    ):
+        raise ProtocolError(
+            f"`{name}` has no UTC offset. Give an explicit one, for example "
+            "2026-06-08T09:00:00+03:00; a naive timestamp names a different "
+            "moment to every reader."
+        )
+    return parsed
+
+
+def _check_event_bounds(start: date | datetime, end: date | datetime) -> None:
+    """Both ends of the same kind, and ordered. Neither is repaired."""
+    if isinstance(start, datetime) != isinstance(end, datetime):
+        raise ProtocolError(
+            "`start` and `end` must both be timestamps, or both be plain dates "
+            "for an all-day event. One of each has no reading that is not a "
+            "guess about which was meant."
+        )
+    if _as_moment(end) <= _as_moment(start):
+        raise ProtocolError(
+            "`end` must be after `start`; an event that ends when it begins "
+            "occupies no time. For an all-day event `end` is exclusive, so a "
+            "single day ends on the following date."
+        )
+
+
+def _as_moment(value: date | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
