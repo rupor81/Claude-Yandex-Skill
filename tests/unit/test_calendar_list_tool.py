@@ -105,31 +105,49 @@ def test_a_cursor_minted_by_another_tool_is_refused():
         call(tool_for(FakeCalendarClient(3)), cursor=foreign)
 
 
-def test_a_cursor_past_the_end_is_an_error_not_an_empty_account():
-    """A `complete: true` empty page here would read as "you have no calendars"."""
+def test_a_cursor_naming_a_deleted_calendar_still_resumes():
+    """The position it names need not still exist; it only has to order.
+
+    This replaces an older rule that a cursor past the end was an error. That
+    rule existed to compensate for an index cursor, which could not tell a
+    shrunken list from a finished one. A position can: everything after it is
+    still well defined once the calendar it names is gone.
+    """
+    client = FakeCalendarClient(count=4)
+    first = call(tool_for(client), limit=2)
+    assert [c.name for c in first.items] == ["Calendar 0", "Calendar 1"]
+
+    # The calendar the cursor names is unsubscribed before the next page.
+    client._refs = [ref for ref in client._refs if ref.name != "Calendar 1"]
+
+    second = call(tool_for(client), limit=2, cursor=first.next_cursor)
+    assert [c.name for c in second.items] == ["Calendar 2", "Calendar 3"]
+    assert second.complete is True
+
+
+def test_an_offset_shaped_cursor_is_refused_rather_than_reinterpreted():
+    """Cursors from the previous index scheme name nothing this tool can resume."""
     from yandex_core.paging import encode_cursor
 
-    stale = encode_cursor({"offset": 9}, tool="calendar_list")
-    with pytest.raises(ProtocolError) as caught:
-        call(tool_for(FakeCalendarClient(3)), cursor=stale)
-    assert "past the end" in str(caught.value)
-
-
-def test_a_cursor_exactly_at_the_end_is_still_an_error():
-    from yandex_core.paging import encode_cursor
-
-    stale = encode_cursor({"offset": 3}, tool="calendar_list")
+    stale = encode_cursor({"offset": 2}, tool="calendar_list")
     with pytest.raises(ProtocolError):
         call(tool_for(FakeCalendarClient(3)), cursor=stale)
 
 
-@pytest.mark.parametrize("offset", [-1, True, "1", 1.5, None])
-def test_a_cursor_with_an_unusable_offset_is_refused(offset):
-    from yandex_core.paging import encode_cursor
-
-    bad = encode_cursor({"offset": offset}, tool="calendar_list")
-    with pytest.raises(ProtocolError):
-        call(tool_for(FakeCalendarClient(3)), cursor=bad)
+def test_two_calendars_sharing_a_name_both_survive_paging():
+    """The URL breaks the tie, so a strict resume cannot drop either of them."""
+    client = FakeCalendarClient(count=0)
+    client._refs = [
+        CalendarRef(name="Shared", url="https://caldav.yandex.ru/c/a/"),
+        CalendarRef(name="Shared", url="https://caldav.yandex.ru/c/b/"),
+    ]
+    first = call(tool_for(client), limit=1)
+    second = call(tool_for(client), limit=1, cursor=first.next_cursor)
+    seen = [c.url for c in first.items] + [c.url for c in second.items]
+    assert seen == [
+        "https://caldav.yandex.ru/c/a/",
+        "https://caldav.yandex.ru/c/b/",
+    ]
 
 
 @pytest.mark.parametrize("limit", [0, -1, MAX_LIMIT + 1, 10_000])
@@ -158,3 +176,26 @@ def test_an_out_of_range_limit_never_reaches_the_client():
     with pytest.raises(ProtocolError):
         call(tool_for(client), limit=0)
     assert client.calls == 0
+
+
+def test_a_calendar_removed_between_pages_does_not_hide_the_next_one():
+    """Resuming must name where it stopped, not count how far it got.
+
+    An index cursor means "skip N". If a calendar earlier in the list is
+    unsubscribed between two pages, everything after it shifts up by one and
+    "skip N" lands one calendar too far, silently omitting one from the answer.
+    A cursor that names the last calendar returned resumes correctly instead.
+    """
+    client = FakeCalendarClient(count=4)
+    first = call(tool_for(client), limit=2)
+    assert [c.name for c in first.items] == ["Calendar 0", "Calendar 1"]
+    assert first.complete is False and first.next_cursor
+
+    # The account changes: the first calendar is unsubscribed.
+    client._refs = client._refs[1:]
+
+    second = call(tool_for(client), limit=2, cursor=first.next_cursor)
+    assert [c.name for c in second.items] == ["Calendar 2", "Calendar 3"], (
+        "resuming after 'Calendar 1' must return Calendar 2 next; an index "
+        "cursor skips it because the list shifted"
+    )

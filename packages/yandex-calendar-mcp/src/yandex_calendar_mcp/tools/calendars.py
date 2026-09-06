@@ -12,7 +12,11 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 from yandex_core.errors import ProtocolError
-from yandex_core.paging import checked_limit, decode_cursor, encode_cursor
+from yandex_core.paging import (
+    checked_limit,
+    decode_position_cursor,
+    encode_position_cursor,
+)
 from yandex_core.results import Page
 
 from ..client.caldav_client import CalDAVCalendarClient
@@ -76,22 +80,17 @@ def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaita
         `next_cursor` carries the remainder.
         """
         limit_used = checked_limit(limit, minimum=MIN_LIMIT, maximum=MAX_LIMIT)
-        offset = _offset_from(cursor)
+        after = _position_from(cursor)
         client = await client_provider()
-        calendars = await client.list_calendars()
 
-        if offset and offset >= len(calendars):
-            # The account shrank, or the cursor is older than the collection.
-            # An empty `complete: true` page here would read as "no calendars".
-            raise ProtocolError(
-                f"Cursor points past the end of the calendar list "
-                f"({offset} of {len(calendars)}); the list changed since it was "
-                "issued. Start again without a cursor."
-            )
+        # Sorted so the cursor resumes against a stable order. The server's own
+        # enumeration order is not promised to hold between two calls.
+        calendars = sorted(await client.list_calendars(), key=_sort_key)
+        if after is not None:
+            calendars = [ref for ref in calendars if _sort_key(ref) > after]
 
-        window = calendars[offset : offset + limit_used]
-        remaining = len(calendars) - (offset + len(window))
-        complete = remaining <= 0
+        window = calendars[:limit_used]
+        complete = len(window) == len(calendars)
 
         return Page[CalendarSummary](
             items=[CalendarSummary(name=ref.name, url=ref.url) for ref in window],
@@ -99,7 +98,9 @@ def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaita
             next_cursor=(
                 None
                 if complete
-                else encode_cursor({"offset": offset + len(window)}, tool=TOOL_NAME)
+                else encode_position_cursor(
+                    {"name": window[-1].name, "url": window[-1].url}, tool=TOOL_NAME
+                )
             ),
         )
 
@@ -107,11 +108,26 @@ def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaita
     return calendar_list
 
 
-def _offset_from(cursor: str | None) -> int:
+_CURSOR_FIELDS = ("name", "url")
+
+
+def _sort_key(ref: object) -> tuple[str, str]:
+    """Total order over calendars: name first, URL to break ties.
+
+    The URL is unique, so no two calendars share a key. Without that tiebreak
+    two calendars named alike would collide and the strict resume below would
+    drop one of them.
+    """
+    return (getattr(ref, "name", "") or "", getattr(ref, "url", "") or "")
+
+
+def _position_from(cursor: str | None) -> tuple[str, str] | None:
+    """The calendar a previous page stopped at, or None to start at the top.
+
+    Naming the last calendar rather than counting how many were skipped is what
+    keeps a page correct when the account gains or loses one in between.
+    """
     if cursor is None:
-        return 0
-    payload = decode_cursor(cursor, tool=TOOL_NAME)
-    offset = payload.get("offset")
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise ProtocolError("Cursor is not a cursor this server issued.")
-    return offset
+        return None
+    after = decode_position_cursor(cursor, tool=TOOL_NAME, fields=_CURSOR_FIELDS)
+    return (after["name"] or "", after["url"] or "")
