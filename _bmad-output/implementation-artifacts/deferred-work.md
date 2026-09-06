@@ -23,3 +23,11 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-4-read-one-event-in-full.md`
   summary: A recurring series whose master and whose RECURRENCE-ID override are stored at unrelated hrefs cannot be read completely, so such an instance returns the series' unmodified time.
   evidence: A genuine platform limit rather than an omission. Enumerating every object sharing a UID needs a UID search, and this server's UID search returns the entire calendar — 1759 objects for one UID, measured. The library's by-UID lookup returns exactly one object by construction. The addressed href plus that lookup covers every shape seen on the live account; only an override filed under an unrelated href escapes, and no safe mechanism reaches it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-5-inspect-busy-time.md`
+  summary: An all-day event's busy interval is anchored to the offset of the range the caller asked with, and for a login written without a domain the account's own domains are inferred from the CalDAV host rather than read from the principal.
+  evidence: Both are defensible defaults with no better source available today. A profile carries a login and a URL, not a timezone, so inventing a config field would create a value nothing verifies. The principal's calendar-user-address-set is the authoritative answer to "which addresses are this account" and would replace the host-derived guess; it is one extra request at connect time and worth doing when a second connector needs the same answer.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-query-events-over-a-date-range.md`
+  summary: The live paging test fails intermittently when run after the rest of the live suite and passes on its own, because it makes about thirty sequential account-wide queries into a server with aggressive rate limiting.
+  evidence: Observed twice. The code is not at fault — the same test passes in isolation in about 100 seconds — but a test that is red in the suite and green alone teaches everyone to stop reading red, which costs more than the coverage is worth. Walking fewer pages would check the same three properties (it terminates, never dead-ends, never repeats) without provoking the limit; that is a change to the test's cost, not to what it asserts.

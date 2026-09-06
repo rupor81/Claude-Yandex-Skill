@@ -516,3 +516,77 @@ def test_the_ceiling_applies_after_the_resume_point(monkeypatch):
     )
     assert len(second.occurrences) == 1
     assert second.occurrences[0].start > first.occurrences[0].start
+
+
+# -- what the busy question needs the client to carry down -----------------
+
+CROSSING = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:crossing-1\r\nSUMMARY:Overnight\r\n"
+    "DTSTART;TZID=Europe/Moscow:20260531T230000\r\n"
+    "DTEND;TZID=Europe/Moscow:20260601T020000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+DECLINED_INVITE = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:invite-1\r\nSUMMARY:Invitation\r\n"
+    "DTSTART;TZID=Europe/Moscow:20260608T100000\r\n"
+    "DTEND;TZID=Europe/Moscow:20260608T110000\r\n"
+    "ATTENDEE;PARTSTAT=ACCEPTED:mailto:someone@yandex.ru\r\n"
+    "ATTENDEE;PARTSTAT=DECLINED:mailto:me@yandex.ru\r\n"
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+
+def test_the_overlap_rule_is_carried_down_into_the_expansion(monkeypatch):
+    """Dropped on the way down, every meeting that began before the range
+    vanishes -- and the busy answer reports the range's first hours as free."""
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [CROSSING])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    listing = fetch(make_client())
+    assert [o.uid for o in listing.occurrences] == []
+
+    overlapping = fetch(make_client(), overlap=True)
+    assert [o.uid for o in overlapping.occurrences] == ["crossing-1"]
+
+
+def test_the_overlap_rule_has_no_default_on_the_way_down():
+    """A default on the private half turns an omission into a quiet wrong
+    answer instead of a TypeError."""
+    parameter = inspect.signature(
+        CalDAVCalendarClient._list_occurrences_blocking
+    ).parameters["overlap"]
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_the_accounts_own_reply_is_read_with_no_caller_supplying_an_address(monkeypatch):
+    """Without the operator address, every declined invitation becomes firm busy
+    time -- and the address is the client's own, never a caller's."""
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [DECLINED_INVITE])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+
+    (only,) = fetch(make_client()).occurrences
+    assert only.participation_status == "DECLINED"
+
+
+def test_a_bare_login_is_completed_from_the_account_it_is_connected_to(monkeypatch):
+    """A login is routinely written without its domain, and an invitation always
+    carries one; a stranger's local part must not stand in for it."""
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [DECLINED_INVITE])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+    client = CalDAVCalendarClient(url=URL, username="me", password=PASSWORD)
+
+    (only,) = fetch(client).occurrences
+    assert only.participation_status == "DECLINED"
+
+
+def test_an_attendee_on_a_domain_the_account_does_not_own_is_a_stranger(monkeypatch):
+    """`me@othercorp.com` declining is not this account declining."""
+    stranger = DECLINED_INVITE.replace("mailto:me@yandex.ru", "mailto:me@othercorp.com")
+    calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [stranger])
+    install_fake_dav_client(monkeypatch, calendars=[calendar])
+    client = CalDAVCalendarClient(url=URL, username="me", password=PASSWORD)
+
+    (only,) = fetch(client).occurrences
+    assert only.participation_status is None

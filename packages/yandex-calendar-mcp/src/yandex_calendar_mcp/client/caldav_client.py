@@ -140,6 +140,7 @@ class CalDAVCalendarClient:
         calendar_url: str | None = None,
         ceiling: int = EXPANSION_CEILING,
         after: SortKey | None = None,
+        overlap: bool = False,
     ) -> Expansion:
         """Concrete occurrences between ``start`` and ``end``.
 
@@ -158,6 +159,14 @@ class CalDAVCalendarClient:
                 counted over what remains after ``after``.
             after: resume strictly after this sort key, so a caller paging into
                 a truncated tail can always make progress.
+            overlap: return occurrences that merely overlap the range as well as
+                those starting inside it.  A question about busy time needs the
+                meeting that began last night and is still running.
+
+        Each occurrence also carries whether it consumes time at all and the
+        configured account's own reply to it.  The address that decides "own"
+        is the profile's login, which this client was constructed with, so no
+        caller has to supply -- or could substitute -- somebody else's.
 
         A calendar that cannot be read -- a 403 on one shared collection, say --
         is counted in ``unreadable_calendars`` and the others are still
@@ -172,6 +181,7 @@ class CalDAVCalendarClient:
                 calendar_url=calendar_url,
                 ceiling=ceiling,
                 after=after,
+                overlap=overlap,
             )
 
         return await anyio.to_thread.run_sync(run)
@@ -239,6 +249,7 @@ class CalDAVCalendarClient:
         calendar_url: str | None,
         ceiling: int,
         after: SortKey | None,
+        overlap: bool,
     ) -> Expansion:
         sources: list[CalendarSource] = []
         unreadable_calendars = 0
@@ -286,9 +297,40 @@ class CalDAVCalendarClient:
         # Expansion is pure and needs no connection, so it happens after the
         # client is closed -- but still inside client/, so no RRULE escapes.
         expansion = expand_occurrences(
-            sources, start=start, end=end, ceiling=ceiling, after=after
+            sources,
+            start=start,
+            end=end,
+            ceiling=ceiling,
+            after=after,
+            operator=self._username,
+            operator_domains=self._account_domains(),
+            overlap=overlap,
         )
         return with_unreadable_calendars(expansion, unreadable_calendars)
+
+    def _account_domains(self) -> tuple[str, ...]:
+        """The mail domains this account owns, for a login written without one.
+
+        A login is routinely just ``me``, while an invitation always names a
+        full address, so the missing half has to come from somewhere.  It comes
+        from the account this client is connected to -- the login's own domain
+        when it has one, and otherwise the host being talked to, with a leading
+        service label dropped so ``caldav.example.com`` yields ``example.com``.
+        Nothing is hard-coded: an account on a custom domain resolves to its own
+        domain rather than to somebody else's, and an attendee outside these
+        domains stays a stranger whose reply is not this account's.
+        """
+        login = (self._username or "").strip().casefold()
+        _, _, own_domain = login.partition("@")
+        if own_domain:
+            return (own_domain,)
+        host = urllib.parse.urlsplit(self._url).hostname or ""
+        host = host.strip().casefold().strip(".")
+        labels = host.split(".")
+        if len(labels) > 2:
+            labels = labels[1:]
+        derived = ".".join(labels)
+        return (derived,) if "." in derived else ()
 
     def _get_event_blocking(
         self,

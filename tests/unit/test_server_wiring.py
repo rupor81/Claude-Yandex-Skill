@@ -44,6 +44,7 @@ def test_the_registered_tools_are_the_read_only_ones(monkeypatch):
     assert sorted(tool.name for tool in tools) == [
         "calendar_event_get",
         "calendar_events_list",
+        "calendar_freebusy_query",
         "calendar_list",
     ]
     assert all(tool.annotations.read_only_hint is True for tool in tools)
@@ -51,7 +52,7 @@ def test_the_registered_tools_are_the_read_only_ones(monkeypatch):
 
 
 #: The tools that return a collection, and so must say whether it is whole.
-LISTING_TOOLS = {"calendar_list", "calendar_events_list"}
+LISTING_TOOLS = {"calendar_list", "calendar_events_list", "calendar_freebusy_query"}
 
 
 def test_page_is_the_declared_output_schema_of_every_listing_tool(monkeypatch):
@@ -217,3 +218,28 @@ def test_the_instructions_admit_a_page_can_be_irrecoverably_short():
     text = server_module.INSTRUCTIONS.lower()
     assert "could not be read" in text
     assert "no cursor can retrieve them" in text
+
+
+def test_calling_the_freebusy_tool_returns_intervals_and_no_titles(monkeypatch):
+    """The busy answer must never carry what the meeting was about."""
+    server = build(
+        monkeypatch,
+        calendars=[
+            FakeCalendar(
+                "Personal", "https://caldav.yandex.ru/c/personal/", [EVENT_DOCUMENT]
+            )
+        ],
+    )
+    result = anyio.run(
+        lambda: server.call_tool(
+            "calendar_freebusy_query",
+            {"start": "2026-06-01T00:00:00+03:00", "end": "2026-06-30T00:00:00+03:00"},
+        )
+    )
+    payload = result.structuredContent if hasattr(result, "structuredContent") else None
+    if payload is None:
+        payload = result.structured_content
+    assert payload["complete"] is True
+    assert len(payload["items"]) == 3
+    assert {item["kind"] for item in payload["items"]} == {"busy"}
+    assert "standup" not in str(payload).lower()

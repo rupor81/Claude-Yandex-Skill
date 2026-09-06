@@ -100,3 +100,11 @@ def test_calendar_events_list_is_registered_read_only():
     assert annotations.read_only_hint is True
     assert annotations.destructive_hint is False
     assert annotations.idempotent_hint is True
+
+
+def test_calendar_freebusy_query_is_registered_read_only():
+    """A busy-time question changes nothing; annotated otherwise, a caller gates it."""
+    annotations = annotations_for("calendar_freebusy_query")
+    assert annotations.read_only_hint is True
+    assert annotations.destructive_hint is False
+    assert annotations.idempotent_hint is True

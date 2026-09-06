@@ -46,6 +46,8 @@ from yandex_core.errors import ProtocolError
 __all__ = [
     "CalendarSource",
     "Occurrence",
+    "TRANSPARENCY_OPAQUE",
+    "TRANSPARENCY_TRANSPARENT",
     "Expansion",
     "DEFAULT_CEILING",
     "expand",
@@ -62,6 +64,13 @@ __all__ = [
     "SCOPE_OCCURRENCE",
     "read_event",
 ]
+
+
+#: What ``TRANSP`` says when an event blocks time.  iCalendar's own default.
+TRANSPARENCY_OPAQUE = "OPAQUE"
+
+#: What ``TRANSP`` says when an event is on the calendar but consumes no time.
+TRANSPARENCY_TRANSPARENT = "TRANSPARENT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +99,24 @@ class Occurrence:
     all_day: bool
     calendar_url: str
     calendar_name: str
+
+    transparency: str = TRANSPARENCY_OPAQUE
+    """Whether this occurrence consumes time: ``OPAQUE`` or ``TRANSPARENT``.
+
+    iCalendar's default is ``OPAQUE``, and that default is applied here rather
+    than left to each caller: an event with no ``TRANSP`` line does block time,
+    and a caller reading ``None`` as "unknown" would have to guess which way.
+    """
+
+    participation_status: str | None = None
+    """The *operator's own* reply to this event, as iCalendar spells it.
+
+    ``ACCEPTED``, ``DECLINED``, ``TENTATIVE``, ``NEEDS-ACTION`` -- or ``None``
+    when the operator is not on the attendee list at all, which is the normal
+    shape of an event they created themselves.  Nobody else's reply is ever
+    read into this field: another attendee's ``PARTSTAT`` is a fact about their
+    calendar, not this one's.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +159,9 @@ def expand(
     end: datetime,
     ceiling: int = DEFAULT_CEILING,
     after: SortKey | None = None,
+    operator: str | None = None,
+    operator_domains: Sequence[str] = (),
+    overlap: bool = False,
 ) -> Expansion:
     """Expand fetched calendar documents into ordered occurrences in a range.
 
@@ -152,6 +182,20 @@ def expand(
         ceiling: most occurrences to keep, in order, before reporting truncation.
         after: resume strictly after this sort key, as a previous page's cursor
             named it.  ``None`` starts from the beginning of the range.
+        operator: the configured account's address, used to pick *its own*
+            ``ATTENDEE`` line out of an invitation.  ``None`` leaves every
+            occurrence's ``participation_status`` unset rather than guessing
+            whose reply to read.
+        operator_domains: the mail domains the account actually owns, for a
+            login written without one.  Only these turn a bare login into a
+            full address: an attendee on any other domain is somebody else,
+            however alike the two local parts look.
+        overlap: keep occurrences that merely *overlap* the window instead of
+            only those starting inside it.  Off by default, because the listing
+            contract needs an occurrence to belong to exactly one of two
+            adjacent ranges.  A question about busy *time* needs the other rule:
+            a meeting that began yesterday and runs until noon takes up this
+            morning whether or not it started in it.
 
     Raises:
         ProtocolError: if ``ceiling`` is below one, which would mark every
@@ -174,21 +218,33 @@ def expand(
             unreadable += 1
 
     collected: list[Occurrence] = []
+    addresses = _operator_addresses(operator, operator_domains)
 
     for group in _group_by_calendar_and_uid(parsed):
         if group.uid is None:
             # An event with no UID cannot be identified, addressed, or
             # deduplicated against its own overrides. Reported, not dropped --
             # unless it provably could not have appeared in this window anyway.
-            if _may_intersect(group.components, start=start, end=end):
+            if _may_intersect(
+                group.components, start=start, end=end, overlap=overlap
+            ):
                 unreadable += len(group.components)
             continue
         try:
             occurrences = list(
-                _expand_one_series(group, uid=group.uid, start=start, end=end)
+                _expand_one_series(
+                    group,
+                    uid=group.uid,
+                    start=start,
+                    end=end,
+                    addresses=addresses,
+                    overlap=overlap,
+                )
             )
         except Exception:  # noqa: BLE001 - one bad series, one reported failure
-            if _may_intersect(group.components, start=start, end=end):
+            if _may_intersect(
+                group.components, start=start, end=end, overlap=overlap
+            ):
                 unreadable += len(group.components)
             continue
         collected.extend(occurrences)
@@ -270,7 +326,13 @@ def _group_by_calendar_and_uid(
 
 
 def _expand_one_series(
-    group: _Group, *, uid: str, start: datetime, end: datetime
+    group: _Group,
+    *,
+    uid: str,
+    start: datetime,
+    end: datetime,
+    addresses: tuple[str, ...] = (),
+    overlap: bool = False,
 ) -> Iterator[Occurrence]:
     """Expand the components sharing one ``UID`` into occurrences in the range."""
     subset = _calendar_with(group)
@@ -289,12 +351,17 @@ def _expand_one_series(
         occurrence_start = _instant(expanded, "DTSTART")
         if occurrence_start is None:
             raise ValueError(f"event {uid!r} has no DTSTART")
-        if not _in_window(occurrence_start, start=start, end=end):
-            # The library answers with anything overlapping the window; the
-            # contract is about where the occurrence *starts*.
-            continue
-
         occurrence_end = _end_instant(expanded, occurrence_start)
+
+        if overlap:
+            if not _overlaps_window(
+                occurrence_start, occurrence_end, start=start, end=end
+            ):
+                continue
+        elif not _in_window(occurrence_start, start=start, end=end):
+            # The library answers with anything overlapping the window; the
+            # listing contract is about where the occurrence *starts*.
+            continue
 
         summary = expanded.get("SUMMARY")
         yield Occurrence(
@@ -310,6 +377,8 @@ def _expand_one_series(
             all_day=_is_all_day(occurrence_start),
             calendar_url=source.calendar_url,
             calendar_name=source.calendar_name,
+            transparency=_transparency(expanded),
+            participation_status=_participation_status(expanded, addresses),
         )
 
 
@@ -317,6 +386,101 @@ def _in_window(value: date | datetime, *, start: datetime, end: datetime) -> boo
     """Start-inclusive, end-exclusive, judged on the occurrence's own start."""
     instant = _as_instant(value)
     return _as_instant(start) <= instant < _as_instant(end)
+
+
+def _overlaps_window(
+    occurrence_start: date | datetime,
+    occurrence_end: date | datetime,
+    *,
+    start: datetime,
+    end: datetime,
+) -> bool:
+    """Whether an occupied span touches the window at all.
+
+    Half-open at both ends, so an occurrence that ends exactly when the window
+    opens does not overlap it and one that starts exactly when it closes belongs
+    to the next window.  An occurrence of zero length occupies no span to
+    intersect, so it is judged on its start alone rather than being dropped
+    silently for having no width.
+    """
+    begins = _as_instant(occurrence_start)
+    finishes = _as_instant(occurrence_end)
+    window_start = _as_instant(start)
+    window_end = _as_instant(end)
+    if finishes <= begins:
+        return window_start <= begins < window_end
+    return begins < window_end and finishes > window_start
+
+
+def _transparency(component: icalendar.Event) -> str:
+    """Whether this component consumes time, defaulting the way iCalendar does.
+
+    Absent ``TRANSP`` means ``OPAQUE`` by the specification, so the default is
+    applied here rather than reported as unknown: an event with no such line
+    genuinely does block time, and passing the ambiguity upwards would only move
+    the same guess somewhere with less information.
+    """
+    value = component.get("TRANSP")
+    if value is None:
+        return TRANSPARENCY_OPAQUE
+    text = str(value).strip().upper()
+    return TRANSPARENCY_TRANSPARENT if text == TRANSPARENCY_TRANSPARENT else (
+        TRANSPARENCY_OPAQUE
+    )
+
+
+def _operator_addresses(
+    operator: str | None, domains: Sequence[str] = ()
+) -> tuple[str, ...]:
+    """Every spelling of the configured account's own address, case-folded.
+
+    A profile login is written either way -- ``me`` or ``me@example.com`` -- and
+    an invitation always carries the full address, so a bare login has to be
+    completed before it can match anything.  The domains used are the ones the
+    account actually owns: the login's own, plus whatever the caller derived
+    from the account it is connected to.  Nothing is assumed beyond that, in
+    either direction.  Guessing a domain would read every invitation on a
+    custom-domain account as unanswered, and matching a local part on *any*
+    domain would let ``me@somewhere-else.example`` decline this account's
+    meetings for it.
+    """
+    if not operator:
+        return ()
+    value = operator.strip().casefold()
+    if not value:
+        return ()
+    local, _, own_domain = value.partition("@")
+    owned = [own_domain] if own_domain else []
+    for domain in domains:
+        cleaned = (domain or "").strip().casefold().lstrip("@")
+        if cleaned and cleaned not in owned:
+            owned.append(cleaned)
+    if not local:
+        return (value,)
+    spellings = [value, *(f"{local}@{domain}" for domain in owned)]
+    return tuple(dict.fromkeys(spellings))
+
+
+def _participation_status(
+    component: icalendar.Event, addresses: tuple[str, ...]
+) -> str | None:
+    """The operator's own ``PARTSTAT`` on this component, or ``None``.
+
+    Only a line addressed to the configured account is read, and "addressed to"
+    means the whole address: another attendee's reply describes their
+    availability, not this account's, and a shared local part on a domain this
+    account does not own is a stranger with the same name.
+    """
+    if not addresses:
+        return None
+    for person in _participants(component, "ATTENDEE"):
+        email = (person.email or "").strip().casefold()
+        if not email:
+            continue
+        if email in addresses:
+            status = (person.response_status or "").strip().upper()
+            return status or None
+    return None
 
 
 def _is_cancelled(component: icalendar.Event) -> bool:
@@ -363,7 +527,11 @@ def _is_series(components: Sequence[icalendar.Event]) -> bool:
 
 
 def _may_intersect(
-    components: Sequence[icalendar.Event], *, start: datetime, end: datetime
+    components: Sequence[icalendar.Event],
+    *,
+    start: datetime,
+    end: datetime,
+    overlap: bool = False,
 ) -> bool:
     """Whether a series that failed to expand could have landed in the window.
 
@@ -372,15 +540,20 @@ def _may_intersect(
     query report ``unreadable >= 1`` for ever, with no range narrow enough to
     escape it.  The check is deliberately generous: anything that cannot be
     ruled out counts.
+
+    ``overlap`` must be the same rule the expansion is running under.  Under the
+    overlap rule a meeting that began before the window is part of the answer,
+    so ruling one out by its start would drop it with nothing counted -- an
+    answer that reads as free time.
     """
     return any(
-        _component_may_intersect(component, start=start, end=end)
+        _component_may_intersect(component, start=start, end=end, overlap=overlap)
         for component in components
     )
 
 
 def _component_may_intersect(
-    component: icalendar.Event, *, start: datetime, end: datetime
+    component: icalendar.Event, *, start: datetime, end: datetime, overlap: bool = False
 ) -> bool:
     begins = _raw_instant(component, "DTSTART")
     if begins is None:
@@ -391,7 +564,15 @@ def _component_may_intersect(
 
     recurs = any(component.get(name) is not None for name in ("RRULE", "RDATE"))
     if not recurs:
-        return begins >= _as_instant(start)
+        if begins >= _as_instant(start):
+            return True
+        if not overlap:
+            return False
+        # It began before the window; under the overlap rule it is still part of
+        # the answer unless it provably finished first. A component this broken
+        # may have no readable end at all, and unknown means counted.
+        finishes = _raw_instant(component, "DTEND")
+        return finishes is None or finishes > _as_instant(start)
 
     until = _rrule_until(component)
     if until is not None and until < _as_instant(start):

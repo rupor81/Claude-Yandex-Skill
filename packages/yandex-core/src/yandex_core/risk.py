@@ -45,6 +45,7 @@ RISK_REGISTRY: dict[str, RiskClass] = {
     "calendar_list": RiskClass.READ,
     "calendar_events_list": RiskClass.READ,
     "calendar_event_get": RiskClass.READ,
+    "calendar_freebusy_query": RiskClass.READ,
 }
 
 _ANNOTATIONS: dict[RiskClass, dict[str, bool]] = {

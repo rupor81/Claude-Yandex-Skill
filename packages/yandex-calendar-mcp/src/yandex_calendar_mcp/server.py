@@ -18,6 +18,7 @@ from yandex_core.errors import YandexError
 from .client.caldav_client import CalDAVCalendarClient
 from .tools.calendars import build_calendar_list
 from .tools.events import build_calendar_event_get, build_calendar_events_list
+from .tools.freebusy import build_calendar_freebusy_query
 
 __all__ = ["SERVICE", "build_calendar_server", "main"]
 
@@ -26,8 +27,12 @@ SERVICE = "calendar"
 INSTRUCTIONS = (
     "Read a Yandex calendar over CalDAV. This server is read-only: it can list "
     "the calendars on the configured account, the event occurrences in a date "
-    "range, and one event in full by its UID, and nothing else -- it cannot "
-    "create, change, or delete anything. Recurring series are returned already "
+    "range, one event in full by its UID, and the merged intervals of time the "
+    "account is busy, and nothing else -- it cannot create, change, or delete "
+    "anything. Busy time is answered by `calendar_freebusy_query`, which "
+    "returns time only and no meeting titles, and which reports a tentative or "
+    "unanswered invitation as its own kind of busy rather than deciding for "
+    "you whether it counts. Recurring series are returned already "
     "expanded into concrete occurrences, never as recurrence rules. An event "
     "is read by addressing its UID, so a UID that is not on the account is an "
     "error naming it rather than an empty result. Listing tools are bounded: a "
@@ -63,6 +68,7 @@ def build_calendar_server(profile: Profile | None = None):
     register_tool(server, build_calendar_list(client_provider))
     register_tool(server, build_calendar_events_list(client_provider))
     register_tool(server, build_calendar_event_get(client_provider))
+    register_tool(server, build_calendar_freebusy_query(client_provider))
     return server
 
 

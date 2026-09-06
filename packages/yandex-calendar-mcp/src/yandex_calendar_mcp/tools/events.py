@@ -25,18 +25,13 @@ The decisions worth reading twice:
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Annotated
 
 from pydantic import BaseModel, Field
 from yandex_core.errors import ProtocolError
-from yandex_core.paging import (
-    checked_limit,
-    decode_position_cursor,
-    encode_position_cursor,
-)
+from yandex_core.paging import checked_limit, encode_position_cursor
 from yandex_core.results import Page
 
 from ..client.caldav_client import CalDAVCalendarClient
@@ -50,6 +45,19 @@ from ..client.recurrence import (
     format_instant,
     parse_instant,
     position_sort_key,
+)
+from .timerange import (
+    MAX_RANGE_DAYS,
+    MIN_LIMIT,
+    MORE_PAGES,
+    RANGE_TRUNCATED,
+    UNREADABLE_DATA,
+    check_range,
+    checked_calendar_url,
+    checked_instant,
+    decoded_position,
+    incomplete_reasons,
+    query_stamp,
 )
 
 __all__ = [
@@ -79,18 +87,12 @@ __all__ = [
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
-MIN_LIMIT = 1
 
 #: How much of an invitation body one answer may carry.  A meeting description
 #: is routinely thousands of characters of quoted mail; every other listing in
 #: this server is bounded and says so, and an unbounded one here would be the
 #: single place a caller could not predict the size of an answer.
 MAX_DESCRIPTION_CHARS = 2000
-
-#: The widest span one call may ask for.  A range beyond this is refused by
-#: name rather than narrowed: a quietly shortened window returns an answer that
-#: looks complete for a question nobody asked.
-MAX_RANGE_DAYS = 366
 
 TOOL_NAME = "calendar_events_list"
 GET_TOOL_NAME = "calendar_event_get"
@@ -119,11 +121,6 @@ DESCRIPTION_TRUNCATED_NOTE = (
     f"`description` was longer than {MAX_DESCRIPTION_CHARS} characters and has "
     "been cut to that length; the rest is not in this answer."
 )
-
-#: The three reasons a page may not be the whole answer.
-MORE_PAGES = "more_pages"
-RANGE_TRUNCATED = "range_truncated"
-UNREADABLE_DATA = "unreadable_data"
 
 #: The fields a cursor carries to name one occurrence and the query it answered.
 _CURSOR_FIELDS = ("start", "calendar_url", "uid", "recurrence_id", "query")
@@ -297,18 +294,18 @@ def build_calendar_events_list(
         read `unreadable` and `unreadable_calendars` when the loss is data this
         server could not read at all.
         """
-        window_start = _checked_instant(start, "start")
-        window_end = _checked_instant(end, "end")
-        _check_range(window_start, window_end)
+        window_start = checked_instant(start, "start")
+        window_end = checked_instant(end, "end")
+        check_range(window_start, window_end)
         limit_used = checked_limit(limit, minimum=MIN_LIMIT, maximum=MAX_LIMIT)
-        wanted_calendar = _checked_calendar_url(calendar_url)
+        wanted_calendar = checked_calendar_url(calendar_url)
         needle = _checked_title(title_contains)
 
-        query = _query_stamp(
+        query = query_stamp(
             start=window_start,
             end=window_end,
             calendar_url=wanted_calendar,
-            title_contains=needle,
+            extra=(needle,),
         )
         after = _position_from(cursor, query=query)
 
@@ -350,9 +347,13 @@ def build_calendar_events_list(
             resume_from = None
 
         complete = resume_from is None and not lost
-        reason = _incomplete_reason(
+        # This tool's contract names one reason; the shared helper lists every
+        # shortfall in the order a caller can act on them, so the first is the
+        # one to name.
+        reasons = incomplete_reasons(
             more_remain=more_remain, truncated=expansion.truncated, lost=lost
         )
+        reason = reasons[0] if reasons else None
 
         return EventPage(
             items=[_to_model(o) for o in window],
@@ -371,19 +372,6 @@ def build_calendar_events_list(
 
     calendar_events_list.__name__ = TOOL_NAME
     return calendar_events_list
-
-
-def _incomplete_reason(
-    *, more_remain: bool, truncated: bool, lost: bool
-) -> str | None:
-    """Which of the three shortfalls to name, resumable ones first."""
-    if more_remain:
-        return MORE_PAGES
-    if truncated:
-        return RANGE_TRUNCATED
-    if lost:
-        return UNREADABLE_DATA
-    return None
 
 
 def _key(occurrence: Occurrence):
@@ -420,34 +408,17 @@ def _cursor_position(
     }
 
 
-def _query_stamp(
-    *,
-    start: datetime,
-    end: datetime,
-    calendar_url: str | None,
-    title_contains: str | None,
-) -> str:
-    """A short fingerprint of the question a cursor was issued for.
-
-    Without it, page one's cursor replayed with a different range decodes
-    cleanly and resumes a different question -- the same quiet wrong answer the
-    tool-name stamp already refuses for a different tool's cursor.
-    """
-    parts = (
-        start.astimezone(timezone.utc).isoformat(),
-        end.astimezone(timezone.utc).isoformat(),
-        calendar_url or "",
-        title_contains or "",
-    )
-    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
-    return digest[:16]
-
-
 def _position_from(cursor: str | None, *, query: str):
     """The sort key of the last occurrence a previous page returned."""
     if cursor is None:
         return None
-    position = decode_position_cursor(cursor, tool=TOOL_NAME, fields=_CURSOR_FIELDS)
+    position = decoded_position(
+        cursor,
+        tool=TOOL_NAME,
+        fields=_CURSOR_FIELDS,
+        query=query,
+        restate="`start`, `end`, `calendar_url` and `title_contains`",
+    )
     raw_start = position["start"]
     calendar_url = position["calendar_url"]
     uid = position["uid"]
@@ -457,13 +428,6 @@ def _position_from(cursor: str | None, *, query: str):
         or not isinstance(uid, str)
     ):
         raise ProtocolError("Cursor is not a cursor this server issued.")
-    if position["query"] != query:
-        raise ProtocolError(
-            "This cursor was issued for a different question. A cursor resumes "
-            "one range with one set of filters; pass `start`, `end`, "
-            "`calendar_url` and `title_contains` back exactly as they were, or "
-            "start again without a cursor."
-        )
     try:
         start = parse_instant(raw_start)
         return position_sort_key(start, calendar_url, uid, position["recurrence_id"])
@@ -471,51 +435,6 @@ def _position_from(cursor: str | None, *, query: str):
         # A timestamp that parses but names a moment no clock can hold is still
         # not a position this server ever issued.
         raise ProtocolError("Cursor is not a cursor this server issued.") from exc
-
-
-def _checked_instant(value: object, name: str) -> datetime:
-    """A required, timezone-aware moment.
-
-    Strings are accepted so the function behaves the same when called directly
-    as it does through the protocol, where pydantic parses them. A naive value
-    is refused here, before any request is made: a moment with no offset means
-    something different to everyone who reads it.
-    """
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise ProtocolError(
-                f"`{name}` is not an ISO 8601 timestamp: {value!r}."
-            ) from exc
-    if not isinstance(value, datetime):
-        raise ProtocolError(
-            f"`{name}` must be an ISO 8601 timestamp with an explicit UTC offset, "
-            f"not {type(value).__name__}."
-        )
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ProtocolError(
-            f"`{name}` has no UTC offset. Give an explicit one, for example "
-            f"2026-06-01T00:00:00+03:00; a naive timestamp means a different "
-            "moment to every reader."
-        )
-    return value
-
-
-def _checked_calendar_url(calendar_url: object) -> str | None:
-    """One calendar, or every calendar.
-
-    A blank or whitespace-only string is the caller saying "no restriction", not
-    a query against a calendar whose URL is the empty string.
-    """
-    if calendar_url is None:
-        return None
-    if not isinstance(calendar_url, str):
-        raise ProtocolError(
-            f"`calendar_url` must be a string, not {type(calendar_url).__name__}."
-        )
-    trimmed = calendar_url.strip()
-    return trimmed or None
 
 
 def _checked_title(title_contains: object) -> str | None:
@@ -538,21 +457,6 @@ def _checked_title(title_contains: object) -> str | None:
             "blank filter would report an unfiltered answer as a filtered one."
         )
     return trimmed.casefold()
-
-
-def _check_range(start: datetime, end: datetime) -> None:
-    if end <= start:
-        raise ProtocolError(
-            f"`end` must be after `start`; got start={start.isoformat()} and "
-            f"end={end.isoformat()}."
-        )
-    span = end - start
-    if span > timedelta(days=MAX_RANGE_DAYS):
-        raise ProtocolError(
-            f"The range spans {span.days} days, beyond the {MAX_RANGE_DAYS}-day "
-            "maximum for one query. Ask for a narrower range; it is not narrowed "
-            "for you, because a shortened window would answer a different question."
-        )
 
 
 # -- one event, in full ---------------------------------------------------
@@ -802,7 +706,7 @@ def build_calendar_event_get(
         """
         wanted_uid = _checked_uid(uid)
         instance = _checked_recurrence_id(recurrence_id)
-        wanted_calendar = _checked_calendar_url(calendar_url)
+        wanted_calendar = checked_calendar_url(calendar_url)
 
         client = await client_provider()
         fetched = await client.get_event(
