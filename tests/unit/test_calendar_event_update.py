@@ -20,18 +20,19 @@ No socket is opened: `caldav.DAVClient` is the shared fake from `conftest`.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import anyio
 import pytest
 from caldav.lib import error as caldav_error
 from conftest import FakeCalendar, install_fake_dav_client
 from niquests import exceptions as http_error
+
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_calendar_mcp.tools.events import (
-    UPDATE_TOOL_NAME,
     SCOPE_OCCURRENCE,
     SCOPE_SERIES,
+    UPDATE_TOOL_NAME,
     build_calendar_event_get,
     build_calendar_event_update,
 )
@@ -209,11 +210,14 @@ def test_a_stale_etag_is_refused_and_nothing_is_written(monkeypatch):
         update(etag="etag-from-an-hour-ago", summary="Daily standup")
 
     message = str(caught.value)
-    assert "read the event again" in message.lower(), "the caller is not told to re-read"
+    assert "read the event again" in message.lower(), (
+        "the caller is not told to re-read"
+    )
     assert puts == [], "a write went out carrying an ETag known to be stale"
-    assert "SUMMARY:Standup\r\n" in calendar.event_by_url(
-        calendar.href_for("standup")
-    ).data
+    assert (
+        "SUMMARY:Standup\r\n"
+        in calendar.event_by_url(calendar.href_for("standup")).data
+    )
 
 
 def test_a_precondition_the_server_refuses_is_a_conflict_that_wrote_nothing(
@@ -232,7 +236,9 @@ def test_a_precondition_the_server_refuses_is_a_conflict_that_wrote_nothing(
     assert len(puts) == 1, "a refused write was retried"
     message = str(caught.value)
     assert "standup" in message
-    assert "read the event again" in message.lower(), "the caller is not told to re-read"
+    assert "read the event again" in message.lower(), (
+        "the caller is not told to re-read"
+    )
 
 
 def test_a_refused_write_is_never_retried_with_a_fresh_etag(monkeypatch):
@@ -276,7 +282,7 @@ def test_changing_one_occurrence_leaves_the_other_instances_alone(monkeypatch):
     # Asserted through the read path, not by reading the bytes back: another
     # instance must still be where it was.
     other = read("standup", recurrence_id=ELEVENTH)
-    assert other.start == datetime(2026, 6, 11, 6, 0, tzinfo=timezone.utc)
+    assert other.start == datetime(2026, 6, 11, 6, 0, tzinfo=UTC)
 
 
 def test_changing_the_series_changes_every_instance(monkeypatch):
@@ -313,7 +319,7 @@ def test_changing_a_series_keeps_an_instance_that_was_already_moved(monkeypatch)
     assert "DTSTART:20260610T080000Z" in body, "the moved instance was put back"
 
     moved = read("standup", recurrence_id=TENTH)
-    assert moved.start == datetime(2026, 6, 10, 8, 0, tzinfo=timezone.utc)
+    assert moved.start == datetime(2026, 6, 10, 8, 0, tzinfo=UTC)
     assert moved.summary == "Standup (moved)"
 
 
@@ -515,7 +521,7 @@ def test_an_unknown_uid_is_a_not_found_naming_the_uid(monkeypatch):
 
 
 def test_an_unknown_instance_is_told_apart_from_an_unknown_event(monkeypatch):
-    """"That meeting is not on this account" and "that day is not in this
+    """ "That meeting is not on this account" and "that day is not in this
     series" need different corrections from the caller."""
     calendar = _series_calendar()
     puts: list = []
@@ -612,7 +618,14 @@ def test_a_microsecond_this_server_dropped_is_not_blamed_on_yandex(monkeypatch):
 # -- the write went wrong, or its outcome is unknown ----------------------
 
 
-def test_a_connection_lost_mid_write_says_the_outcome_is_unknown(monkeypatch):
+def test_a_connection_lost_mid_write_is_settled_by_the_version_not_a_guess(
+    monkeypatch,
+):
+    """The object is still there after a failed write -- which proves nothing.
+
+    An update is not settled by presence: the event was there before the write
+    too. Its version is what moves, and here it did not, so nothing was applied.
+    """
     calendar = _series_calendar()
     puts: list = []
     install_fake_dav_client(
@@ -626,10 +639,12 @@ def test_a_connection_lost_mid_write_says_the_outcome_is_unknown(monkeypatch):
         update(summary="Daily standup")
 
     message = str(caught.value)
-    assert "unknown" in message.lower()
+    assert "version was" in message.lower(), message
+    assert "nothing was applied" in message.lower(), message
+    assert "may or may not" not in message, "a settled outcome is still hedged"
     assert "standup" in message
     assert "calendar_event_get" in message
-    assert len(puts) == 1, "a write of unknown outcome was retried"
+    assert len(puts) == 1, "a write whose answer was lost was retried"
 
 
 def test_a_rate_limited_write_is_not_re_issued_and_names_the_uid(monkeypatch):
@@ -675,9 +690,7 @@ def test_a_conditional_write_answered_201_is_the_change_this_server_made(
 
 def test_a_write_answered_with_no_status_at_all_is_not_success(monkeypatch):
     calendar = _series_calendar()
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], put_status=None
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], put_status=None)
 
     with pytest.raises(ProtocolError) as caught:
         update(summary="Daily standup")
@@ -687,9 +700,7 @@ def test_a_write_answered_with_no_status_at_all_is_not_success(monkeypatch):
 
 def test_a_server_failure_during_the_write_is_never_reported_as_changed(monkeypatch):
     calendar = _series_calendar()
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], put_status=500
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], put_status=500)
 
     with pytest.raises(ProtocolError) as caught:
         update(summary="Daily standup")
@@ -848,7 +859,7 @@ def test_the_client_layer_also_requires_the_etag(monkeypatch):
 
 def test_the_tool_declares_itself_destructive():
     """It overwrites what was there, and a caller that gates writes must know."""
-    from yandex_core.risk import RiskClass, RISK_REGISTRY, annotations_for
+    from yandex_core.risk import RISK_REGISTRY, RiskClass, annotations_for
 
     assert RISK_REGISTRY[UPDATE_TOOL_NAME] is RiskClass.DESTRUCTIVE
     annotations = annotations_for(UPDATE_TOOL_NAME)
@@ -1135,8 +1146,9 @@ class TimestampingCalendar(FakeCalendar):
     def add(self, href, data):
         super().add(
             href,
-            data.replace("DTSTART;VALUE=DATE:20260615", "DTSTART:20260615T000000Z")
-            .replace("DTEND;VALUE=DATE:20260616", "DTEND:20260616T000000Z"),
+            data.replace(
+                "DTSTART;VALUE=DATE:20260615", "DTSTART:20260615T000000Z"
+            ).replace("DTEND;VALUE=DATE:20260616", "DTEND:20260616T000000Z"),
         )
 
 
@@ -1167,9 +1179,7 @@ def test_a_409_does_not_send_the_caller_to_re_read_and_retry(monkeypatch):
     thing that cannot help, and they will keep doing it.
     """
     calendar = _series_calendar()
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], put_status=409
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], put_status=409)
 
     with pytest.raises(Conflict) as caught:
         update(summary="Daily standup")
@@ -1279,9 +1289,7 @@ def test_a_calendar_url_the_account_does_not_list_writes_nothing(monkeypatch):
     install_fake_dav_client(monkeypatch, calendars=[calendar], puts=puts)
 
     with pytest.raises(NotFound) as caught:
-        update(
-            calendar_url=f"{URL}/calendars/me/nonexistent/", summary="Daily standup"
-        )
+        update(calendar_url=f"{URL}/calendars/me/nonexistent/", summary="Daily standup")
 
     message = str(caught.value)
     assert f"{URL}/calendars/me/nonexistent/" in message
@@ -1354,3 +1362,164 @@ def test_a_no_op_reports_the_etag_the_caller_may_still_use(monkeypatch):
     assert puts == []
     assert updated.etag == "etag-design-review"
     assert updated.etag_note is None
+
+
+# -- settling a lost answer instead of handing the question back -----------
+
+
+def test_a_change_that_landed_before_the_answer_was_lost_says_it_was_applied(
+    monkeypatch,
+):
+    """The half that matters: the write landed and the reply never came back.
+
+    Nothing in the failure distinguishes this from the case above. A caller
+    told "it may or may not have been applied" either repeats the change with
+    an ETag that is now stale, or re-reads and applies it on top of somebody
+    else's edit -- and this server can simply say which happened.
+    """
+    calendar = _series_calendar()
+    puts: list = []
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises_after=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        update(summary="Daily standup")
+
+    message = str(caught.value)
+    lowered = message.lower()
+    assert "version had" in lowered, message
+    assert "was applied" in lowered, message
+    assert "do not repeat it" in lowered, message
+    assert "may or may not" not in message
+    assert len(puts) == 1
+
+
+class _GoneWhenTheWriteIsSent(FakeCalendar):
+    """The event is deleted by somebody else while the write is in flight.
+
+    Not a contrivance: it is the race this server measured and could not close.
+    A conditional PUT to an address holding nothing is answered by Yandex with
+    a creation, not a refusal, so a caller who repeats the change here puts the
+    deleted event back.
+    """
+
+    def __init__(self, *args, after, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._after = after
+
+    def event_by_url(self, href, data=None):
+        if self._after:
+            from caldav.lib import error as caldav_error
+
+            raise caldav_error.NotFoundError(url=str(href), reason="Not Found")
+        return super().event_by_url(href, data)
+
+    def object_by_uid(self, uid, *args, **kwargs):
+        if self._after:
+            from caldav.lib import error as caldav_error
+
+            raise caldav_error.NotFoundError(url=str(self.url), reason="Not Found")
+        return super().object_by_uid(uid, *args, **kwargs)
+
+
+def test_an_event_deleted_under_a_lost_write_is_not_offered_a_repeat(monkeypatch):
+    """ "Nothing was applied" is true here and the wrong thing to say alone."""
+    puts: list = []
+    calendar = _GoneWhenTheWriteIsSent("Personal", PERSONAL, [SERIES], after=puts)
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        update(summary="Daily standup")
+
+    message = str(caught.value)
+    lowered = message.lower()
+    assert "not on it at all" in lowered, message
+    assert "do not repeat it" in lowered, message
+    assert "put the deleted event back" in lowered, message
+    assert len(puts) == 1
+
+
+class _BreaksWhenTheWriteIsSent(FakeCalendar):
+    """Reads normally until the PUT goes out, then the connection is gone.
+
+    The update path reads the stored document before editing it, so a calendar
+    that refused every read would break before the write was ever sent -- and
+    the test would prove nothing about what this server says afterwards.
+    """
+
+    def __init__(self, *args, after, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._after = after
+
+    def event_by_url(self, href, data=None):
+        if self._after:
+            raise http_error.ConnectionError("still down")
+        return super().event_by_url(href, data)
+
+    def object_by_uid(self, uid, *args, **kwargs):
+        if self._after:
+            raise http_error.ConnectionError("still down")
+        return super().object_by_uid(uid, *args, **kwargs)
+
+
+def test_a_change_whose_readback_also_fails_still_says_unknown(monkeypatch):
+    """The check is an attempt over the connection that just broke."""
+    puts: list = []
+    calendar = _BreaksWhenTheWriteIsSent("Personal", PERSONAL, [SERIES], after=puts)
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        update(summary="Daily standup")
+
+    message = str(caught.value)
+    assert "may or may not" in message, message
+    assert "calendar_event_get" in message
+    assert len(puts) == 1
+
+
+def test_a_version_that_cannot_be_read_leaves_the_change_unsettled(monkeypatch):
+    """The gap between "unchanged" and "we could not tell".
+
+    On this server the ETag is a PROPFIND property, and a PROPFIND can fail on
+    its own. An edit whose version cannot be read is not an edit that did not
+    land -- and the two answers point the caller in opposite directions: repeat
+    it, or do not. Treating one as the other would tell somebody to send a
+    change that may already be stored.
+    """
+    puts: list = []
+    calendar = FakeCalendar(
+        "Personal",
+        PERSONAL,
+        [SERIES],
+        property_error=caldav_error.DAVError("the server would not answer PROPFIND"),
+    )
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        update(summary="Daily standup")
+
+    message = str(caught.value)
+    assert "may or may not" in message, message
+    assert "nothing was applied" not in message.lower(), (
+        "an unreadable version was reported as a change that did not land"
+    )
+    assert len(puts) == 1

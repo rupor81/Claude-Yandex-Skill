@@ -8,16 +8,16 @@ secret: messages name *which* credential failed, never its value.
 from __future__ import annotations
 
 __all__ = [
-    "YandexError",
     "AuthError",
-    "CredentialNotFound",
-    "PolicyError",
-    "NotFound",
     "Conflict",
+    "CredentialNotFound",
+    "NotConfigured",
+    "NotFound",
+    "PolicyError",
+    "ProtocolError",
     "RateLimited",
     "TransportError",
-    "ProtocolError",
-    "NotConfigured",
+    "YandexError",
 ]
 
 

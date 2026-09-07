@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from yandex_core.config import (
     DEFAULT_CALDAV_URL,
     PROFILE_ENV_VAR,

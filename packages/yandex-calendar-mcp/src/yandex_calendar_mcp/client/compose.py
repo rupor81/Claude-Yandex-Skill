@@ -33,29 +33,30 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import icalendar
+
 from yandex_core.errors import ProtocolError
 
 __all__ = [
-    "EventDraft",
-    "EventEdit",
-    "EditedDocument",
-    "CancelledInstance",
+    "EDITABLE_FIELDS",
     "PRODID",
     "SCOPE_OCCURRENCE",
     "SCOPE_SERIES",
     "UNCHANGED",
+    "CancelledInstance",
+    "EditedDocument",
+    "EventDraft",
+    "EventEdit",
+    "FloatingExclusion",
     "apply_event_edit",
     "apply_instance_cancellation",
+    "build_event_document",
     "check_event_edit",
     "exdates",
-    "FloatingExclusion",
-    "EDITABLE_FIELDS",
     "new_uid",
-    "build_event_document",
     "written_boundary",
 ]
 
@@ -105,7 +106,7 @@ def build_event_document(draft: EventDraft, *, now: datetime | None = None) -> s
 
     event = icalendar.Event()
     event.add("UID", draft.uid)
-    event.add("DTSTAMP", (now or datetime.now(timezone.utc)).replace(microsecond=0))
+    event.add("DTSTAMP", (now or datetime.now(UTC)).replace(microsecond=0))
     event.add("SUMMARY", draft.summary)
     event.add("DTSTART", written_boundary(draft.start))
     event.add("DTEND", written_boundary(draft.end))
@@ -135,7 +136,7 @@ def written_boundary(value: date | datetime) -> date | datetime:
     made.
     """
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).replace(microsecond=0)
+        return value.astimezone(UTC).replace(microsecond=0)
     return value
 
 
@@ -193,8 +194,8 @@ def _check_boundaries(start: date | datetime, end: date | datetime) -> None:
 
 def _as_instant(value: date | datetime) -> datetime:
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc)
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        return value.astimezone(UTC)
+    return datetime(value.year, value.month, value.day, tzinfo=UTC)
 
 
 # -- editing a document the server already holds --------------------------
@@ -317,7 +318,7 @@ def apply_event_edit(
 
     try:
         document = icalendar.Calendar.from_ical(ics)
-    except Exception as exc:  # noqa: BLE001 - never a missing event
+    except Exception as exc:
         raise ProtocolError(
             f"The stored calendar object for event {uid!r} could not be read, so "
             "it cannot be changed: the server returned something this parser "
@@ -447,7 +448,7 @@ def apply_instance_cancellation(
     """
     try:
         document = icalendar.Calendar.from_ical(ics)
-    except Exception as exc:  # noqa: BLE001 - never a missing event
+    except Exception as exc:
         raise ProtocolError(
             f"The stored calendar object for event {uid!r} could not be read, so "
             "the instance cannot be cancelled: the server returned something "
@@ -585,7 +586,7 @@ def _holder_of(
 
 def _master_component(
     components: list[icalendar.Event], *, uid: str
-) -> "icalendar.Event | None":
+) -> icalendar.Event | None:
     """The one component that defines the event, or nothing when there is none.
 
     Two components sharing the UID with no ``RECURRENCE-ID`` between them are
@@ -594,9 +595,7 @@ def _master_component(
     as it was, and the caller has no way to see that from the answer.
     """
     masters = [
-        component
-        for component in components
-        if component.get("RECURRENCE-ID") is None
+        component for component in components if component.get("RECURRENCE-ID") is None
     ]
     if len(masters) > 1:
         raise ProtocolError(
@@ -611,12 +610,12 @@ def _master_component(
 
 
 def _override_for(
-    master: "icalendar.Event | None",
+    master: icalendar.Event | None,
     overrides: list[icalendar.Event],
     *,
     uid: str,
     recurrence_id: date | datetime | None,
-) -> tuple[icalendar.Event, "icalendar.Event | None"]:
+) -> tuple[icalendar.Event, icalendar.Event | None]:
     """The component for one instance, found or derived.
 
     Returns the component to edit and, when it had to be derived, that same
@@ -651,7 +650,7 @@ def _stamp(component: icalendar.Event, *, now: datetime | None) -> None:
     one it holds; without the bump a change is written and every other calendar
     keeps showing the old time.
     """
-    moment = (now or datetime.now(timezone.utc)).replace(microsecond=0)
+    moment = (now or datetime.now(UTC)).replace(microsecond=0)
     _replace(component, "DTSTAMP", moment)
     _replace(component, "LAST-MODIFIED", moment)
     try:
@@ -661,9 +660,7 @@ def _stamp(component: icalendar.Event, *, now: datetime | None) -> None:
     _replace(component, "SEQUENCE", sequence + 1)
 
 
-def _apply(
-    component: icalendar.Event, edit: EventEdit
-) -> tuple[bool, dict[str, Any]]:
+def _apply(component: icalendar.Event, edit: EventEdit) -> tuple[bool, dict[str, Any]]:
     """Write the named values onto one component, and say whether any differed.
 
     A value already equal to what is stored is not written.  The distinction
@@ -792,9 +789,7 @@ def _text_property(component: icalendar.Event, name: str) -> str | None:
     return None if value is None else str(value)
 
 
-def _same_boundary(
-    stored: date | datetime | None, written: date | datetime
-) -> bool:
+def _same_boundary(stored: date | datetime | None, written: date | datetime) -> bool:
     """Whether a boundary already names the same point, spelling aside.
 
     A date is never the same boundary as a timestamp: an all-day event turned

@@ -15,6 +15,7 @@ import pytest
 from caldav.lib import error as caldav_error
 from conftest import FakeCalendar, install_fake_dav_client
 from niquests import exceptions as http_error
+
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_core.errors import (
     AuthError,
@@ -193,7 +194,8 @@ def test_transport_failures_never_escape_as_http_exceptions(monkeypatch, failure
 
 def test_not_found_is_translated(monkeypatch):
     install_fake_dav_client(
-        monkeypatch, on_principal=caldav_error.NotFoundError(url=URL, reason="Not Found")
+        monkeypatch,
+        on_principal=caldav_error.NotFoundError(url=URL, reason="Not Found"),
     )
     with pytest.raises(NotFound):
         anyio.run(make_client().list_calendars)
@@ -201,7 +203,8 @@ def test_not_found_is_translated(monkeypatch):
 
 def test_rate_limiting_is_translated(monkeypatch):
     install_fake_dav_client(
-        monkeypatch, on_principal=caldav_error.RateLimitError(url=URL, reason="Too Many Requests")
+        monkeypatch,
+        on_principal=caldav_error.RateLimitError(url=URL, reason="Too Many Requests"),
     )
     with pytest.raises(RateLimited):
         anyio.run(make_client().list_calendars)
@@ -209,7 +212,8 @@ def test_rate_limiting_is_translated(monkeypatch):
 
 def test_other_dav_errors_become_protocol_errors(monkeypatch):
     install_fake_dav_client(
-        monkeypatch, on_principal=caldav_error.PropfindError(url=URL, reason="Bad Gateway")
+        monkeypatch,
+        on_principal=caldav_error.PropfindError(url=URL, reason="Bad Gateway"),
     )
     with pytest.raises(ProtocolError):
         anyio.run(make_client().list_calendars)
@@ -273,9 +277,7 @@ WEEKLY = (
 
 def fetch(client, **kwargs):
     async def run():
-        return await client.list_occurrences(
-            start=RANGE_START, end=RANGE_END, **kwargs
-        )
+        return await client.list_occurrences(start=RANGE_START, end=RANGE_END, **kwargs)
 
     return anyio.run(run)
 
@@ -308,7 +310,9 @@ def test_the_only_server_side_filter_is_the_time_range(monkeypatch):
 
 
 def test_the_range_fetch_takes_no_text_parameter():
-    parameters = set(inspect.signature(CalDAVCalendarClient.list_occurrences).parameters)
+    parameters = set(
+        inspect.signature(CalDAVCalendarClient.list_occurrences).parameters
+    )
     assert not parameters & {"title", "title_contains", "text", "summary", "query"}
 
 
@@ -560,7 +564,9 @@ def test_the_overlap_rule_has_no_default_on_the_way_down():
     assert parameter.default is inspect.Parameter.empty
 
 
-def test_the_accounts_own_reply_is_read_with_no_caller_supplying_an_address(monkeypatch):
+def test_the_accounts_own_reply_is_read_with_no_caller_supplying_an_address(
+    monkeypatch,
+):
     """Without the operator address, every declined invitation becomes firm busy
     time -- and the address is the client's own, never a caller's."""
     calendar = FakeCalendar("Personal", f"{URL}/c/personal/", [DECLINED_INVITE])

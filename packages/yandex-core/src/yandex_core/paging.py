@@ -28,10 +28,10 @@ from .errors import ProtocolError
 
 __all__ = [
     "checked_limit",
-    "encode_cursor",
     "decode_cursor",
-    "encode_position_cursor",
     "decode_position_cursor",
+    "encode_cursor",
+    "encode_position_cursor",
 ]
 
 _VERSION = 1

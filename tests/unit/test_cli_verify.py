@@ -8,6 +8,7 @@ is reachable without a network.
 from __future__ import annotations
 
 import pytest
+
 from yandex_core.config import Profile, config_path, write_profile
 from yandex_core.credentials import REDACTED, store_secret
 from yandex_core.errors import (
@@ -408,9 +409,9 @@ def test_the_cli_does_not_import_the_connector_at_module_level():
         # Only statements directly in the module body run at import time; the
         # same import inside a function body is exactly what this story wants.
         for node in ast.walk(ast.Module(body=tree.body, type_ignores=[])):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                node.body = []
-            elif is_type_checking(node):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ) or is_type_checking(node):
                 node.body = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -422,9 +423,7 @@ def test_the_cli_does_not_import_the_connector_at_module_level():
             offenders = [
                 name for name in names if name.split(".")[0] in CONNECTOR_PACKAGES
             ]
-            assert not offenders, (
-                f"{path.name} imports {offenders} at module level"
-            )
+            assert not offenders, f"{path.name} imports {offenders} at module level"
 
 
 def test_verify_still_reports_when_the_connector_is_genuinely_absent(tmp_path):
@@ -669,8 +668,12 @@ def test_one_failure_beside_an_unconfigured_service_still_exits_one(
     monkeypatch.setattr(
         verify_module,
         "CHECKS",
-        (check_notes, verify_module.check_calendar, verify_module.check_mail,
-         verify_module.check_disk),
+        (
+            check_notes,
+            verify_module.check_calendar,
+            verify_module.check_mail,
+            verify_module.check_disk,
+        ),
     )
 
     code, out, _ = run(capsys)

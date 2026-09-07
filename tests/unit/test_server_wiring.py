@@ -7,10 +7,11 @@ import caldav
 import pytest
 from caldav.lib import error as caldav_error
 from conftest import FakeCalendar, FakePrincipal, install_fake_dav_client
+from mcp.server.mcpserver.exceptions import ToolError
+
 from yandex_calendar_mcp import server as server_module
 from yandex_core.config import Profile
 from yandex_core.errors import AuthError, CredentialNotFound
-from mcp.server.mcpserver.exceptions import ToolError
 
 PROFILE = Profile(name="default", login="me@yandex.ru")
 
@@ -240,7 +241,9 @@ def test_a_wrong_app_password_never_reaches_the_caller_as_text(monkeypatch):
 
     class FailingDAVClient:
         def __init__(self, **kwargs):
-            raise caldav_error.AuthorizationError(url="https://caldav.yandex.ru", reason="Unauthorized")
+            raise caldav_error.AuthorizationError(
+                url="https://caldav.yandex.ru", reason="Unauthorized"
+            )
 
     monkeypatch.setenv("YANDEX_MCP_CALENDAR_DEFAULT_PASSWORD", secret)
     monkeypatch.setattr(caldav, "DAVClient", FailingDAVClient)
@@ -257,9 +260,7 @@ def test_the_instructions_claim_exactly_the_writes_this_server_can_do(monkeypatc
     """Three writes exist now, and the instructions must claim those three."""
     server = build(monkeypatch)
     tools = anyio.run(server.list_tools)
-    writes = sorted(
-        tool.name for tool in tools if not tool.annotations.read_only_hint
-    )
+    writes = sorted(tool.name for tool in tools if not tool.annotations.read_only_hint)
     assert writes == [
         "calendar_event_create",
         "calendar_event_delete",

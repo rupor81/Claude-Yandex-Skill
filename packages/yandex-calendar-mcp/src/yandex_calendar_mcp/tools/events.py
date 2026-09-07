@@ -26,10 +26,11 @@ The decisions worth reading twice:
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Annotated
 
 from pydantic import BaseModel, Field
+
 from yandex_core.errors import ProtocolError
 from yandex_core.paging import checked_limit, encode_position_cursor
 from yandex_core.results import Page
@@ -53,6 +54,7 @@ from ..client.recurrence import (
     EventRecord,
     Occurrence,
     Participant,
+    SortKey,
     format_instant,
     parse_instant,
     position_sort_key,
@@ -72,40 +74,40 @@ from .timerange import (
 )
 
 __all__ = [
+    "CREATE_TOOL_NAME",
+    "DEFAULT_LIMIT",
+    "DELETE_TOOL_NAME",
+    "DESCRIPTION_TRUNCATED_NOTE",
+    "ETAG_UNREADABLE_NOTE",
+    "GET_TOOL_NAME",
+    "MAX_DESCRIPTION_CHARS",
+    "MAX_DESCRIPTION_INPUT_CHARS",
+    "MAX_LIMIT",
+    "MAX_LOCATION_CHARS",
+    "MAX_RANGE_DAYS",
+    "MAX_SUMMARY_CHARS",
+    "MIN_LIMIT",
+    "MORE_PAGES",
+    "NO_ETAG_NOTE",
+    "RANGE_TRUNCATED",
+    "SCOPE_OCCURRENCE",
+    "SCOPE_SERIES",
+    "SCOPE_SINGLE",
+    "TOOL_NAME",
+    "UNREADABLE_DATA",
+    "UPDATE_TOOL_NAME",
+    "Attendee",
+    "EventCreated",
+    "EventDeleted",
+    "EventDetail",
     "EventOccurrence",
     "EventPage",
-    "DEFAULT_LIMIT",
-    "MAX_LIMIT",
-    "MIN_LIMIT",
-    "MAX_RANGE_DAYS",
-    "Attendee",
-    "EventDetail",
-    "TOOL_NAME",
-    "GET_TOOL_NAME",
-    "SCOPE_SINGLE",
-    "SCOPE_SERIES",
-    "SCOPE_OCCURRENCE",
-    "NO_ETAG_NOTE",
-    "ETAG_UNREADABLE_NOTE",
-    "DESCRIPTION_TRUNCATED_NOTE",
-    "MAX_DESCRIPTION_CHARS",
-    "MAX_SUMMARY_CHARS",
-    "MAX_LOCATION_CHARS",
-    "MAX_DESCRIPTION_INPUT_CHARS",
-    "build_calendar_event_get",
-    "CREATE_TOOL_NAME",
-    "StoredEvent",
-    "EventCreated",
-    "build_calendar_event_create",
-    "UPDATE_TOOL_NAME",
     "EventUpdated",
-    "build_calendar_event_update",
-    "DELETE_TOOL_NAME",
-    "EventDeleted",
+    "StoredEvent",
+    "build_calendar_event_create",
     "build_calendar_event_delete",
-    "MORE_PAGES",
-    "RANGE_TRUNCATED",
-    "UNREADABLE_DATA",
+    "build_calendar_event_get",
+    "build_calendar_event_update",
     "build_calendar_events_list",
 ]
 
@@ -354,11 +356,7 @@ def build_calendar_events_list(
         # The client applies `after` before its own ceiling, which is what makes
         # a truncated range pageable at all. Re-applying it here costs nothing
         # and keeps this contract true of any client, not only that one.
-        fetched = [
-            o
-            for o in expansion.occurrences
-            if after is None or _key(o) > after
-        ]
+        fetched = [o for o in expansion.occurrences if after is None or _key(o) > after]
         matching = (
             [o for o in fetched if needle in (o.summary or "").casefold()]
             if needle is not None
@@ -408,7 +406,7 @@ def build_calendar_events_list(
     return calendar_events_list
 
 
-def _key(occurrence: Occurrence):
+def _key(occurrence: Occurrence) -> SortKey:
     return position_sort_key(
         occurrence.start,
         occurrence.calendar_url,
@@ -430,9 +428,7 @@ def _to_model(occurrence: Occurrence) -> EventOccurrence:
     )
 
 
-def _cursor_position(
-    occurrence: Occurrence, *, query: str
-) -> dict[str, str | None]:
+def _cursor_position(occurrence: Occurrence, *, query: str) -> dict[str, str | None]:
     return {
         "start": format_instant(occurrence.start),
         "calendar_url": occurrence.calendar_url,
@@ -442,7 +438,7 @@ def _cursor_position(
     }
 
 
-def _position_from(cursor: str | None, *, query: str):
+def _position_from(cursor: str | None, *, query: str) -> SortKey | None:
     """The sort key of the last occurrence a previous page returned."""
     if cursor is None:
         return None
@@ -500,9 +496,7 @@ class Attendee(BaseModel):
     """One person on an event, as the invitation records them."""
 
     email: str | None = Field(
-        description=(
-            "Address of the participant, or null when the line carried none."
-        )
+        description=("Address of the participant, or null when the line carried none.")
     )
     name: str | None = Field(
         description=(
@@ -519,8 +513,7 @@ class Attendee(BaseModel):
     )
     role: str | None = Field(
         description=(
-            "REQ-PARTICIPANT, OPT-PARTICIPANT, CHAIR, and so on, or null when "
-            "unstated."
+            "REQ-PARTICIPANT, OPT-PARTICIPANT, CHAIR, and so on, or null when unstated."
         )
     )
 
@@ -535,9 +528,7 @@ class EventDetail(BaseModel):
     """
 
     uid: str = Field(
-        description=(
-            "Identifier of the event, shared by every instance of a series."
-        )
+        description=("Identifier of the event, shared by every instance of a series.")
     )
     recurrence_id: str | None = Field(
         description=(
@@ -606,8 +597,8 @@ class EventDetail(BaseModel):
     recurrence_summary: str | None = Field(
         default=None,
         description=(
-            "How this series repeats, in a sentence -- for example \"Repeats "
-            "daily, 5 times in all.\" Null for a one-off event. The recurrence "
+            'How this series repeats, in a sentence -- for example "Repeats '
+            'daily, 5 times in all." Null for a one-off event. The recurrence '
             "rule itself is never returned; use `calendar_events_list` to see "
             "the concrete instances."
         ),
@@ -936,8 +927,11 @@ class EventCreated(BaseModel):
         description=(
             "Always true when this answer is returned: the server accepted the "
             "write. A write that did not happen is an error, never this model "
-            "with `created: false` -- and a write whose outcome is unknown is an "
-            "error that says so and names the UID to check."
+            "with `created: false`. A write whose answer was lost is an error "
+            "too, and it says which of the two happened: the calendar is read "
+            "once before answering, so it reports the event as created or as "
+            "not created rather than handing the question back. Only when that "
+            "read fails as well does it say the outcome is unknown."
         )
     )
     uid: str = Field(
@@ -1261,9 +1255,7 @@ def _differences(
     differences: list[str] = []
 
     def note(field: str, requested: object, stored: object) -> None:
-        differences.append(
-            f"{field}: requested {requested!r}, stored {stored!r}"
-        )
+        differences.append(f"{field}: requested {requested!r}, stored {stored!r}")
 
     if (record.summary or "") != summary:
         note("summary", summary, record.summary)
@@ -1434,8 +1426,8 @@ def _check_event_bounds(start: date | datetime, end: date | datetime) -> None:
 
 def _as_moment(value: date | datetime) -> datetime:
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc)
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        return value.astimezone(UTC)
+    return datetime(value.year, value.month, value.day, tzinfo=UTC)
 
 
 # -- changing one event ---------------------------------------------------
@@ -1504,9 +1496,7 @@ class EventUpdated(BaseModel):
             "the series itself was."
         ),
     )
-    href: str = Field(
-        description="CalDAV URL of the object that holds the event."
-    )
+    href: str = Field(description="CalDAV URL of the object that holds the event.")
     calendar_url: str = Field(
         description="The calendar it lives in, as that calendar's listing gives it."
     )
@@ -1746,12 +1736,8 @@ def build_calendar_event_update(
         precondition = checked_etag(etag)
         wanted_calendar = checked_calendar_url(calendar_url)
         edit = EventEdit(
-            summary=(
-                UNCHANGED if summary is None else _checked_summary(summary)
-            ),
-            start=(
-                UNCHANGED if start is None else _checked_boundary(start, "start")
-            ),
+            summary=(UNCHANGED if summary is None else _checked_summary(summary)),
+            start=(UNCHANGED if start is None else _checked_boundary(start, "start")),
             end=UNCHANGED if end is None else _checked_boundary(end, "end"),
             description=(
                 UNCHANGED
@@ -2128,7 +2114,7 @@ class EventDeleted(BaseModel):
             "which has nothing left to have occurrences, and null when the "
             "question could not be answered -- an endless rule whose every "
             "instance is cancelled is not walked forever. Null is never "
-            "\"none left\": `series_note` says which of the two it is."
+            '"none left": `series_note` says which of the two it is.'
         ),
     )
     series_note: str | None = Field(

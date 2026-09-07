@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from yandex_core.credentials import (
     REDACTED,
     get_secret,

@@ -1,0 +1,69 @@
+name: CI
+
+# Live tests are deliberately absent from CI. They write to a real Yandex account,
+# and this server's rate limit is per account and does not reset between runs, so a
+# CI job racing a developer's local run would fail one of them for no reason. They
+# are run by hand; the README says how, including the spacing rule.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Sync
+        run: uv sync --no-editable --frozen
+
+      # The project's own records, checked against each other. Every one of the
+      # cases this catches actually happened during epic 1.
+      - name: Records agree
+        run: uv run --no-sync python scripts/check_bookkeeping.py
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Format
+        run: uv run --no-sync ruff format --check .
+
+      # `env -u PYTHONPATH` is not decoration. This project once reported a green
+      # suite that was green only because PYTHONPATH happened to be set in one
+      # shell; the same run failed in a clean environment. The unit suite must
+      # import what is installed and nothing else.
+      - name: Unit tests
+        run: env -u PYTHONPATH uv run --no-sync pytest tests/unit -q
+
+      # The connectors are useless if the server cannot be started and asked what
+      # it offers, and that path imports every module the tests import separately.
+      - name: Server starts and lists its tools
+        run: |
+          env -u PYTHONPATH uv run --no-sync python - <<'PY'
+          import anyio
+          from yandex_calendar_mcp.server import build_calendar_server
+          from yandex_core.risk import RISK_REGISTRY
+
+          server = build_calendar_server()
+          tools = anyio.run(server.list_tools)
+          names = sorted(t.name for t in tools)
+          expected = sorted(RISK_REGISTRY)
+          assert names == expected, f"{names} != {expected}"
+          destructive = sorted(
+              t.name for t in tools if t.annotations and t.annotations.destructive_hint
+          )
+          assert destructive == ["calendar_event_delete", "calendar_event_update"], destructive
+          print(f"{len(names)} tools, {len(destructive)} destructive")
+          PY

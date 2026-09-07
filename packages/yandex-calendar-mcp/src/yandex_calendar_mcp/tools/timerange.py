@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from yandex_core.errors import ProtocolError
@@ -34,12 +34,12 @@ __all__ = [
     "RANGE_TRUNCATED",
     "UNREADABLE_DATA",
     "IncompleteReason",
-    "checked_instant",
-    "checked_calendar_url",
     "check_range",
-    "query_stamp",
+    "checked_calendar_url",
+    "checked_instant",
     "decoded_position",
     "incomplete_reasons",
+    "query_stamp",
 ]
 
 #: The smallest limit any tool accepts.  Zero would ask for an answer that
@@ -145,8 +145,8 @@ def query_stamp(
     cannot forget to bind it.
     """
     parts = (
-        start.astimezone(timezone.utc).isoformat(),
-        end.astimezone(timezone.utc).isoformat(),
+        start.astimezone(UTC).isoformat(),
+        end.astimezone(UTC).isoformat(),
         calendar_url or "",
         *(value or "" for value in extra),
     )

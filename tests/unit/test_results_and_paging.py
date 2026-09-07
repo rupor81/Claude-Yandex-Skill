@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
+
 from yandex_core.errors import ProtocolError
 from yandex_core.paging import (
     decode_cursor,
@@ -74,7 +75,11 @@ POSITION_FIELDS = ("start", "uid", "recurrence_id")
 
 
 def position(**overrides):
-    base = {"start": "2026-06-08T09:00:00+03:00", "uid": "standup-1", "recurrence_id": None}
+    base = {
+        "start": "2026-06-08T09:00:00+03:00",
+        "uid": "standup-1",
+        "recurrence_id": None,
+    }
     base.update(overrides)
     return base
 

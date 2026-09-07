@@ -6,19 +6,17 @@ A bare list cannot say whether it is the whole answer.  ``Page`` can, and both
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
-
 from pydantic import BaseModel, Field
 
 __all__ = ["Page"]
 
-T = TypeVar("T")
 
-
-class Page(BaseModel, Generic[T]):
+class Page[T](BaseModel):
     """One bounded slice of a collection, honest about what it left out."""
 
-    items: list[T] = Field(description="The items in this slice, at most `limit` of them.")
+    items: list[T] = Field(
+        description="The items in this slice, at most `limit` of them."
+    )
     complete: bool = Field(
         description=(
             "True when this page ends the result set: nothing further remains. "
@@ -33,6 +31,6 @@ class Page(BaseModel, Generic[T]):
     )
 
     @classmethod
-    def whole(cls, items: list[T]) -> "Page[T]":
+    def whole(cls, items: list[T]) -> Page[T]:
         """A page that is provably the entire result set."""
         return cls(items=items, complete=True, next_cursor=None)

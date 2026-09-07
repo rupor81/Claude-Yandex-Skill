@@ -6,10 +6,11 @@ itself part of the contract: the tool must never hand the client a text filter.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import anyio
 import pytest
+
 from yandex_calendar_mcp.client.recurrence import (
     Expansion,
     Occurrence,
@@ -86,7 +87,9 @@ class FakeClient:
         self.calls.append(kwargs)
         after = kwargs.get("after")
         remaining = [
-            o for o in self.occurrences if after is None or occurrence_sort_key(o) > after
+            o
+            for o in self.occurrences
+            if after is None or occurrence_sort_key(o) > after
         ]
         truncated = self.forced_truncated
         if self.ceiling is not None:
@@ -285,7 +288,9 @@ def test_the_client_exposes_no_text_search_parameter_at_all():
 
     from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 
-    parameters = set(inspect.signature(CalDAVCalendarClient.list_occurrences).parameters)
+    parameters = set(
+        inspect.signature(CalDAVCalendarClient.list_occurrences).parameters
+    )
     assert not parameters & {"title", "title_contains", "text", "summary", "query"}
 
 
@@ -573,7 +578,9 @@ def test_each_occurrence_reports_the_calendar_it_came_from():
 
     page = call(tool, start=START, end=END)
 
-    assert {(item.uid, item.calendar_url, item.calendar_name) for item in page.items} == {
+    assert {
+        (item.uid, item.calendar_url, item.calendar_name) for item in page.items
+    } == {
         ("a", CALENDAR, "Personal"),
         ("b", OTHER_CALENDAR, "Work"),
     }
@@ -623,8 +630,8 @@ def test_the_same_range_written_in_another_offset_is_the_same_question():
 
     second = call(
         tool,
-        start=START.astimezone(timezone.utc),
-        end=END.astimezone(timezone.utc),
+        start=START.astimezone(UTC),
+        end=END.astimezone(UTC),
         limit=2,
         cursor=first.next_cursor,
     )

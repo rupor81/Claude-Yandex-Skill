@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from yandex_core.app import build_server, register_tool
 from yandex_core.errors import ProtocolError
 from yandex_core.risk import RiskClass, annotations_for, is_registered

@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.14", "pyyaml>=6"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -38,3 +38,45 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 bypass-selection = true
+
+# The linter exists because the source already carries `noqa` codes -- BLE001 and
+# ANN001 -- that nothing was enforcing. A suppression nobody checks is worse than no
+# suppression: it reads as a considered exception when it may be a leftover.
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+# `_bmad/` is vendored methodology scaffolding installed by the operator, not our
+# source; linting it would report on somebody else's code and drown ours.
+extend-exclude = ["_bmad", "_bmad-output", ".venv"]
+src = [
+    "packages/yandex-core/src",
+    "packages/yandex-calendar-mcp/src",
+    "packages/yandex-mcp-cli/src",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # import order
+    "UP",          # pyupgrade
+    "B",           # bugbear
+    "BLE",         # blind except -- the codes already suppressed in the source
+    "ANN",         # annotations -- likewise
+    "SIM",         # simplify
+    "RET",         # return paths
+    "PTH",         # pathlib over os.path
+    "RUF",
+]
+ignore = [
+    "ANN401",      # deliberate `object` / `Any` at the validation boundary
+    "E501",        # long lines are formatter territory, not lint territory
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests name their fakes and fixtures for what they prove, not for a type checker,
+# and a fake that swallows an exception is often the point of the test.
+"tests/**" = ["ANN", "BLE", "B011"]
+
+[tool.ruff.lint.flake8-annotations]
+suppress-none-returning = true

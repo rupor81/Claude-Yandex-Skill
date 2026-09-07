@@ -14,20 +14,13 @@ account with one would fail a test of the code that has nothing wrong with it.
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import anyio
 import pytest
+
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_calendar_mcp.tools.calendars import build_calendar_list
-from yandex_calendar_mcp.tools.freebusy import (
-    BUSY,
-    BUSY_TENTATIVE,
-    BUSY_UNANSWERED,
-    BusyInterval,
-    FreeBusyPage,
-    build_calendar_freebusy_query,
-)
 from yandex_calendar_mcp.tools.events import (
     MORE_PAGES,
     RANGE_TRUNCATED,
@@ -38,6 +31,14 @@ from yandex_calendar_mcp.tools.events import (
     build_calendar_event_create,
     build_calendar_event_get,
     build_calendar_events_list,
+)
+from yandex_calendar_mcp.tools.freebusy import (
+    BUSY,
+    BUSY_TENTATIVE,
+    BUSY_UNANSWERED,
+    BusyInterval,
+    FreeBusyPage,
+    build_calendar_freebusy_query,
 )
 from yandex_core.config import load_profile
 from yandex_core.credentials import get_secret
@@ -75,7 +76,7 @@ def test_calendar_list_returns_real_calendars():
 
 def test_calendar_events_list_returns_real_occurrences():
     """One real range query: a week from today, against the configured account."""
-    start = datetime.now(timezone.utc).replace(microsecond=0)
+    start = datetime.now(UTC).replace(microsecond=0)
     end = start + timedelta(days=7)
 
     tool = build_calendar_events_list(_provider())
@@ -117,7 +118,7 @@ def test_calendar_events_list_returns_real_occurrences():
 
 def test_paging_a_real_range_terminates_and_never_dead_ends():
     """Follow the cursor for real: every page must be resumable or complete."""
-    start = datetime.now(timezone.utc).replace(microsecond=0)
+    start = datetime.now(UTC).replace(microsecond=0)
     end = start + timedelta(days=30)
 
     tool = build_calendar_events_list(_provider())
@@ -164,7 +165,7 @@ def test_reading_one_real_event_by_uid_returns_it_with_an_etag():
     # calendar, and costs a third of the requests. The whole live suite
     # shares one rate-limit budget, so a window wider than the question
     # needs is paid for by whichever test happens to run last.
-    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=7)
+    start = datetime.now(UTC).replace(microsecond=0) - timedelta(days=7)
     end = start + timedelta(days=21)
 
     listed = anyio.run(
@@ -183,7 +184,9 @@ def test_reading_one_real_event_by_uid_returns_it_with_an_etag():
     assert detail.calendar_url == occurrence.calendar_url
     assert detail.scope in {SCOPE_SINGLE, SCOPE_SERIES}
     assert detail.etag, "the server supplied no ETag; story 1.7 cannot be made safe"
-    assert "--gzip" not in detail.etag, "the ETag came from the header, not the property"
+    assert "--gzip" not in detail.etag, (
+        "the ETag came from the header, not the property"
+    )
     assert detail.etag_note is None
     assert isinstance(detail.attendees, list)
 
@@ -194,7 +197,7 @@ def test_reading_one_real_instance_of_a_real_series():
     # calendar, and costs a third of the requests. The whole live suite
     # shares one rate-limit budget, so a window wider than the question
     # needs is paid for by whichever test happens to run last.
-    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=7)
+    start = datetime.now(UTC).replace(microsecond=0) - timedelta(days=7)
     end = start + timedelta(days=21)
 
     listed = anyio.run(
@@ -229,7 +232,7 @@ def test_an_unknown_uid_is_a_not_found_against_the_real_account():
 def _as_moment(value):
     if isinstance(value, datetime):
         return value
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    return datetime(value.year, value.month, value.day, tzinfo=UTC)
 
 
 def test_a_real_week_of_busy_time_is_answered_without_a_single_title():
@@ -240,7 +243,7 @@ def test_a_real_week_of_busy_time_is_answered_without_a_single_title():
     expanded occurrences. What is asserted is the contract, never the operator's
     diary: an account with a quiet week is not a failing server.
     """
-    start = datetime.now(timezone.utc).replace(microsecond=0)
+    start = datetime.now(UTC).replace(microsecond=0)
     end = start + timedelta(days=7)
 
     tool = build_calendar_freebusy_query(_provider())
@@ -313,7 +316,7 @@ def test_a_real_busy_query_never_reports_a_meeting_the_account_declined():
     rather than passing on an account that could not have failed it -- and the
     range is a month rather than a week to give it something to find.
     """
-    start = datetime.now(timezone.utc).replace(microsecond=0)
+    start = datetime.now(UTC).replace(microsecond=0)
     end = start + timedelta(days=30)
 
     async def occurrences():
@@ -359,7 +362,9 @@ def test_a_real_busy_query_never_reports_a_meeting_the_account_declined():
             "nothing else fills, so there is nothing this assertion could catch"
         )
 
-    busy = anyio.run(lambda: build_calendar_freebusy_query(_provider())(start=start, end=end))
+    busy = anyio.run(
+        lambda: build_calendar_freebusy_query(_provider())(start=start, end=end)
+    )
     for moment in free_moments:
         assert not [
             interval
@@ -369,7 +374,7 @@ def test_a_real_busy_query_never_reports_a_meeting_the_account_declined():
 
 
 def test_a_real_range_beyond_the_maximum_is_refused_before_the_network():
-    start = datetime.now(timezone.utc).replace(microsecond=0)
+    start = datetime.now(UTC).replace(microsecond=0)
     tool = build_calendar_freebusy_query(_provider())
     with pytest.raises(ProtocolError) as caught:
         anyio.run(lambda: tool(start=start, end=start + timedelta(days=400)))
@@ -448,9 +453,7 @@ def test_creating_a_real_event_reports_what_the_server_stored_and_leaves_no_trac
         # On a whole minute: measured, this server stores an event to the
         # minute and drops the seconds, and the sub-minute case is asserted
         # deliberately further down rather than tripped over here.
-        start = datetime.now(timezone.utc).replace(second=0, microsecond=0) + timedelta(
-            days=1
-        )
+        start = datetime.now(UTC).replace(second=0, microsecond=0) + timedelta(days=1)
         end = start + timedelta(hours=1)
         create = build_calendar_event_create(_provider())
         created = anyio.run(
@@ -468,7 +471,9 @@ def test_creating_a_real_event_reports_what_the_server_stored_and_leaves_no_trac
         assert created.uid
         assert created.calendar_url.rstrip("/") == scratch_url.rstrip("/")
         assert created.etag, "no ETag was returned, so story 1.7 cannot be made safe"
-        assert "--gzip" not in created.etag, "the ETag came from a header, not the property"
+        assert "--gzip" not in created.etag, (
+            "the ETag came from a header, not the property"
+        )
         assert created.stored is not None, created.stored_note
         assert created.stored.all_day is False
         assert created.stored.start.utcoffset() is not None
@@ -539,7 +544,7 @@ def test_a_real_write_into_a_url_that_is_not_a_calendar_writes_nothing():
     profile = load_profile()
     bogus = profile.caldav_url.rstrip("/") + "/no-such-calendar-yandex-mcp-live/"
     create = build_calendar_event_create(_provider())
-    start = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)
+    start = datetime.now(UTC).replace(microsecond=0) + timedelta(days=1)
 
     with pytest.raises(NotFound) as caught:
         anyio.run(
@@ -572,10 +577,10 @@ LIVE_SERIES_UID = "yandex-mcp-live-update-series"
 
 def _live_series_document(start):
     end = start + timedelta(minutes=30)
-    stamp = datetime.now(timezone.utc).replace(microsecond=0)
+    stamp = datetime.now(UTC).replace(microsecond=0)
 
     def moment(value):
-        return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
 
     return (
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//yandex-mcp//live-test//EN\r\n"
@@ -613,19 +618,16 @@ def test_changing_a_real_series_and_one_real_instance_of_it():
         assert scratch_url, (
             "the throwaway calendar was created but is not in the listing"
         )
-        first = (
-            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-            + timedelta(days=1)
-        )
+        first = datetime.now(UTC).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(days=1)
         with _dav_client() as client:
             client.calendar(url=scratch_url).save_event(_live_series_document(first))
 
         update = build_calendar_event_update(_provider())
         get = build_calendar_event_get(_provider())
 
-        original = anyio.run(
-            lambda: get(uid=LIVE_SERIES_UID, calendar_url=scratch_url)
-        )
+        original = anyio.run(lambda: get(uid=LIVE_SERIES_UID, calendar_url=scratch_url))
         assert original.is_series, "the series was not stored as a series"
         assert original.etag, "no ETag, so no change can be made safely"
 
@@ -676,7 +678,9 @@ def test_changing_a_real_series_and_one_real_instance_of_it():
         starts = [_as_moment(item.start) for item in occurrences]
         assert starts[0] == first, "an instance nobody touched was moved"
         assert starts[2] == first + timedelta(days=2), "the last instance moved"
-        assert moved_start in starts, "the instance that was moved is not at its new time"
+        assert moved_start in starts, (
+            "the instance that was moved is not at its new time"
+        )
         assert instance not in starts, "the moved instance is still at its old time too"
 
         # Now the series itself. The instance already moved must survive with
@@ -772,10 +776,10 @@ LIVE_DELETE_SERIES_UID = "yandex-mcp-live-delete-series"
 
 def _live_delete_series_document(start):
     end = start + timedelta(minutes=30)
-    stamp = datetime.now(timezone.utc).replace(microsecond=0)
+    stamp = datetime.now(UTC).replace(microsecond=0)
 
     def moment(value):
-        return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
 
     return (
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//yandex-mcp//live-test//EN\r\n"
@@ -813,10 +817,9 @@ def test_cancelling_one_real_instance_and_then_removing_the_real_series():
         assert scratch_url, (
             "the throwaway calendar was created but is not in the listing"
         )
-        first = (
-            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-            + timedelta(days=1)
-        )
+        first = datetime.now(UTC).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(days=1)
         with _dav_client() as client:
             client.calendar(url=scratch_url).save_event(
                 _live_delete_series_document(first)
@@ -906,9 +909,7 @@ def test_cancelling_one_real_instance_and_then_removing_the_real_series():
         # Confirmed independently, through the read path rather than the
         # delete's own answer.
         with pytest.raises(NotFound):
-            anyio.run(
-                lambda: get(uid=LIVE_DELETE_SERIES_UID, calendar_url=scratch_url)
-            )
+            anyio.run(lambda: get(uid=LIVE_DELETE_SERIES_UID, calendar_url=scratch_url))
     finally:
         target = _real_url_of(scratch_name)
         if target is not None:

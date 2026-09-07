@@ -30,10 +30,11 @@ attendee, no UID.  This tool answers about time only.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, tzinfo
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
+
 from yandex_core.errors import ProtocolError
 from yandex_core.paging import checked_limit, encode_position_cursor
 from yandex_core.results import Page
@@ -56,27 +57,27 @@ from .timerange import (
 )
 
 __all__ = [
-    "TOOL_NAME",
     "BUSY",
     "BUSY_TENTATIVE",
     "BUSY_UNANSWERED",
-    "KINDS",
+    "CLIPPED_BOTH_NOTE",
+    "CLIPPED_END_NOTE",
+    "CLIPPED_START_NOTE",
     "DEFAULT_LIMIT",
+    "KINDS",
     "MAX_LIMIT",
-    "MIN_LIMIT",
     "MAX_RANGE_DAYS",
+    "MIN_LIMIT",
     "MORE_PAGES",
     "RANGE_TRUNCATED",
+    "TOOL_NAME",
     "UNREADABLE_DATA",
-    "CLIPPED_START_NOTE",
-    "CLIPPED_END_NOTE",
-    "CLIPPED_BOTH_NOTE",
-    "IncompleteReason",
-    "Kind",
     "BusyInterval",
     "FreeBusyPage",
-    "merge_intervals",
+    "IncompleteReason",
+    "Kind",
     "build_calendar_freebusy_query",
+    "merge_intervals",
 ]
 
 TOOL_NAME = "calendar_freebusy_query"
@@ -347,9 +348,7 @@ def build_calendar_freebusy_query(
                 # the time is missing either way.
                 corrupt += 1
                 continue
-            interval = _interval_for(
-                occurrence, start=window_start, end=window_end
-            )
+            interval = _interval_for(occurrence, start=window_start, end=window_end)
             if interval is not None:
                 collected.append(interval)
         intervals = merge_intervals(collected)
@@ -467,7 +466,7 @@ def _kind_of(occurrence: Occurrence) -> Kind | None:
     return _STATUS_KINDS.get(status, BUSY)
 
 
-def _as_moment(value: date | datetime, offset) -> datetime:
+def _as_moment(value: date | datetime, offset: tzinfo | None) -> datetime:
     """A bound as an instant, giving an all-day date its whole day.
 
     A date has no offset of its own, and reading it as midnight UTC would block

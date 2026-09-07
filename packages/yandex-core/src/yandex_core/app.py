@@ -27,7 +27,7 @@ from .credentials import REDACTED, SECRET_FIELD_NAMES, redact_mapping
 from .errors import ProtocolError, YandexError
 from .risk import annotations_for
 
-__all__ = ["build_server", "register_tool", "configure_logging", "LOG_LEVEL_ENV_VAR"]
+__all__ = ["LOG_LEVEL_ENV_VAR", "build_server", "configure_logging", "register_tool"]
 
 LOG_LEVEL_ENV_VAR = "YANDEX_MCP_LOG_LEVEL"
 DEFAULT_LOG_LEVEL = "INFO"

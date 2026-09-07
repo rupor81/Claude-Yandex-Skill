@@ -25,6 +25,7 @@ import anyio
 import pytest
 from caldav.lib import error as caldav_error
 from conftest import FakeCalendar, FakeObject, install_fake_dav_client
+
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_calendar_mcp.client.recurrence import EventRecord
 from yandex_calendar_mcp.tools.events import (
@@ -259,7 +260,7 @@ def test_an_unknown_uid_is_a_not_found_naming_it_never_an_empty_success(monkeypa
 
 
 def test_an_unknown_instance_is_distinguishable_from_an_unknown_uid(monkeypatch):
-    """"The series is not there" and "that day is not in it" need different fixes."""
+    """ "The series is not there" and "that day is not in it" need different fixes."""
     tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [SERIES])])
     with pytest.raises(NotFound) as caught:
         call(tool, uid="standup", recurrence_id="2027-01-01T09:00:00+03:00")
@@ -363,7 +364,7 @@ def test_an_unreachable_calendar_does_not_stop_the_others_from_answering(monkeyp
 
 
 def test_a_transport_failure_is_not_reported_as_a_missing_event(monkeypatch):
-    """"Not found" would send the caller looking for an event that is really there."""
+    """ "Not found" would send the caller looking for an event that is really there."""
     broken = FakeCalendar(
         "Personal", PERSONAL, fetch_raises=http_error.ConnectionError("no route")
     )
@@ -460,7 +461,7 @@ def test_the_tool_is_named_for_the_registry(monkeypatch):
 
 
 def test_an_unparseable_document_is_not_reported_as_a_missing_event(monkeypatch):
-    """"Not found" would be a claim about the account; the fault is in the data."""
+    """ "Not found" would be a claim about the account; the fault is in the data."""
     calendar = FakeCalendar("Personal", PERSONAL, ["UID:broken\r\nnot an icalendar"])
     tool = make_tool(monkeypatch, [calendar])
     with pytest.raises(ProtocolError) as caught:
@@ -578,7 +579,7 @@ def test_an_event_whose_etag_cannot_be_read_is_still_returned(monkeypatch):
 
 
 def test_an_unreadable_etag_is_not_described_as_one_the_server_never_sent(monkeypatch):
-    """"None supplied" and "we could not read it" call for different next steps."""
+    """ "None supplied" and "we could not read it" call for different next steps."""
     unreadable = FakeCalendar(
         "Personal", PERSONAL, [STANDALONE], property_error=RuntimeError("boom")
     )
@@ -594,9 +595,7 @@ def test_an_unreadable_etag_is_not_described_as_one_the_server_never_sent(monkey
 
 def test_a_caldav_without_use_cached_does_not_make_the_event_vanish(monkeypatch):
     """An older library signature must not read as "that event does not exist"."""
-    calendar = FakeCalendar(
-        "Personal", PERSONAL, [STANDALONE], legacy_property=True
-    )
+    calendar = FakeCalendar("Personal", PERSONAL, [STANDALONE], legacy_property=True)
     tool = make_tool(monkeypatch, [calendar])
     assert call(tool, uid="design-review").etag == "etag-design-review"
 
@@ -617,7 +616,9 @@ ORPHAN_OVERRIDE = document(
 
 def test_a_document_of_overrides_alone_is_not_passed_off_as_the_series(monkeypatch):
     """One instance's time reported as the series' own is a plausible wrong answer."""
-    tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [ORPHAN_OVERRIDE])])
+    tool = make_tool(
+        monkeypatch, [FakeCalendar("Personal", PERSONAL, [ORPHAN_OVERRIDE])]
+    )
     with pytest.raises(ProtocolError) as caught:
         call(tool, uid="orphan")
     assert not isinstance(caught.value, NotFound)
@@ -642,7 +643,9 @@ def test_a_floating_exdate_never_yields_a_start_the_tool_would_itself_refuse(
     monkeypatch,
 ):
     """A naive start here is a value this tool's own validator rejects on the way in."""
-    tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [FLOATING_EXDATE])])
+    tool = make_tool(
+        monkeypatch, [FakeCalendar("Personal", PERSONAL, [FLOATING_EXDATE])]
+    )
     with pytest.raises(ProtocolError):
         call(tool, uid="floating-exdate", recurrence_id="2026-06-10T09:00:00+00:00")
 
@@ -693,7 +696,7 @@ def test_the_scan_stops_at_the_calendar_that_answered(monkeypatch):
 def test_a_calendar_url_that_names_no_calendar_is_not_reported_as_a_missing_event(
     monkeypatch,
 ):
-    """"No such event" sends the caller hunting for a meeting that is really there."""
+    """ "No such event" sends the caller hunting for a meeting that is really there."""
     tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [STANDALONE])])
     with pytest.raises(NotFound) as unlisted:
         call(tool, uid="no-such-event", calendar_url=f"{URL}/calendars/me/gone/")
@@ -726,7 +729,9 @@ def test_a_rejected_password_is_an_auth_failure_not_a_missing_event(monkeypatch)
     rejected = FakeCalendar(
         "Personal",
         PERSONAL,
-        fetch_raises=caldav_error.AuthorizationError(url=PERSONAL, reason="Unauthorized"),
+        fetch_raises=caldav_error.AuthorizationError(
+            url=PERSONAL, reason="Unauthorized"
+        ),
     )
     tool = make_tool(monkeypatch, [rejected])
     with pytest.raises(AuthError):
@@ -794,7 +799,9 @@ def test_an_instance_after_a_this_and_future_override_is_not_answered_at_the_old
     monkeypatch,
 ):
     """Every later instance moved; returning 09:00 sends the caller five hours early."""
-    tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [THIS_AND_FUTURE])])
+    tool = make_tool(
+        monkeypatch, [FakeCalendar("Personal", PERSONAL, [THIS_AND_FUTURE])]
+    )
     with pytest.raises(ProtocolError) as caught:
         call(tool, uid="shifted", recurrence_id="2026-06-12T09:00:00+03:00")
     assert not isinstance(caught.value, NotFound)
@@ -817,7 +824,9 @@ TWO_ORGANIZERS = document(
 
 def test_a_second_organizer_is_reported_rather_than_dropped(monkeypatch):
     """Dropping one silently makes the answer look complete when it is not."""
-    tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [TWO_ORGANIZERS])])
+    tool = make_tool(
+        monkeypatch, [FakeCalendar("Personal", PERSONAL, [TWO_ORGANIZERS])]
+    )
     detail = call(tool, uid="two-chairs")
     assert [person.email for person in detail.organizers] == [
         "first@example.com",
@@ -870,7 +879,7 @@ def test_the_join_link_is_returned_rather_than_left_to_be_dug_out(monkeypatch):
 
 
 def test_a_series_says_how_it_recurs_rather_than_only_that_it_does(monkeypatch):
-    """"is_series: true" with no rule leaves the caller unable to plan around it."""
+    """ "is_series: true" with no rule leaves the caller unable to plan around it."""
     tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [SERIES])])
     detail = call(tool, uid="standup")
     assert detail.scope == SCOPE_SERIES
@@ -900,7 +909,9 @@ def test_an_all_day_series_instance_is_addressable_by_the_date_the_schema_promis
     monkeypatch,
 ):
     """The schema tells callers to pass a plain date; it must actually work."""
-    tool = make_tool(monkeypatch, [FakeCalendar("Personal", PERSONAL, [ALL_DAY_SERIES])])
+    tool = make_tool(
+        monkeypatch, [FakeCalendar("Personal", PERSONAL, [ALL_DAY_SERIES])]
+    )
     detail = call(tool, uid="sprint-demo", recurrence_id="2026-06-19")
     assert detail.scope == SCOPE_OCCURRENCE
     assert detail.recurrence_id == "2026-06-19"

@@ -11,9 +11,10 @@ pure: a draft in, iCalendar text out.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
+
 from yandex_calendar_mcp.client.compose import (
     PRODID,
     EventDraft,
@@ -25,7 +26,7 @@ from yandex_core.errors import ProtocolError
 MOSCOW = timezone(timedelta(hours=3))
 START = datetime(2026, 6, 8, 9, 0, tzinfo=MOSCOW)
 END = START + timedelta(hours=1)
-STAMP = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
+STAMP = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
 
 
 def draft(**kwargs) -> EventDraft:
@@ -57,9 +58,7 @@ def test_a_timed_event_is_written_as_an_instant_nobody_has_to_interpret():
 
 def test_an_all_day_event_stays_dates_at_both_ends():
     """Coercing a day to midnight moves the day for everybody not on UTC."""
-    document = build_event_document(
-        draft(start=date(2026, 6, 8), end=date(2026, 6, 9))
-    )
+    document = build_event_document(draft(start=date(2026, 6, 8), end=date(2026, 6, 9)))
 
     assert "DTSTART;VALUE=DATE:20260608" in lines(document)
     assert "DTEND;VALUE=DATE:20260609" in lines(document)
@@ -100,14 +99,14 @@ def test_the_stamp_can_be_supplied_so_the_document_is_reproducible():
 
 
 def test_the_stamp_defaults_to_now_in_utc():
-    before = datetime.now(timezone.utc).replace(microsecond=0)
+    before = datetime.now(UTC).replace(microsecond=0)
     document = build_event_document(draft())
-    after = datetime.now(timezone.utc)
+    after = datetime.now(UTC)
 
     (stamp,) = [line for line in lines(document) if line.startswith("DTSTAMP:")]
     written = datetime.strptime(
         stamp.removeprefix("DTSTAMP:"), "%Y%m%dT%H%M%SZ"
-    ).replace(tzinfo=timezone.utc)
+    ).replace(tzinfo=UTC)
     assert before <= written <= after
 
 
@@ -221,7 +220,7 @@ def test_an_event_spanning_an_offset_change_is_ordered_as_instants():
     """09:00+03:00 is before 07:30+00:00; comparing the clock faces would refuse
     a perfectly good meeting."""
     document = build_event_document(
-        draft(start=START, end=datetime(2026, 6, 8, 7, 30, tzinfo=timezone.utc))
+        draft(start=START, end=datetime(2026, 6, 8, 7, 30, tzinfo=UTC))
     )
 
     assert "DTEND:20260608T073000Z" in lines(document)
@@ -268,7 +267,7 @@ MASTER_WITH_ALARM = (
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 )
 
-NINTH = datetime(2026, 6, 9, 6, 0, tzinfo=timezone.utc)
+NINTH = datetime(2026, 6, 9, 6, 0, tzinfo=UTC)
 
 
 def edited(ics, **kwargs):
@@ -311,8 +310,8 @@ def test_deriving_an_override_carries_the_reminder_the_series_gave_it(monkeypatc
         scope="occurrence",
         recurrence_id=NINTH,
         edit=EventEdit(
-            start=datetime(2026, 6, 9, 7, 0, tzinfo=timezone.utc),
-            end=datetime(2026, 6, 9, 7, 30, tzinfo=timezone.utc),
+            start=datetime(2026, 6, 9, 7, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 9, 7, 30, tzinfo=UTC),
         ),
     )
 
@@ -338,8 +337,8 @@ def test_a_derived_override_is_not_a_second_series(monkeypatch):
         scope="occurrence",
         recurrence_id=NINTH,
         edit=EventEdit(
-            start=datetime(2026, 6, 9, 7, 0, tzinfo=timezone.utc),
-            end=datetime(2026, 6, 9, 7, 30, tzinfo=timezone.utc),
+            start=datetime(2026, 6, 9, 7, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 9, 7, 30, tzinfo=UTC),
         ),
     )
 
@@ -370,8 +369,8 @@ def test_moving_an_event_timed_by_duration_leaves_only_one_answer_for_its_end():
         DURATION_MASTER,
         uid="sprint-sync",
         edit=EventEdit(
-            start=datetime(2026, 6, 8, 8, 0, tzinfo=timezone.utc),
-            end=datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc),
+            start=datetime(2026, 6, 8, 8, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 8, 9, 0, tzinfo=UTC),
         ),
     )
 
@@ -473,7 +472,7 @@ def test_the_revision_stamp_can_be_pinned_and_moves_forward():
         ONE_OFF_WITH_LOCATION,
         uid="design-review",
         edit=EventEdit(summary="Design review II"),
-        now=datetime(2026, 6, 2, 12, 30, 15, 987654, tzinfo=timezone.utc),
+        now=datetime(2026, 6, 2, 12, 30, 15, 987654, tzinfo=UTC),
     )
 
     lines_written = lines(result.document)
@@ -509,7 +508,7 @@ CANCEL_SERIES = (
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 )
 
-NINTH_AT_SIX = datetime(2026, 6, 9, 6, 0, tzinfo=timezone.utc)
+NINTH_AT_SIX = datetime(2026, 6, 9, 6, 0, tzinfo=UTC)
 
 
 def test_cancelling_an_instance_of_an_unreadable_document_writes_nothing():
@@ -612,9 +611,7 @@ def test_a_floating_exclusion_is_refused_rather_than_written_beside():
     )
 
     with pytest.raises(ProtocolError) as caught:
-        apply_instance_cancellation(
-            floating, uid="standup", recurrence_id=NINTH_AT_SIX
-        )
+        apply_instance_cancellation(floating, uid="standup", recurrence_id=NINTH_AT_SIX)
 
     assert "timezone" in str(caught.value).lower()
 
@@ -630,12 +627,16 @@ def test_the_reader_and_the_writer_read_exclusions_through_one_implementation():
         "the reader has an EXDATE implementation of its own again"
     )
     # And they answer the same document the same way.
-    component = list(
-        __import__("icalendar").Calendar.from_ical(
-            CANCEL_SERIES.replace(
-                "RRULE:FREQ=DAILY;COUNT=5\r\n",
-                "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260609T060000Z\r\n",
+    component = next(
+        iter(
+            __import__("icalendar")
+            .Calendar.from_ical(
+                CANCEL_SERIES.replace(
+                    "RRULE:FREQ=DAILY;COUNT=5\r\n",
+                    "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260609T060000Z\r\n",
+                )
             )
-        ).walk("VEVENT")
-    )[0]
+            .walk("VEVENT")
+        )
+    )
     assert compose.exdates(component) == recurrence._exdates(component)

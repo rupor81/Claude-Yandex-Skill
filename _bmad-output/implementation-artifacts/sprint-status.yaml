@@ -57,16 +57,16 @@ story_location: '{project-root}/_bmad-output/implementation-artifacts'
 
 development_status:
   # Epic 1: Calendar connector, end to end
-  epic-1: in-progress
-  1-1-connect-a-calendar-and-list-it: review
-  1-2-verify-a-configured-account: review
-  1-3-query-events-over-a-date-range: review
-  1-4-read-one-event-in-full: review
-  1-5-inspect-busy-time: review
-  1-6-create-an-event: review
-  1-7-update-an-event-with-an-explicit-scope: review
-  1-8-delete-an-event-with-an-explicit-scope: review
-  epic-1-retrospective: optional
+  epic-1: done
+  1-1-connect-a-calendar-and-list-it: done
+  1-2-verify-a-configured-account: done
+  1-3-query-events-over-a-date-range: done
+  1-4-read-one-event-in-full: done
+  1-5-inspect-busy-time: done
+  1-6-create-an-event: done
+  1-7-update-an-event-with-an-explicit-scope: done
+  1-8-delete-an-event-with-an-explicit-scope: done
+  epic-1-retrospective: done
 
   # Epic 2: Mail connector, end to end
   epic-2: backlog
@@ -93,3 +93,72 @@ development_status:
   3-7-create-folders-and-copy-paths: backlog
   3-8-move-and-trash-paths-in-bulk: backlog
   epic-3-retrospective: optional
+
+# Action items committed during retrospectives. Each names the epic it came from
+# and the retrospective document that argues for it.
+action_items:
+  - id: ai-1-1
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: Add README, LICENSE, ruff configuration, py.typed markers and a CI workflow.
+    status: done
+    outcome: >-
+      Done 2026-09-07. The linter's first run found 153 findings, 9 of them stale `noqa`
+      codes suppressing diagnostics that no longer fire -- which was the argument for
+      configuring it. CI runs the records check, the linter, the formatter, the unit
+      suite under `env -u PYTHONPATH`, and a real server start that lists its tools.
+  - id: ai-1-2
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: Decide and document the install-mode split — editable for development, non-editable for operators — so the UF_HIDDEN trap cannot cost another false verification.
+    status: done
+    outcome: >-
+      Done 2026-09-07. README carries the split as a table with the root cause, and says
+      explicitly that reaching for PYTHONPATH hides the problem and produces verification
+      that proves nothing -- which is what it did once.
+  - id: ai-1-3
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: State the live-suite spacing rule in the test module itself; the rate limit is per account and does not reset between runs.
+    status: done
+    outcome: >-
+      Done 2026-09-07. tests/live/conftest.py stamps each run and warns, before the next
+      one starts, when it opens inside the quiet period -- naming the rate limit so a
+      failure is not diagnosed as a defect for the third time. It warns rather than
+      skips: a suite that silently declines to run is the worse failure.
+  - id: ai-1-4
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: Carry the unknown-write-outcome contract into epic 2's send path explicitly — there the unknown outcome is a sent message, and a blind retry sends a second one.
+    status: in-progress
+    outcome: >-
+      The calendar half is done 2026-09-07: a write whose answer was lost is now settled
+      by exactly one read rather than handed back to the caller. A create reports created
+      or not created; a delete reports gone or still there; an edit is settled by the
+      version rather than by presence, because the object was there before the write too.
+      An unreadable version and a failed read both keep the unsettled wording, and a 429
+      is deliberately not checked -- that read would spend the budget the caller needs.
+      Proven by eight mutations, one of which survived and exposed a missing test for the
+      unreadable-version case. What remains is epic 2's own: a sent message cannot be
+      read back the way a calendar object can, so the same contract needs a different
+      mechanism.
+  - id: ai-1-5
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: Script the consistency check between sprint-status.yaml and the spec files; both bookkeeping defects this epic were manual-update failures.
+    status: done
+    outcome: >-
+      Done 2026-09-07 as scripts/check_bookkeeping.py, run by CI. It was written after a
+      third instance of the same defect: repairing deferred-work.md during this very
+      retrospective dropped an entry and left two `## Resolved` headings. Verified by
+      reintroducing all three historical defects and watching it report each one.
+  - id: ai-1-6
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: Write the rule "a fake models the server's observed behaviour, never the code under test" into the epic 2 context; two of eight stories shipped a self-validating fake.
+    status: open
+  - id: ai-1-7
+    epic: 1
+    source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
+    summary: Verify each cross-layer rule against the library's actual behaviour rather than our call site; caldav retried a PUT on 429 under a no-retry rule.
+    status: open

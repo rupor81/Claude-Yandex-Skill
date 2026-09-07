@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from pydantic import BaseModel, Field
-from yandex_core.errors import ProtocolError
+
 from yandex_core.paging import (
     checked_limit,
     decode_position_cursor,
@@ -22,11 +22,11 @@ from yandex_core.results import Page
 from ..client.caldav_client import CalDAVCalendarClient
 
 __all__ = [
-    "CalendarSummary",
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
     "MIN_LIMIT",
     "TOOL_NAME",
+    "CalendarSummary",
     "build_calendar_list",
 ]
 
@@ -46,7 +46,9 @@ class CalendarSummary(BaseModel):
     url: str = Field(description="CalDAV collection URL identifying the calendar.")
 
 
-def build_calendar_list(client_provider: ClientProvider) -> Callable[..., Awaitable[Page]]:
+def build_calendar_list(
+    client_provider: ClientProvider,
+) -> Callable[..., Awaitable[Page]]:
     """Bind ``calendar_list`` to a source of clients.
 
     The provider is injected rather than imported so that tests, and later

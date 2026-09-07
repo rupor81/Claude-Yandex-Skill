@@ -13,6 +13,7 @@ import logging
 import sys
 
 import pytest
+
 from yandex_core.app import LOG_LEVEL_ENV_VAR, configure_logging
 from yandex_core.credentials import (
     KEYRING_SERVICE,

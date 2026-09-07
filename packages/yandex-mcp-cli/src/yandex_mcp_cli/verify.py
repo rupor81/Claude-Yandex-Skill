@@ -54,8 +54,8 @@ from yandex_core.errors import (
 )
 
 __all__ = [
-    "CHECK_TIMEOUT_SECONDS",
     "CHECKS",
+    "CHECK_TIMEOUT_SECONDS",
     "ServiceResult",
     "State",
     "check_calendar",

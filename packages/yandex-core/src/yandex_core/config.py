@@ -21,8 +21,8 @@ __all__ = [
     "Profile",
     "config_dir",
     "config_path",
-    "selected_profile_name",
     "load_profile",
+    "selected_profile_name",
     "write_profile",
 ]
 
@@ -116,7 +116,9 @@ def load_profile(name: str | None = None) -> Profile:
     try:
         return Profile(name=resolved, **fields)
     except ValidationError as exc:
-        raise ProtocolError(f"Profile {resolved!r} in {path} is incomplete: {exc}") from exc
+        raise ProtocolError(
+            f"Profile {resolved!r} in {path} is incomplete: {exc}"
+        ) from exc
 
 
 def write_profile(profile: Profile, *, make_default: bool = True) -> Path:
@@ -183,7 +185,9 @@ def _render_table(path: list[str], table: dict[str, Any]) -> list[str]:
     header = ".".join(_toml_key(part) for part in path)
     if scalars or not nested:
         lines.append(f"[{header}]")
-        lines.extend(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in sorted(scalars.items()))
+        lines.extend(
+            f"{_toml_key(k)} = {_toml_value(v)}" for k, v in sorted(scalars.items())
+        )
         lines.append("")
     for name in sorted(nested):
         lines.extend(_render_table([*path, name], nested[name]))
@@ -203,11 +207,13 @@ def _toml_value(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, str):
         return _toml_string(value)
-    if isinstance(value, int) or isinstance(value, float):
+    if isinstance(value, int | float):
         return repr(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    raise ProtocolError(f"Config value of type {type(value).__name__} cannot be written.")
+    raise ProtocolError(
+        f"Config value of type {type(value).__name__} cannot be written."
+    )
 
 
 _TOML_ESCAPES = {

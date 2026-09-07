@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import sys
 
+from mcp.server.mcpserver import MCPServer
+
 from yandex_core.app import build_server, configure_logging, register_tool
 from yandex_core.config import Profile, load_profile
 from yandex_core.credentials import get_secret
@@ -77,7 +79,7 @@ INSTRUCTIONS = (
 logger = logging.getLogger(__name__)
 
 
-def build_calendar_server(profile: Profile | None = None):
+def build_calendar_server(profile: Profile | None = None) -> MCPServer:
     """Build the calendar application with no transport chosen yet.
 
     Raises:

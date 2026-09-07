@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import anyio
 import pytest
+
 from yandex_calendar_mcp.client.recurrence import (
     CalendarSource,
     Expansion,
@@ -32,6 +33,7 @@ from yandex_calendar_mcp.tools.freebusy import (
     CLIPPED_BOTH_NOTE,
     CLIPPED_END_NOTE,
     DEFAULT_LIMIT,
+    KINDS,
     MAX_LIMIT,
     MAX_RANGE_DAYS,
     MORE_PAGES,
@@ -40,7 +42,6 @@ from yandex_calendar_mcp.tools.freebusy import (
     UNREADABLE_DATA,
     BusyInterval,
     FreeBusyPage,
-    KINDS,
     build_calendar_freebusy_query,
     merge_intervals,
 )
@@ -178,7 +179,9 @@ def test_the_operators_own_reply_is_read_and_no_one_elses():
             "ATTENDEE;PARTSTAT=TENTATIVE;CN=Me:mailto:me@yandex.ru\r\n"
         ),
     )
-    expansion = expand([document(invite)], start=START, end=END, operator="me@yandex.ru")
+    expansion = expand(
+        [document(invite)], start=START, end=END, operator="me@yandex.ru"
+    )
     (only,) = expansion.occurrences
     assert only.participation_status == "TENTATIVE"
 
@@ -300,7 +303,9 @@ def test_each_accepted_meeting_produces_one_busy_interval():
     client = FakeClient(
         [
             occurrence("a", moment(2, 10), moment(2, 11)),
-            occurrence("b", moment(4, 15), moment(4, 16), participation_status="ACCEPTED"),
+            occurrence(
+                "b", moment(4, 15), moment(4, 16), participation_status="ACCEPTED"
+            ),
         ]
     )
     page = call(build(client))
@@ -394,8 +399,12 @@ def test_two_tentative_meetings_that_touch_do_merge_with_each_other():
     """Kinds must not merge into each other -- but a kind must merge with itself."""
     client = FakeClient(
         [
-            occurrence("a", moment(2, 10), moment(2, 11), participation_status="TENTATIVE"),
-            occurrence("b", moment(2, 11), moment(2, 12), participation_status="TENTATIVE"),
+            occurrence(
+                "a", moment(2, 10), moment(2, 11), participation_status="TENTATIVE"
+            ),
+            occurrence(
+                "b", moment(2, 11), moment(2, 12), participation_status="TENTATIVE"
+            ),
         ]
     )
     page = call(build(client))
@@ -410,7 +419,11 @@ def test_a_delegated_invitation_is_not_this_accounts_time():
     Falling through to plain busy would block an hour this account handed over.
     """
     client = FakeClient(
-        [occurrence("a", moment(2, 10), moment(2, 11), participation_status="DELEGATED")]
+        [
+            occurrence(
+                "a", moment(2, 10), moment(2, 11), participation_status="DELEGATED"
+            )
+        ]
     )
     assert call(build(client)).items == []
 
@@ -418,7 +431,11 @@ def test_a_delegated_invitation_is_not_this_accounts_time():
 def test_a_reply_this_server_has_never_seen_is_still_busy():
     """The conservative reading never quietly frees an hour that may be taken."""
     client = FakeClient(
-        [occurrence("a", moment(2, 10), moment(2, 11), participation_status="X-INVENTED")]
+        [
+            occurrence(
+                "a", moment(2, 10), moment(2, 11), participation_status="X-INVENTED"
+            )
+        ]
     )
     (only,) = call(build(client)).items
     assert only.kind == BUSY
@@ -476,7 +493,9 @@ def test_a_clipping_flag_survives_the_merge_that_absorbs_its_interval():
 
 def test_merge_intervals_joins_only_within_one_kind():
     """Exercised directly: every other test reaches it through the whole tool."""
-    tentative = BusyInterval(start=moment(2, 10), end=moment(2, 12), kind=BUSY_TENTATIVE)
+    tentative = BusyInterval(
+        start=moment(2, 10), end=moment(2, 12), kind=BUSY_TENTATIVE
+    )
     merged = merge_intervals(
         [
             BusyInterval(start=moment(2, 11), end=moment(2, 13), kind=BUSY),
@@ -645,7 +664,10 @@ def test_the_answer_carries_no_event_titles_descriptions_or_attendees():
     client = FakeClient(
         [
             occurrence(
-                "a", moment(2, 10), moment(2, 11), summary="Quarterly compensation review"
+                "a",
+                moment(2, 10),
+                moment(2, 11),
+                summary="Quarterly compensation review",
             )
         ]
     )
@@ -679,7 +701,10 @@ def test_a_page_cut_short_by_the_limit_carries_a_cursor_that_continues_it():
 def test_paging_continues_past_the_second_page_and_terminates():
     """A cursor that only ever works once leaves the tail of a range unreachable."""
     client = FakeClient(
-        [occurrence(f"e{day}", moment(day, 9), moment(day, 10)) for day in (2, 3, 4, 5, 6)]
+        [
+            occurrence(f"e{day}", moment(day, 9), moment(day, 10))
+            for day in (2, 3, 4, 5, 6)
+        ]
     )
     tool = build(client)
     seen = []
@@ -715,7 +740,11 @@ def test_the_permitted_kinds_and_reasons_reach_the_json_schema():
     kind = definitions["BusyInterval"]["properties"]["kind"]
     assert set(kind.get("enum", [])) == set(KINDS)
     reasons = schema["properties"]["incomplete_reasons"]["items"]
-    assert set(reasons.get("enum", [])) == {MORE_PAGES, RANGE_TRUNCATED, UNREADABLE_DATA}
+    assert set(reasons.get("enum", [])) == {
+        MORE_PAGES,
+        RANGE_TRUNCATED,
+        UNREADABLE_DATA,
+    }
 
 
 def test_a_cursor_issued_for_a_different_range_is_refused_not_quietly_honoured():
@@ -730,7 +759,10 @@ def test_a_cursor_issued_for_a_different_range_is_refused_not_quietly_honoured()
 
 def test_another_tools_cursor_is_refused():
     with pytest.raises(ProtocolError):
-        call(build(FakeClient()), cursor=encode_cursor({"after": {}}, tool="something_else"))
+        call(
+            build(FakeClient()),
+            cursor=encode_cursor({"after": {}}, tool="something_else"),
+        )
 
 
 @pytest.mark.parametrize("limit", [0, MAX_LIMIT + 1, "10", True])

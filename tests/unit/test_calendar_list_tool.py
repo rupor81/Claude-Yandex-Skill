@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import anyio
 import pytest
+
 from yandex_calendar_mcp.client.caldav_client import CalendarRef
 from yandex_calendar_mcp.tools.calendars import (
     DEFAULT_LIMIT,
@@ -44,7 +45,11 @@ def call(tool, **kwargs) -> Page:
 
 def test_happy_path_is_complete_with_no_cursor():
     page = call(tool_for(FakeCalendarClient(3)))
-    assert [item.name for item in page.items] == ["Calendar 0", "Calendar 1", "Calendar 2"]
+    assert [item.name for item in page.items] == [
+        "Calendar 0",
+        "Calendar 1",
+        "Calendar 2",
+    ]
     assert page.complete is True
     assert page.next_cursor is None
 

@@ -21,7 +21,6 @@ import sys
 from yandex_core.config import (
     DEFAULT_CALDAV_URL,
     Profile,
-    config_path,
     write_profile,
 )
 from yandex_core.credentials import delete_secret, store_secret
@@ -29,7 +28,7 @@ from yandex_core.errors import YandexError
 
 from .verify import render_results, run_checks
 
-__all__ = ["main", "build_parser"]
+__all__ = ["build_parser", "main"]
 
 APP_PASSWORD_EXPLANATION = """\
 Yandex CalDAV does not accept OAuth access tokens: a bearer token that works for

@@ -37,37 +37,38 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import icalendar
 import recurring_ical_events
+
 from yandex_core.errors import ProtocolError
 
 from .compose import FloatingExclusion, exdates
 
 __all__ = [
-    "CalendarSource",
-    "Occurrence",
+    "DEFAULT_CEILING",
+    "OCCURRENCE_SEARCH_LIMIT",
+    "SCOPE_OCCURRENCE",
+    "SCOPE_SERIES",
+    "SCOPE_SINGLE",
     "TRANSPARENCY_OPAQUE",
     "TRANSPARENCY_TRANSPARENT",
-    "Expansion",
-    "DEFAULT_CEILING",
-    "expand",
-    "occurrence_sort_key",
-    "position_sort_key",
-    "format_instant",
-    "parse_instant",
+    "CalendarSource",
     "EventNotInDocument",
-    "InstanceNotInSeries",
-    "Participant",
     "EventRecord",
-    "SCOPE_SINGLE",
-    "SCOPE_SERIES",
-    "SCOPE_OCCURRENCE",
-    "read_event",
+    "Expansion",
+    "InstanceNotInSeries",
+    "Occurrence",
+    "Participant",
+    "expand",
+    "format_instant",
     "has_occurrences",
-    "OCCURRENCE_SEARCH_LIMIT",
+    "occurrence_sort_key",
     "other_uids",
+    "parse_instant",
+    "position_sort_key",
+    "read_event",
 ]
 
 
@@ -230,9 +231,7 @@ def expand(
             # An event with no UID cannot be identified, addressed, or
             # deduplicated against its own overrides. Reported, not dropped --
             # unless it provably could not have appeared in this window anyway.
-            if _may_intersect(
-                group.components, start=start, end=end, overlap=overlap
-            ):
+            if _may_intersect(group.components, start=start, end=end, overlap=overlap):
                 unreadable += len(group.components)
             continue
         try:
@@ -247,9 +246,7 @@ def expand(
                 )
             )
         except Exception:  # noqa: BLE001 - one bad series, one reported failure
-            if _may_intersect(
-                group.components, start=start, end=end, overlap=overlap
-            ):
+            if _may_intersect(group.components, start=start, end=end, overlap=overlap):
                 unreadable += len(group.components)
             continue
         collected.extend(occurrences)
@@ -429,8 +426,10 @@ def _transparency(component: icalendar.Event) -> str:
     if value is None:
         return TRANSPARENCY_OPAQUE
     text = str(value).strip().upper()
-    return TRANSPARENCY_TRANSPARENT if text == TRANSPARENCY_TRANSPARENT else (
-        TRANSPARENCY_OPAQUE
+    return (
+        TRANSPARENCY_TRANSPARENT
+        if text == TRANSPARENCY_TRANSPARENT
+        else (TRANSPARENCY_OPAQUE)
     )
 
 
@@ -580,7 +579,11 @@ def _component_may_intersect(
         return finishes is None or finishes > _as_instant(start)
 
     until = _rrule_until(component)
-    if until is not None and until < _as_instant(start):
+    # Suppressed on the next line: this is a guard, not a predicate. Inlining the
+    # negation would read as one expression about the component when it is the last
+    # of several separate checks, each with its own reason above it.
+    if until is not None and until < _as_instant(start):  # noqa: SIM103
+        # The rule ran out before the window opened.
         return False
     return True
 
@@ -650,9 +653,7 @@ def _duration_property(component: icalendar.Event) -> timedelta | None:
     return value if isinstance(value, timedelta) else None
 
 
-def _end_instant(
-    component: icalendar.Event, start: date | datetime
-) -> date | datetime:
+def _end_instant(component: icalendar.Event, start: date | datetime) -> date | datetime:
     """When this component ends: ``DTEND``, else ``DTSTART`` plus ``DURATION``.
 
     ``DURATION`` is the other legal spelling of how long a meeting lasts, and it
@@ -710,9 +711,9 @@ def _as_instant(value: date | datetime) -> datetime:
     """
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    return datetime(value.year, value.month, value.day, tzinfo=UTC)
 
 
 def format_instant(value: date | datetime) -> str:
@@ -909,9 +910,7 @@ def read_event(
                 is_series=is_series,
                 scope=SCOPE_SERIES if is_series else SCOPE_SINGLE,
                 start=_required_start(master, uid),
-                recurrence_summary=(
-                    _recurrence_summary(master) if is_series else None
-                ),
+                recurrence_summary=(_recurrence_summary(master) if is_series else None),
             )
 
         if not is_series:
@@ -1027,7 +1026,7 @@ def has_occurrences(
     ).after(earliest):
         if not _is_cancelled(expanded):
             return True
-        seen += 1
+        seen += 1  # noqa: SIM113 -- counts skipped instances, not iterations
         if seen >= OCCURRENCE_SEARCH_LIMIT:
             # Every instance so far was skipped and the rule has not run out.
             # Saying "none left" here would be a claim about a series this
@@ -1037,7 +1036,7 @@ def has_occurrences(
 
 
 def other_uids(
-    sources: "CalendarSource | Sequence[CalendarSource]", *, uid: str
+    sources: CalendarSource | Sequence[CalendarSource], *, uid: str
 ) -> list[str]:
     """Every *other* event held by the same objects as this one.
 
@@ -1081,7 +1080,7 @@ def _select_instance(
     uid: str,
     source: CalendarSource,
     documents: Sequence[icalendar.Calendar],
-    master: "icalendar.Event | None",
+    master: icalendar.Event | None,
     overrides: Sequence[icalendar.Event],
     components: Sequence[icalendar.Event],
     recurrence_id: date | datetime,
@@ -1206,7 +1205,7 @@ def _superseded_from(
     return None
 
 
-def _master_of(components: Sequence[icalendar.Event]) -> "icalendar.Event | None":
+def _master_of(components: Sequence[icalendar.Event]) -> icalendar.Event | None:
     """The component that defines the series, as opposed to overriding one instance."""
     for component in components:
         if component.get("RECURRENCE-ID") is None:
@@ -1328,7 +1327,9 @@ def _recurrence_summary(component: icalendar.Event) -> str | None:
         interval = int(_first_value(rule.get("INTERVAL")) or 1)
     except (TypeError, ValueError):
         interval = 1
-    parts = [f"Repeats every {interval} {plural}" if interval > 1 else f"Repeats {every}"]
+    parts = [
+        f"Repeats every {interval} {plural}" if interval > 1 else f"Repeats {every}"
+    ]
 
     byday = rule.get("BYDAY")
     if byday:

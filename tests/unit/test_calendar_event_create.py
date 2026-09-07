@@ -25,6 +25,7 @@ import pytest
 from caldav.lib import error as caldav_error
 from conftest import FakeCalendar, install_fake_dav_client
 from niquests import exceptions as http_error
+
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_calendar_mcp.tools.events import (
     CREATE_TOOL_NAME,
@@ -35,6 +36,7 @@ from yandex_core.errors import (
     NotFound,
     PolicyError,
     ProtocolError,
+    RateLimited,
     TransportError,
 )
 
@@ -106,7 +108,7 @@ def test_the_answer_reports_the_stored_values_not_the_requested_ones(monkeypatch
 
 
 def test_the_event_really_exists_on_the_server_afterwards(monkeypatch):
-    """"Created" is a claim about the account, and it is verified before it is made."""
+    """ "Created" is a claim about the account, and it is verified before it is made."""
     calendar = FakeCalendar("Personal", PERSONAL)
     install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[])
 
@@ -304,7 +306,7 @@ def test_a_write_onto_an_existing_href_fails_rather_than_replacing_it(monkeypatc
     assert "Somebody else's meeting" in stored, "an existing event was overwritten"
 
 
-def test_a_connection_lost_mid_write_says_the_outcome_is_unknown(monkeypatch):
+def test_a_connection_lost_mid_write_names_the_uid_and_is_not_retried(monkeypatch):
     calendar = FakeCalendar("Personal", PERSONAL)
     puts: list = []
     install_fake_dav_client(
@@ -318,12 +320,12 @@ def test_a_connection_lost_mid_write_says_the_outcome_is_unknown(monkeypatch):
         create()
 
     message = str(caught.value)
-    assert "unknown" in message.lower()
-    assert "calendar_event_get" in message, "the caller is not told how to check"
+    # The outcome itself is settled by a read -- see the tests below. What this
+    # one holds is the part that is true either way: the UID is named, and the
+    # write is never re-issued.
+    assert "its answer was lost" in message, message
     # The UID it names must be the one that was actually written to.
-    (uid,) = [
-        put["url"].rsplit("/", 1)[-1].removesuffix(".ics") for put in puts
-    ]
+    (uid,) = [put["url"].rsplit("/", 1)[-1].removesuffix(".ics") for put in puts]
     assert uid in message
     assert len(puts) == 1, "a write of unknown outcome was retried"
 
@@ -401,7 +403,7 @@ def test_an_absent_etag_is_never_invented(monkeypatch):
 
 
 def test_the_tool_declares_itself_a_write_and_not_read_only():
-    from yandex_core.risk import RiskClass, RISK_REGISTRY, annotations_for
+    from yandex_core.risk import RISK_REGISTRY, RiskClass, annotations_for
 
     assert RISK_REGISTRY[CREATE_TOOL_NAME] is RiskClass.WRITE
     annotations = annotations_for(CREATE_TOOL_NAME)
@@ -421,7 +423,9 @@ def test_recurring_and_attendees_are_not_offered_by_this_tool():
     """Deferred deliberately: inviting sends mail on the operator's behalf."""
     import inspect
 
-    parameters = set(inspect.signature(build_calendar_event_create(_provider())).parameters)
+    parameters = set(
+        inspect.signature(build_calendar_event_create(_provider())).parameters
+    )
     assert not parameters & {"attendees", "rrule", "recurrence", "invitees"}
 
 
@@ -554,15 +558,15 @@ def test_the_write_client_disables_the_librarys_own_retry_of_a_put(monkeypatch):
 
 def test_a_rate_limited_write_names_the_uid_to_check(monkeypatch):
     """A 429 leaves the outcome unknown, and a blind retry makes two meetings."""
-    from yandex_core.errors import RateLimited
-
     calendar = FakeCalendar("Personal", PERSONAL)
     puts: list = []
     install_fake_dav_client(
         monkeypatch,
         calendars=[calendar],
         puts=puts,
-        put_raises=caldav_error.RateLimitError(url=PERSONAL, reason="Too Many Requests"),
+        put_raises=caldav_error.RateLimitError(
+            url=PERSONAL, reason="Too Many Requests"
+        ),
     )
 
     with pytest.raises(RateLimited) as caught:
@@ -581,7 +585,9 @@ def test_a_server_failure_during_the_write_is_never_reported_as_created(monkeypa
     """A 500 or a 507 must not fall through to the readback and become success."""
     calendar = FakeCalendar("Personal", PERSONAL)
     puts: list = []
-    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=puts, put_status=500)
+    install_fake_dav_client(
+        monkeypatch, calendars=[calendar], puts=puts, put_status=500
+    )
 
     with pytest.raises(ProtocolError) as caught:
         create()
@@ -640,7 +646,7 @@ def test_a_not_found_on_the_write_does_not_deny_a_calendar_that_is_listed(monkey
 
 
 def test_a_write_answered_with_no_status_at_all_is_not_success(monkeypatch):
-    """"The server said nothing" is not "the event was created"."""
+    """ "The server said nothing" is not "the event was created"."""
     calendar = FakeCalendar("Personal", PERSONAL)
     puts: list = []
     install_fake_dav_client(
@@ -732,8 +738,9 @@ class TimingAnAllDayCalendar(FakeCalendar):
     def add(self, href, data):
         super().add(
             href,
-            data.replace("DTSTART;VALUE=DATE:20260608", "DTSTART:20260608T000000Z")
-            .replace("DTEND;VALUE=DATE:20260609", "DTEND:20260609T000000Z"),
+            data.replace(
+                "DTSTART;VALUE=DATE:20260608", "DTSTART:20260608T000000Z"
+            ).replace("DTEND;VALUE=DATE:20260609", "DTEND:20260609T000000Z"),
         )
 
 
@@ -791,7 +798,9 @@ def test_a_stored_confirmed_status_is_not_reported_as_a_difference(monkeypatch):
 
     class ConfirmingCalendar(FakeCalendar):
         def add(self, href, data):
-            super().add(href, data.replace("SEQUENCE:0", "SEQUENCE:0\r\nSTATUS:CONFIRMED"))
+            super().add(
+                href, data.replace("SEQUENCE:0", "SEQUENCE:0\r\nSTATUS:CONFIRMED")
+            )
 
     calendar = ConfirmingCalendar("Personal", PERSONAL)
     install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[])
@@ -818,7 +827,9 @@ def test_a_microsecond_this_server_dropped_is_not_blamed_on_yandex(monkeypatch):
     start = START.replace(microsecond=500_000)
     created = create(start=start, end=start + timedelta(hours=1))
 
-    assert created.differences == [], "a difference this server made was blamed on Yandex"
+    assert created.differences == [], (
+        "a difference this server made was blamed on Yandex"
+    )
     assert created.differs_from_request is False
 
 
@@ -942,3 +953,106 @@ def test_the_reported_href_is_the_object_that_was_found(monkeypatch):
 
     assert created.href.endswith("-server.ics")
     assert calendar.holds(created.href)
+
+
+# -- settling an unknown outcome instead of leaving it with the caller ------
+
+
+def test_a_lost_connection_that_stored_nothing_says_nothing_was_created(monkeypatch):
+    """ "The outcome is unknown" is worth saying only while it is still true.
+
+    The connection failed before the server stored anything. One read
+    afterwards settles that, and the caller who is told "nothing was created"
+    can act; the caller told "it may or may not exist" can only go and look.
+    """
+    calendar = FakeCalendar("Personal", PERSONAL)
+    puts: list = []
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        create()
+
+    message = str(caught.value)
+    assert "nothing was created" in message.lower(), message
+    assert "may or may not" not in message, "a settled outcome is still hedged"
+    assert len(puts) == 1, "the write was retried"
+
+
+def test_a_lost_connection_after_the_write_landed_says_it_was_created(monkeypatch):
+    """The dangerous half: the write landed and the answer never came back.
+
+    Nothing in the failure distinguishes this from the case above, which is why
+    it is read rather than assumed. A caller told to create it again here ends
+    up with the meeting twice.
+    """
+    calendar = FakeCalendar("Personal", PERSONAL)
+    puts: list = []
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises_after=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        create()
+
+    message = str(caught.value)
+    lowered = message.lower()
+    assert "was created" in lowered, message
+    assert "do not create it again" in lowered, message
+    assert "may or may not" not in message
+    assert len(puts) == 1
+
+
+def test_a_lost_connection_whose_readback_also_fails_still_says_unknown(monkeypatch):
+    """The check is an attempt, never a promise: the connection is the same one."""
+    calendar = FakeCalendar(
+        "Personal",
+        PERSONAL,
+        fetch_raises=http_error.ConnectionError("still down"),
+    )
+    puts: list = []
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        create()
+
+    message = str(caught.value)
+    assert "may or may not" in message, message
+    assert "calendar_event_get" in message, "the caller is not told how to check"
+    assert len(puts) == 1
+
+
+def test_a_rate_limited_create_does_not_spend_another_request_checking(monkeypatch):
+    """The one unknown outcome that is deliberately left unsettled.
+
+    A 429 says this account has no budget left. Spending the next request on a
+    read that will almost certainly be refused too costs the caller the attempt
+    they actually need, and buys an answer we would not get.
+    """
+    calendar = FakeCalendar("Personal", PERSONAL)
+    puts: list = []
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=puts,
+        put_raises=caldav_error.RateLimitError("slow down"),
+    )
+
+    with pytest.raises(RateLimited) as caught:
+        create()
+
+    assert calendar.fetched == [], "a rate-limited account was asked for more"
+    assert "may or may not" in str(caught.value)
+    assert len(puts) == 1

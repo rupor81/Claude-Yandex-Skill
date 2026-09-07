@@ -9,6 +9,7 @@ from __future__ import annotations
 import getpass
 
 import pytest
+
 from yandex_core.config import DEFAULT_CALDAV_URL, load_profile
 from yandex_core.credentials import get_secret
 from yandex_mcp_cli.main import main

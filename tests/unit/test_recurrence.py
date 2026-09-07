@@ -5,9 +5,10 @@ No network and no CalDAV: these run against iCalendar text directly.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
+
 from yandex_calendar_mcp.client.recurrence import (
     CalendarSource,
     expand,
@@ -19,16 +20,24 @@ from yandex_calendar_mcp.client.recurrence import (
 from yandex_core.errors import ProtocolError
 
 MOSCOW = timezone(timedelta(hours=3))
-RANGE_START = datetime(2026, 6, 1, tzinfo=timezone.utc)
-RANGE_END = datetime(2026, 6, 30, tzinfo=timezone.utc)
+RANGE_START = datetime(2026, 6, 1, tzinfo=UTC)
+RANGE_END = datetime(2026, 6, 30, tzinfo=UTC)
 
 
 def document(body: str) -> str:
-    return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n" + body + "END:VCALENDAR\r\n"
+    return (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+        + body
+        + "END:VCALENDAR\r\n"
+    )
 
 
-def source(body: str, *, url: str = "https://caldav.example/me/personal/") -> CalendarSource:
-    return CalendarSource(ics=document(body), calendar_url=url, calendar_name="Personal")
+def source(
+    body: str, *, url: str = "https://caldav.example/me/personal/"
+) -> CalendarSource:
+    return CalendarSource(
+        ics=document(body), calendar_url=url, calendar_name="Personal"
+    )
 
 
 SINGLE = """BEGIN:VEVENT
@@ -58,7 +67,9 @@ EXDATE;TZID=Europe/Moscow:20260610T090000
 END:VEVENT
 """
 
-SERIES_WITH_OVERRIDE = SERIES + """BEGIN:VEVENT
+SERIES_WITH_OVERRIDE = (
+    SERIES
+    + """BEGIN:VEVENT
 UID:series-1
 SUMMARY:Standup (moved)
 RECURRENCE-ID;TZID=Europe/Moscow:20260611T090000
@@ -66,6 +77,7 @@ DTSTART;TZID=Europe/Moscow:20260611T113000
 DTEND;TZID=Europe/Moscow:20260611T120000
 END:VEVENT
 """
+)
 
 ALL_DAY = """BEGIN:VEVENT
 UID:allday-1
@@ -167,7 +179,9 @@ def test_one_unparseable_document_does_not_lose_the_others():
     result = expand(
         [
             source(SINGLE),
-            CalendarSource(ics="this is not iCalendar", calendar_url="u", calendar_name="c"),
+            CalendarSource(
+                ics="this is not iCalendar", calendar_url="u", calendar_name="c"
+            ),
         ],
         start=RANGE_START,
         end=RANGE_END,
@@ -193,13 +207,16 @@ END:VEVENT
 
 def test_a_malformed_event_beside_a_good_one_in_the_same_document():
     """A CalDAV object may hold more than one component; one bad UID costs one."""
-    body = SINGLE + """BEGIN:VEVENT
+    body = (
+        SINGLE
+        + """BEGIN:VEVENT
 UID:broken-2
 SUMMARY:Broken rule
 DTSTART;TZID=Europe/Moscow:20260610T100000
 RRULE:FREQ=NONSENSE;COUNT=x
 END:VEVENT
 """
+    )
     result = run(body)
 
     assert [o.uid for o in result.occurrences] == ["single-1"]
@@ -335,7 +352,9 @@ STATUS:CANCELLED
 END:VEVENT
 """
 
-SERIES_WITH_CANCELLED_INSTANCE = SERIES + """BEGIN:VEVENT
+SERIES_WITH_CANCELLED_INSTANCE = (
+    SERIES
+    + """BEGIN:VEVENT
 UID:series-1
 SUMMARY:Standup
 RECURRENCE-ID;TZID=Europe/Moscow:20260610T090000
@@ -344,6 +363,7 @@ DTEND;TZID=Europe/Moscow:20260610T091500
 STATUS:CANCELLED
 END:VEVENT
 """
+)
 
 
 def test_a_cancelled_event_is_absent_not_returned_as_a_meeting():
@@ -482,8 +502,8 @@ END:VEVENT
 """
     result = expand(
         [source(body)],
-        start=datetime(2026, 10, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 11, 30, tzinfo=timezone.utc),
+        start=datetime(2026, 10, 1, tzinfo=UTC),
+        end=datetime(2026, 11, 30, tzinfo=UTC),
     )
 
     assert len(result.occurrences) == 3
@@ -505,8 +525,8 @@ END:VEVENT
 """
     result = expand(
         [source(body)],
-        start=datetime(2026, 3, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 4, 30, tzinfo=timezone.utc),
+        start=datetime(2026, 3, 1, tzinfo=UTC),
+        end=datetime(2026, 4, 30, tzinfo=UTC),
     )
 
     assert len(result.occurrences) == 3
@@ -573,7 +593,7 @@ def _answer_within(seconds, call):
     def run():
         try:
             outcome["value"] = call()
-        except BaseException as exc:  # noqa: BLE001 - reported to the test
+        except BaseException as exc:
             outcome["error"] = exc
 
     worker = threading.Thread(target=run, daemon=True)

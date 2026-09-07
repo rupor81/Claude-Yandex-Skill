@@ -10,6 +10,7 @@ import re
 import urllib.parse
 
 import pytest
+
 from yandex_core import config as config_module
 
 
@@ -61,8 +62,17 @@ class FakeObject:
     made all three the same would let code read the wrong one and still pass.
     """
 
-    def __init__(self, data, *, url=None, etag=None, cached_etag=None,
-                 header_etag=None, property_error=None, legacy_property=False):
+    def __init__(
+        self,
+        data,
+        *,
+        url=None,
+        etag=None,
+        cached_etag=None,
+        header_etag=None,
+        property_error=None,
+        legacy_property=False,
+    ):
         self.data = data
         self.url = url
         #: What `caldav` caches on the object; empty on the real account.
@@ -353,9 +363,11 @@ def install_fake_dav_client(
     on_principal=None,
     puts=None,
     put_raises=None,
+    put_raises_after=None,
     put_status=_UNSET,
     deletes=None,
     delete_raises=None,
+    delete_raises_after=None,
     delete_status=_UNSET,
 ):
     """Replace `caldav.DAVClient` with a fake that answers or fails as asked.
@@ -369,6 +381,11 @@ def install_fake_dav_client(
             refused write sent none at all.
         put_raises: raised instead of answering, for a connection lost mid-write
             or a server that refuses the method outright.
+        put_raises_after: stored, and *then* raised -- the write that landed and
+            whose answer was lost on the way back.  A fake that could only fail
+            before storing would make "the outcome is unknown" a statement with
+            one possible truth, and any check of it would pass for the wrong
+            reason.
         put_status: answered instead of storing anything, for a server that
             refuses this particular write.  Passing it as ``None`` explicitly is
             a response carrying no status at all -- distinct from not passing
@@ -378,6 +395,10 @@ def install_fake_dav_client(
             delete sent none at all.
         delete_raises: raised instead of answering, for a connection lost
             mid-delete, where the outcome is genuinely unknown.
+        delete_raises_after: removed, and *then* raised -- the delete that landed
+            and whose answer was lost. The counterpart of ``put_raises_after``,
+            and the reason an unknown delete cannot be assumed not to have
+            happened.
         delete_status: answered instead of removing anything, for a server that
             refuses this particular delete.  ``None`` passed explicitly is a
             response carrying no status at all.
@@ -428,6 +449,11 @@ def install_fake_dav_client(
                 puts.append({"url": str(url), "body": body, "headers": sent})
             if put_raises is not None:
                 raise put_raises
+            if put_raises_after is not None:
+                collection = _collection_for(url)
+                if collection is not None:
+                    collection.add(url, body)
+                raise put_raises_after
             if put_status is not _UNSET:
                 return FakeResponse(put_status)
             collection = _collection_for(url)
@@ -464,6 +490,11 @@ def install_fake_dav_client(
                 deletes.append(str(url))
             if delete_raises is not None:
                 raise delete_raises
+            if delete_raises_after is not None:
+                collection = _collection_for(url)
+                if collection is not None:
+                    collection.remove(url)
+                raise delete_raises_after
             if delete_status is not _UNSET:
                 return FakeResponse(delete_status)
             collection = _collection_for(url)

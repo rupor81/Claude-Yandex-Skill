@@ -8,6 +8,7 @@ into an argument, a log record, or an error message.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import stat
 from collections.abc import Mapping
@@ -20,12 +21,12 @@ from .errors import AuthError, CredentialNotFound
 __all__ = [
     "KEYRING_SERVICE",
     "REDACTED",
-    "get_secret",
-    "store_secret",
     "delete_secret",
-    "secret_env_var",
+    "get_secret",
     "redact_mapping",
     "redact_secret",
+    "secret_env_var",
+    "store_secret",
 ]
 
 KEYRING_SERVICE = "yandex-mcp"
@@ -134,11 +135,9 @@ def delete_secret(service: str, profile: str) -> None:
         import keyring.errors
     except ImportError:  # No keyring at all: the file was the only store.
         return
-    try:
+    # Nothing stored under that key. Absence is the outcome we wanted.
+    with contextlib.suppress(keyring.errors.PasswordDeleteError):
         keyring.delete_password(KEYRING_SERVICE, _account(service, profile))
-    except keyring.errors.PasswordDeleteError:
-        # Nothing was stored under that key. Absence is the outcome we wanted.
-        pass
 
 
 def redact_mapping(data: Mapping[str, Any]) -> dict[str, Any]:

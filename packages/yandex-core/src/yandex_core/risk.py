@@ -19,8 +19,8 @@ from mcp.types import ToolAnnotations
 from .errors import ProtocolError
 
 __all__ = [
-    "RiskClass",
     "RISK_REGISTRY",
+    "RiskClass",
     "annotations_for",
     "is_registered",
     "registered_tools",

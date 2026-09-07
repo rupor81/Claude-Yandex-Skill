@@ -22,13 +22,14 @@ No socket is opened: `caldav.DAVClient` is the shared fake from `conftest`.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 import anyio
 import pytest
 from caldav.lib import error as caldav_error
 from conftest import FakeCalendar, install_fake_dav_client
 from niquests import exceptions as http_error
+
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_calendar_mcp.tools.events import (
     DELETE_TOOL_NAME,
@@ -159,8 +160,8 @@ def _starts(calendar, uid="standup"):
     tool = build_calendar_events_list(_provider())
     page = anyio.run(
         lambda: tool(
-            start=datetime(2026, 6, 1, tzinfo=timezone.utc),
-            end=datetime(2026, 6, 30, tzinfo=timezone.utc),
+            start=datetime(2026, 6, 1, tzinfo=UTC),
+            end=datetime(2026, 6, 30, tzinfo=UTC),
             limit=50,
         )
     )
@@ -302,9 +303,7 @@ def test_cancelling_the_last_instance_says_the_object_is_still_there(monkeypatch
     """Never silently removed: an empty series is an object, not an absence."""
     calendar = _series_calendar(LAST_INSTANCE_SERIES)
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     answer = delete(scope=SCOPE_OCCURRENCE, recurrence_id=EIGHTH)
 
@@ -326,7 +325,9 @@ def test_an_instance_that_is_already_cancelled_sends_no_write(monkeypatch):
     assert puts == [], "a write was sent for an instance that was already gone"
     assert answer.already_gone is True
     assert answer.deleted is False
-    assert answer.etag == "etag-standup", "the caller's version was invalidated for nothing"
+    assert answer.etag == "etag-standup", (
+        "the caller's version was invalidated for nothing"
+    )
     assert "already" in answer.delete_note.lower()
 
 
@@ -369,7 +370,7 @@ def test_cancelling_an_instance_of_a_one_off_event_is_a_not_found_for_the_instan
 def test_an_unknown_instance_of_a_real_series_names_the_instance_not_the_event(
     monkeypatch,
 ):
-    """"Which of the two was missing" is the whole content of this answer."""
+    """ "Which of the two was missing" is the whole content of this answer."""
     calendar = _series_calendar()
     puts = []
     install_fake_dav_client(monkeypatch, calendars=[calendar], puts=puts)
@@ -394,9 +395,7 @@ def test_deleting_a_series_removes_the_object_and_confirms_it_is_gone(monkeypatc
     """The object, not one component of it: a series is one CalDAV object here."""
     calendar = _series_calendar()
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     answer = delete(scope=SCOPE_SERIES)
 
@@ -412,9 +411,7 @@ def test_deleting_a_one_off_event_removes_it(monkeypatch):
     """`series` is what a non-recurring event takes; there is nothing else to say."""
     calendar = _one_off_calendar()
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     answer = delete(uid="design-review", scope=SCOPE_SERIES, etag="etag-design-review")
 
@@ -440,9 +437,7 @@ def test_a_stale_etag_refuses_a_series_delete_before_anything_is_removed(monkeyp
     """It cannot be closed, but it can be checked -- and it is, immediately before."""
     calendar = FakeCalendar("Personal", PERSONAL, [SERIES], etags={"standup": "newer"})
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     with pytest.raises(Conflict) as caught:
         delete(scope=SCOPE_SERIES, etag="etag-standup")
@@ -461,9 +456,7 @@ def test_a_series_that_changed_between_the_read_and_the_delete_is_refused(monkey
     """
     calendar = _series_calendar()
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     original = calendar.event_by_url
     seen = {"n": 0}
@@ -489,9 +482,7 @@ def test_an_unknown_uid_is_a_not_found_and_deletes_nothing(monkeypatch):
     """Nothing to delete is an error naming the UID, never a quiet success."""
     calendar = _series_calendar()
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     with pytest.raises(NotFound) as caught:
         delete(uid="no-such-event", scope=SCOPE_SERIES, etag="etag-whatever")
@@ -500,8 +491,16 @@ def test_an_unknown_uid_is_a_not_found_and_deletes_nothing(monkeypatch):
     assert "no-such-event" in str(caught.value)
 
 
-def test_a_delete_whose_outcome_is_unknown_says_so_and_is_not_retried(monkeypatch):
-    """A blind retry after a lost connection removes whatever took its place."""
+def test_a_delete_whose_answer_was_lost_is_settled_by_reading_not_retrying(
+    monkeypatch,
+):
+    """A blind retry after a lost connection removes whatever took its place.
+
+    So the question is answered by reading. Here the object survived the failed
+    request, which settles it: nothing was removed, and repeating the delete is
+    safe -- an answer the caller can act on, unlike "it may or may not have
+    happened".
+    """
     calendar = _series_calendar()
     deletes = []
     install_fake_dav_client(
@@ -515,10 +514,83 @@ def test_a_delete_whose_outcome_is_unknown_says_so_and_is_not_retried(monkeypatc
     with pytest.raises(TransportError) as caught:
         delete(scope=SCOPE_SERIES)
 
-    assert len(deletes) == 1, "the delete was retried after an unknown outcome"
+    assert len(deletes) == 1, "the delete was retried after a lost answer"
     message = str(caught.value)
     assert "standup" in message
-    assert "unknown" in message.lower()
+    assert "still there" in message.lower(), message
+    assert "nothing was removed" in message.lower(), message
+    assert "may or may not" not in message, "a settled outcome is still hedged"
+
+
+def test_a_delete_that_landed_before_the_answer_was_lost_says_it_is_gone(monkeypatch):
+    """The half a caller must never guess at.
+
+    The object was removed and the reply never arrived. Told "it may or may not
+    have happened", a caller repeats the delete -- and that address is free
+    now, so the repeat removes whatever has taken its place.
+    """
+    calendar = _series_calendar()
+    deletes = []
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=[],
+        deletes=deletes,
+        delete_raises_after=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        delete(scope=SCOPE_SERIES)
+
+    message = str(caught.value)
+    lowered = message.lower()
+    assert "is gone" in lowered, message
+    assert "do not repeat it" in lowered, message
+    assert "may or may not" not in message
+    assert len(deletes) == 1
+
+
+class _BreaksWhenTheDeleteIsSent(FakeCalendar):
+    """Reads normally until the delete goes out, then the connection is gone.
+
+    Modelled on the failure rather than on the code: one connection, alive for
+    the ETag re-read the delete path does first, and dead from the delete
+    onward. A calendar that refused *every* read would break before the delete
+    was ever sent, and a test built on one would prove nothing about what this
+    server says afterwards.
+    """
+
+    def __init__(self, *args, after, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: The list the fake client appends to per DELETE. Non-empty means the
+        #: delete has left, which is the moment this connection dies.
+        self._after = after
+
+    def event_by_url(self, href, data=None):
+        if self._after:
+            raise http_error.ConnectionError("still down")
+        return super().event_by_url(href, data)
+
+
+def test_a_delete_whose_readback_also_fails_keeps_saying_unknown(monkeypatch):
+    """The check runs over the connection that just broke; it may break too."""
+    deletes = []
+    calendar = _BreaksWhenTheDeleteIsSent("Personal", PERSONAL, [SERIES], after=deletes)
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=[],
+        deletes=deletes,
+        delete_raises=http_error.ConnectionError("connection reset"),
+    )
+
+    with pytest.raises(TransportError) as caught:
+        delete(scope=SCOPE_SERIES)
+
+    message = str(caught.value)
+    assert "may or may not" in message, message
+    assert "calendar_event_get" in message
+    assert len(deletes) == 1
 
 
 def test_a_rate_limited_delete_is_not_retried(monkeypatch):
@@ -555,7 +627,7 @@ def test_a_delete_the_server_answered_with_404_is_a_not_found(monkeypatch):
 def test_a_delete_the_server_answered_unreadably_is_not_reported_as_success(
     monkeypatch,
 ):
-    """"The server said nothing" is not "the event is gone"."""
+    """ "The server said nothing" is not "the event is gone"."""
     calendar = _series_calendar()
     install_fake_dav_client(
         monkeypatch, calendars=[calendar], puts=[], deletes=[], delete_status=None
@@ -588,9 +660,7 @@ def test_an_event_in_a_url_that_is_not_a_calendar_deletes_nothing(monkeypatch):
     """A URL this account does not list is refused before anything is removed."""
     calendar = _series_calendar()
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     with pytest.raises(NotFound) as caught:
         delete(scope=SCOPE_SERIES, calendar_url=f"{URL}/calendars/me/nope/")
@@ -653,9 +723,7 @@ def test_deleting_a_series_never_removes_another_event_sharing_the_object(
     """
     calendar = _shared_object_calendar()
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     with pytest.raises(ProtocolError) as caught:
         delete(scope=SCOPE_SERIES)
@@ -780,7 +848,7 @@ def test_a_cancellation_whose_readback_failed_says_so_where_the_etag_is_missing(
 def test_a_delete_that_could_not_be_confirmed_does_not_assert_the_event_is_gone(
     monkeypatch,
 ):
-    """"Deleted" and "we could not see that it was deleted" are different answers."""
+    """ "Deleted" and "we could not see that it was deleted" are different answers."""
     calendar = _series_calendar()
     install_fake_dav_client(
         monkeypatch, calendars=[calendar], puts=[], deletes=[], delete_status=204
@@ -934,9 +1002,7 @@ def test_an_event_spread_over_two_objects_is_refused_and_told_how_to_remove_it(
         ],
     )
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     with pytest.raises(ProtocolError) as caught:
         delete(scope=SCOPE_SERIES)
@@ -1047,7 +1113,12 @@ def test_a_cancellation_whose_outcome_is_unknown_says_so_and_is_not_retried(
         delete(scope=SCOPE_OCCURRENCE, recurrence_id=NINTH)
 
     assert len(puts) == 1, "the write was repeated after an unknown outcome"
-    assert "unknown" in str(caught.value).lower()
+    message = str(caught.value)
+    # A cancellation is an edit, so it is settled by the version and not by
+    # whether the event is still there: it is *supposed* to still be there.
+    assert "version was" in message.lower(), message
+    assert "nothing was cancelled" in message.lower(), message
+    assert "may or may not" not in message
 
 
 def test_a_rate_limited_cancellation_is_reported_as_refused_not_unknown(monkeypatch):
@@ -1069,9 +1140,7 @@ def test_an_instance_still_on_the_calendar_after_the_write_is_not_called_cancell
 ):
     """The server answered 204 and stored nothing; only the readback shows it."""
     calendar = _series_calendar()
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], put_status=204
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], put_status=204)
 
     answer = delete(scope=SCOPE_OCCURRENCE, recurrence_id=NINTH)
 
@@ -1092,9 +1161,7 @@ def test_a_delete_with_no_etag_to_compare_says_no_check_was_made_at_all(monkeypa
     """
     calendar = FakeCalendar("Personal", PERSONAL, [SERIES], etags={"standup": None})
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     answer = delete(scope=SCOPE_SERIES)
 
@@ -1150,9 +1217,7 @@ def test_a_calendar_that_refuses_a_delete_names_the_calendar_and_what_did_not_ha
         calendars=[calendar],
         puts=[],
         deletes=deletes,
-        delete_raises=caldav_error.AuthorizationError(
-            url=PERSONAL, reason="Forbidden"
-        ),
+        delete_raises=caldav_error.AuthorizationError(url=PERSONAL, reason="Forbidden"),
     )
 
     with pytest.raises(PolicyError) as caught:
@@ -1210,9 +1275,7 @@ def test_a_delete_whose_readback_broke_off_says_the_event_was_deleted_anyway(
     """Losing this sentence loses the one instruction that prevents a repeat."""
     calendar = BreaksOffAfterTheAct("Personal", PERSONAL, [SERIES])
     deletes = []
-    install_fake_dav_client(
-        monkeypatch, calendars=[calendar], puts=[], deletes=deletes
-    )
+    install_fake_dav_client(monkeypatch, calendars=[calendar], puts=[], deletes=deletes)
 
     with pytest.raises(TransportError) as caught:
         delete(scope=SCOPE_SERIES)

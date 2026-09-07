@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 import yandex_calendar_mcp
 import yandex_core
 
