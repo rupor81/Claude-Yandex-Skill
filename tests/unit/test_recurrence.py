@@ -550,3 +550,149 @@ def test_an_all_day_and_a_timed_series_order_together_deterministically():
     mixed = run(ALL_DAY, SERIES)
     keys = [occurrence_sort_key(o) for o in mixed.occurrences]
     assert keys == sorted(keys)
+
+
+# -- has_occurrences: the walk must end -----------------------------------
+#
+# Asked after an instance is cancelled, so the answer can say whether the
+# series has anything left. It walks the expansion forwards, and an endless
+# series every one of whose instances is skipped has nothing to stop it.
+
+
+def _answer_within(seconds, call):
+    """Run `call` on a thread and fail if it has not finished in time.
+
+    A test that simply called the function would not fail -- it would hang, and
+    take the suite with it. The bound is what is being asserted, so the bound
+    is what the test measures.
+    """
+    import threading
+
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), (
+        f"the call had not answered after {seconds}s; an unbounded walk over an "
+        "endless series never returns, and the caller is the delete tool"
+    )
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+ENDLESS_CANCELLED_SERIES = """BEGIN:VEVENT
+UID:endless-1
+SUMMARY:Standup
+DTSTART;TZID=Europe/Moscow:20260608T090000
+DTEND;TZID=Europe/Moscow:20260608T091500
+RRULE:FREQ=DAILY
+STATUS:CANCELLED
+END:VEVENT
+"""
+
+
+def test_an_endless_series_whose_every_instance_is_cancelled_still_answers():
+    """The harm: the delete tool never returning at all.
+
+    Every expanded instance is skipped as cancelled, and `FREQ=DAILY` with no
+    `UNTIL` and no `COUNT` supplies them forever. Reachable from the tool
+    through the already-cancelled branch.
+    """
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    answer = _answer_within(
+        10, lambda: has_occurrences(source(ENDLESS_CANCELLED_SERIES), uid="endless-1")
+    )
+    # It cannot be said to have none: the walk was cut short, not exhausted.
+    assert answer is None
+
+
+def test_a_series_with_occurrences_left_is_answered_true():
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    assert has_occurrences(source(SERIES), uid="series-1") is True
+
+
+def test_a_series_every_instance_of_which_is_excluded_has_none_left():
+    """Exhausted, not cut short: a COUNT series answers False after a real walk."""
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    body = """BEGIN:VEVENT
+UID:gone-1
+SUMMARY:Standup
+DTSTART;TZID=Europe/Moscow:20260608T090000
+DTEND;TZID=Europe/Moscow:20260608T091500
+RRULE:FREQ=DAILY;COUNT=2
+EXDATE;TZID=Europe/Moscow:20260608T090000
+EXDATE;TZID=Europe/Moscow:20260609T090000
+END:VEVENT
+"""
+    assert has_occurrences(source(body), uid="gone-1") is False
+
+
+def test_a_uid_no_document_holds_has_no_occurrences():
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    assert has_occurrences(source(SERIES), uid="nobody") is False
+
+
+def test_an_unparseable_document_is_not_counted_as_an_occurrence():
+    """The delete path asks this about whatever the server returned."""
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    broken = CalendarSource(
+        ics="this is not iCalendar at all",
+        calendar_url="https://caldav.example/me/personal/",
+        calendar_name="Personal",
+    )
+    assert has_occurrences(broken, uid="series-1") is False
+
+
+def test_a_uid_present_only_as_overrides_still_answers():
+    """No master, so nothing defines the series -- but the overrides happen."""
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    body = """BEGIN:VEVENT
+UID:orphan-1
+RECURRENCE-ID;TZID=Europe/Moscow:20260610T090000
+SUMMARY:Standup (moved)
+DTSTART;TZID=Europe/Moscow:20260610T110000
+DTEND;TZID=Europe/Moscow:20260610T111500
+END:VEVENT
+"""
+    assert has_occurrences(source(body), uid="orphan-1") is True
+
+
+def test_a_component_with_no_readable_start_is_not_an_occurrence():
+    """A floating DTSTART cannot be placed, so it is not counted as one."""
+    from yandex_calendar_mcp.client.recurrence import has_occurrences
+
+    body = """BEGIN:VEVENT
+UID:floating-1
+SUMMARY:Standup
+DTSTART:20260608T090000
+DTEND:20260608T091500
+END:VEVENT
+"""
+    assert has_occurrences(source(body), uid="floating-1") is False
+
+
+def test_the_docstring_describes_the_walk_the_code_actually_makes():
+    """The sentence that hid the hang said the walk stopped on its own."""
+    from yandex_calendar_mcp.client.recurrence import (
+        OCCURRENCE_SEARCH_LIMIT,
+        has_occurrences,
+    )
+
+    text = has_occurrences.__doc__ or ""
+    assert str(OCCURRENCE_SEARCH_LIMIT) in text
+    assert "doubling" not in text
+    assert "representable time" not in text

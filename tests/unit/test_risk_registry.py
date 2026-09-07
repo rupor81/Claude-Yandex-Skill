@@ -20,22 +20,35 @@ def test_hints_are_snake_case_in_python_and_camel_case_on_the_wire():
     assert annotations.model_dump(by_alias=True)["readOnlyHint"] is True
 
 
+#: A name deliberately outside the registry, and one nothing here will ever
+#: register: the tools this project does add are supposed to be declared, and a
+#: stand-in that later becomes real turns this test green for the wrong reason.
+UNDECLARED_TOOL = "calendar_wipe_account"
+
+
 def test_unregistered_tool_has_no_annotations():
-    assert not is_registered("calendar_event_delete")
+    assert not is_registered(UNDECLARED_TOOL)
     with pytest.raises(ProtocolError) as caught:
-        annotations_for("calendar_event_delete")
-    assert "calendar_event_delete" in str(caught.value)
+        annotations_for(UNDECLARED_TOOL)
+    assert UNDECLARED_TOOL in str(caught.value)
 
 
 def test_registering_an_unregistered_tool_fails_at_startup():
     server = build_server(name="test-server")
 
-    async def calendar_event_delete() -> None:
+    async def calendar_wipe_account() -> None:
         """A tool nobody declared."""
 
     with pytest.raises(ProtocolError) as caught:
-        register_tool(server, calendar_event_delete)
-    assert "calendar_event_delete" in str(caught.value)
+        register_tool(server, calendar_wipe_account)
+    assert UNDECLARED_TOOL in str(caught.value)
+
+
+def test_deleting_an_event_is_declared_destructive():
+    """The tool that cannot be undone must not be annotated as a plain write."""
+    annotations = annotations_for("calendar_event_delete")
+    assert annotations.read_only_hint is False
+    assert annotations.destructive_hint is True
 
 
 def test_write_and_destructive_classes_are_distinguishable(monkeypatch):

@@ -491,3 +491,151 @@ def test_the_two_spellings_of_a_scope_are_the_same_two_words():
 
     assert compose.SCOPE_SERIES == recurrence.SCOPE_SERIES
     assert compose.SCOPE_OCCURRENCE == recurrence.SCOPE_OCCURRENCE
+
+
+# -- cancelling one instance, tested where it is composed ------------------
+#
+# `apply_instance_cancellation` had no direct test at all: every assertion
+# about it went through the delete tool, so its refusals -- each of which is
+# the last thing between a caller and a half-applied document -- were reached
+# and never checked.
+
+CANCEL_SERIES = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\n"
+    "DTSTART:20260608T060000Z\r\nDTEND:20260608T063000Z\r\n"
+    "RRULE:FREQ=DAILY;COUNT=5\r\n"
+    "DTSTAMP:20260601T000000Z\r\nSEQUENCE:0\r\n"
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+NINTH_AT_SIX = datetime(2026, 6, 9, 6, 0, tzinfo=timezone.utc)
+
+
+def test_cancelling_an_instance_of_an_unreadable_document_writes_nothing():
+    """The server returned something this parser does not recognise."""
+    from yandex_calendar_mcp.client.compose import apply_instance_cancellation
+
+    with pytest.raises(ProtocolError) as caught:
+        apply_instance_cancellation(
+            "this is not iCalendar", uid="standup", recurrence_id=NINTH_AT_SIX
+        )
+
+    message = str(caught.value)
+    assert "standup" in message
+    assert "Nothing was written" in message
+
+
+def test_cancelling_an_instance_of_a_uid_the_document_does_not_hold_is_refused():
+    from yandex_calendar_mcp.client.compose import apply_instance_cancellation
+
+    with pytest.raises(ProtocolError) as caught:
+        apply_instance_cancellation(
+            CANCEL_SERIES, uid="somebody-else", recurrence_id=NINTH_AT_SIX
+        )
+
+    assert "somebody-else" in str(caught.value)
+
+
+def test_cancelling_an_instance_of_a_series_that_is_only_overrides_is_refused():
+    """An exclusion has nothing to attach to, and inventing a master would be
+    inventing a series nobody created."""
+    from yandex_calendar_mcp.client.compose import apply_instance_cancellation
+
+    only_overrides = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+        "BEGIN:VEVENT\r\nUID:standup\r\nRECURRENCE-ID:20260610T060000Z\r\n"
+        "SUMMARY:Standup (moved)\r\n"
+        "DTSTART:20260610T080000Z\r\nDTEND:20260610T083000Z\r\n"
+        "DTSTAMP:20260602T000000Z\r\nSEQUENCE:1\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+
+    with pytest.raises(ProtocolError) as caught:
+        apply_instance_cancellation(
+            only_overrides, uid="standup", recurrence_id=NINTH_AT_SIX
+        )
+
+    message = str(caught.value)
+    assert "RECURRENCE-ID" in message
+    assert "nothing was written" in message.lower()
+
+
+def test_cancelling_an_instance_adds_an_exclusion_and_keeps_the_others():
+    from yandex_calendar_mcp.client.compose import apply_instance_cancellation
+
+    already = CANCEL_SERIES.replace(
+        "RRULE:FREQ=DAILY;COUNT=5\r\n",
+        "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260611T060000Z\r\n",
+    )
+    result = apply_instance_cancellation(
+        already, uid="standup", recurrence_id=NINTH_AT_SIX
+    )
+
+    assert result.changed is True
+    assert result.exclusion_added is True
+    assert result.override_removed is False
+    written = lines(result.document)
+    assert any("20260609T060000Z" in line for line in written)
+    assert any("20260611T060000Z" in line for line in written), (
+        "an exclusion already on the series was replaced rather than added to"
+    )
+
+
+def test_cancelling_an_instance_that_is_already_excluded_changes_nothing():
+    from yandex_calendar_mcp.client.compose import apply_instance_cancellation
+
+    already = CANCEL_SERIES.replace(
+        "RRULE:FREQ=DAILY;COUNT=5\r\n",
+        "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260609T060000Z\r\n",
+    )
+    result = apply_instance_cancellation(
+        already, uid="standup", recurrence_id=NINTH_AT_SIX
+    )
+
+    assert result.changed is False
+    assert result.document == already, "the document was rewritten for nothing"
+
+
+def test_a_floating_exclusion_is_refused_rather_than_written_beside():
+    """The reader refuses to report such an instance at all.
+
+    Skipping it here -- which this module used to do -- means concluding "not
+    excluded" about an instance the reader will not report, and writing a
+    second exclusion for a meeting that is already off.
+    """
+    from yandex_calendar_mcp.client.compose import apply_instance_cancellation
+
+    floating = CANCEL_SERIES.replace(
+        "RRULE:FREQ=DAILY;COUNT=5\r\n",
+        "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260609T060000\r\n",
+    )
+
+    with pytest.raises(ProtocolError) as caught:
+        apply_instance_cancellation(
+            floating, uid="standup", recurrence_id=NINTH_AT_SIX
+        )
+
+    assert "timezone" in str(caught.value).lower()
+
+
+def test_the_reader_and_the_writer_read_exclusions_through_one_implementation():
+    """They were written twice and disagreed, and the disagreement was silent."""
+    import inspect
+
+    from yandex_calendar_mcp.client import compose, recurrence
+
+    body = inspect.getsource(recurrence._exdates)
+    assert "exdates(component)" in body, (
+        "the reader has an EXDATE implementation of its own again"
+    )
+    # And they answer the same document the same way.
+    component = list(
+        __import__("icalendar").Calendar.from_ical(
+            CANCEL_SERIES.replace(
+                "RRULE:FREQ=DAILY;COUNT=5\r\n",
+                "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260609T060000Z\r\n",
+            )
+        ).walk("VEVENT")
+    )[0]
+    assert compose.exdates(component) == recurrence._exdates(component)

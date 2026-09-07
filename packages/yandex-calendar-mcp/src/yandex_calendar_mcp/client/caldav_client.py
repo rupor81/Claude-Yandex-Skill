@@ -52,15 +52,19 @@ from .recurrence import (
 )
 from .recurrence import DEFAULT_CEILING as EXPANSION_CEILING
 from .recurrence import expand as expand_occurrences
+from .recurrence import has_occurrences
+from .recurrence import other_uids
 from .recurrence import read_event
 from .recurrence import with_unreadable_calendars
 from .compose import (
     SCOPE_OCCURRENCE,
     SCOPE_SERIES,
+    CancelledInstance,
     EditedDocument,
     EventDraft,
     EventEdit,
     apply_event_edit,
+    apply_instance_cancellation,
     check_event_edit,
     build_event_document,
     new_uid,
@@ -71,11 +75,14 @@ __all__ = [
     "CalendarRef",
     "CalDAVCalendarClient",
     "CreatedEvent",
+    "DeletedEvent",
     "FetchedEvent",
     "UpdatedEvent",
     "check_instance_matches_scope",
     "checked_scope",
+    "checked_delete_scope",
     "checked_etag",
+    "checked_delete_etag",
     "EXPANSION_CEILING",
 ]
 
@@ -190,6 +197,70 @@ class UpdatedEvent:
     etag_unreadable: bool = False
     record: EventRecord | None = None
     readback_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeletedEvent:
+    """One event, or one instance of one, as it stands after a removal.
+
+    The two scopes are different acts and this one record describes both, so
+    each field says which of them it is about.
+
+    ``deleted`` means a request was sent and the server accepted it.
+    ``already_gone`` means nothing was sent because the instance was already
+    excluded: the meeting is off either way, and a write storing the same
+    exclusion again would bump the object's version and refuse the next
+    caller's precondition for nothing.
+
+    ``confirmed`` is what the *readback* established, never what the request
+    answered: for an instance, that it is excluded and the series still holds
+    its other occurrences; for a series, that the object is gone. False means
+    the outcome could not be verified -- which is not the same as its having
+    failed -- and ``confirmation_error`` says what was seen instead.
+
+    ``etag`` is the object's new version after an instance was cancelled, since
+    that path writes and the caller's ETag is spent. A removed series has no
+    version, so it is ``None`` there.
+
+    ``occurrences_remaining`` answers "does this series still happen" after an
+    instance was cancelled. False is the case worth naming: the object is still
+    there, holding a series with nothing left in it. It is ``None`` for a
+    removed series, which has nothing to have occurrences -- and also when the
+    question could not be answered at all, either because the expansion could
+    not be read or because it was cut short by
+    :data:`~.recurrence.OCCURRENCE_SEARCH_LIMIT`.
+
+    ``override_removed`` and ``exclusion_added`` together say which act the
+    write was. Both true is an ordinary cancellation of an instance somebody
+    had moved. ``exclusion_added`` false with ``override_removed`` true is the
+    repair of a document that already said both things at once -- the instance
+    was excluded *and* had an entry of its own -- which is not the same event
+    to report as a cancellation.
+
+    ``precondition_rechecked`` says whether the ETag really was read again
+    immediately before the delete. Measured on this account, this server
+    honours ``If-Match`` on a write and ignores it on a DELETE, so that
+    re-read is the only check there is -- and when it could not be made, the
+    answer must not imply that it was.
+    """
+
+    uid: str
+    scope: str
+    recurrence_id: date | datetime | None
+    href: str
+    calendar_url: str
+    calendar_name: str
+    deleted: bool
+    already_gone: bool
+    confirmed: bool
+    etag: str | None = None
+    etag_unreadable: bool = False
+    occurrences_remaining: bool | None = None
+    override_removed: bool = False
+    exclusion_added: bool = True
+    precondition_rechecked: bool = False
+    confirmation_error: str | None = None
+    record: EventRecord | None = None
 
 
 class CalDAVCalendarClient:
@@ -461,6 +532,88 @@ class CalDAVCalendarClient:
                 scope=wanted,
                 etag=precondition,
                 edit=edit,
+                recurrence_id=recurrence_id,
+                calendar_url=calendar_url,
+            )
+
+        return await anyio.to_thread.run_sync(run)
+
+    async def delete_event(
+        self,
+        *,
+        uid: str,
+        scope: str | None,
+        etag: str | None,
+        recurrence_id: date | datetime | None = None,
+        calendar_url: str | None = None,
+    ) -> DeletedEvent:
+        """Cancel one instance of an event, or remove the event itself.
+
+        The two are different acts with different guarantees, and the
+        difference is the whole of this method.
+
+        ``occurrence`` is an *edit*: an ``EXDATE`` is added to the stored
+        object and the object is written back by a conditional write, exactly
+        as a change is.  Nothing is removed from the calendar, the write
+        carries ``If-Match``, and a change somebody else made in between is
+        refused by the server.  An override belonging to the cancelled instance
+        goes in the same write, because an exclusion and an override for one
+        moment contradict each other and readers disagree about which wins.
+
+        ``series`` removes the object.  **It cannot be made conditional on this
+        server.**  Measured on the live account: a DELETE carrying a stale ETag
+        was answered 204 and the object was removed anyway, so the more
+        destructive of the two operations is the less protected one.  The ETag
+        is read again immediately before the delete and compared, which narrows
+        the window between the caller's read and the removal; nothing closes
+        it.  ``precondition_rechecked`` says whether even that much happened.
+
+        ``scope`` is required here as well as in ``tools/``: this module is
+        usable from a plain script, and one of the two readings destroys a
+        year of history while looking like it worked.
+
+        Args:
+            uid: the event to remove.  A UID the caller has read -- there is no
+                deletion by title or by time, because this server's search
+                returns the whole calendar.
+            scope: ``occurrence`` or ``series``. There is no default.
+            etag: the ETag last read for this event.
+            recurrence_id: which instance, required for ``occurrence`` scope
+                and refused for ``series`` scope.
+            calendar_url: restrict the lookup to one calendar.  Omitted, every
+                calendar is searched -- all of them, not up to the first hit --
+                and a UID found in more than one is refused rather than removed
+                from whichever the account lists first.
+
+        Returns:
+            What is now there, read back afterwards: for an instance, the
+            series with its other occurrences; for a series, the confirmation
+            that the object is gone.
+
+        Raises:
+            ProtocolError: the scope or the ETag is not one that can be
+                honoured, the stored object cannot be edited, the UID is in
+                more than one calendar, or -- for ``series`` -- the object
+                holding it also holds another event, which a DELETE would take
+                with it. Nothing was removed.
+            NotFound: no such event, or no such instance of it -- the message
+                says which. Nothing was removed.
+            Conflict: the event changed after the caller read it. Nothing was
+                removed.
+            TransportError: the connection failed. When it failed *during* the
+                delete the message says the outcome is unknown and does not
+                retry: a repeat could remove whatever has since taken its
+                place.
+        """
+        wanted = checked_delete_scope(scope)
+        check_instance_matches_scope(wanted, recurrence_id)
+        precondition = checked_delete_etag(etag, scope=wanted)
+
+        def run() -> DeletedEvent:
+            return self._delete_event_blocking(
+                uid=uid,
+                scope=wanted,
+                etag=precondition,
                 recurrence_id=recurrence_id,
                 calendar_url=calendar_url,
             )
@@ -1031,6 +1184,450 @@ class CalDAVCalendarClient:
             readback_error=readback_error,
         )
 
+    def _delete_event_blocking(
+        self,
+        *,
+        uid: str,
+        scope: str,
+        etag: str,
+        recurrence_id: date | datetime | None,
+        calendar_url: str | None,
+    ) -> DeletedEvent:
+        with self._translated():
+            with caldav.DAVClient(
+                url=self._url,
+                username=self._username,
+                password=self._password,
+                timeout=self._timeout,
+                # As for every other write: the library sleeps on 429 and
+                # re-issues the request. A repeated DELETE is the worst of the
+                # three -- if the first one landed, the second removes whatever
+                # has since been created at that href.
+                rate_limit_handle=False,
+            ) as client:
+                calendars, unlisted = self._calendars_for(client, calendar_url)
+                if calendar_url is not None and (unlisted or not calendars):
+                    raise NotFound(
+                        _not_a_calendar(calendar_url, wrote="nothing was deleted")
+                    )
+
+                # Every calendar is searched, not just up to the first hit.
+                # A UID can be in more than one of them -- an invitation
+                # accepted twice, an imported file -- and taking whichever the
+                # account happens to list first would remove a meeting from a
+                # calendar the caller never named, with nothing said. On the
+                # one path with no undo that is a guess this server does not
+                # make.
+                #
+                # A failure here is never counted as a miss and carried past
+                # either: a partial search that ended in a not-found would deny
+                # an event that is really there.
+                tried = 0
+                found: list[tuple] = []
+                for calendar in calendars:
+                    tried += 1
+                    url = str(getattr(calendar, "url", "") or calendar_url or "")
+                    sources, current_etag, etag_unreadable, found_at = _fetch_sources(
+                        calendar, url=url, uid=uid, gather_overrides=True
+                    )
+                    if not sources:
+                        continue
+                    try:
+                        before = read_event(
+                            sources, uid=uid, recurrence_id=recurrence_id
+                        )
+                    except EventNotInDocument:
+                        continue
+                    except InstanceNotInSeries:
+                        # The event is here; the instance is not. Kept as a
+                        # match so that a UID in two calendars is still
+                        # reported as ambiguous rather than as one bad
+                        # recurrence_id.
+                        before = None
+                    found.append(
+                        (
+                            calendar,
+                            url,
+                            sources,
+                            current_etag,
+                            etag_unreadable,
+                            found_at,
+                            before,
+                        )
+                    )
+
+                if len(found) > 1:
+                    raise ProtocolError(
+                        _uid_in_several_calendars(uid, [entry[1] for entry in found])
+                    )
+
+                for entry in found:
+                    (
+                        calendar,
+                        url,
+                        sources,
+                        current_etag,
+                        etag_unreadable,
+                        found_at,
+                        before,
+                    ) = entry
+                    if before is None:
+                        raise NotFound(_no_such_instance(uid, recurrence_id))
+
+                    if current_etag and current_etag != etag:
+                        # The caller is holding a version that no longer
+                        # describes what is there. Told before anything about
+                        # the object's shape, and before anything is removed.
+                        raise Conflict(
+                            _stale_etag(uid, given=etag)
+                            if scope == SCOPE_OCCURRENCE
+                            else _stale_etag_before_delete(uid, given=etag)
+                        )
+                    if len(sources) > 1:
+                        raise ProtocolError(
+                            _stored_in_several_objects(
+                                uid,
+                                sources,
+                                act="removed",
+                                then="remove it",
+                                outcome="nothing was removed",
+                            )
+                        )
+
+                    name = _display_name(calendar)
+                    href = found_at or _object_href(url, uid)
+                    if scope == SCOPE_OCCURRENCE:
+                        return self._cancel_instance(
+                            client,
+                            calendar,
+                            uid=uid,
+                            recurrence_id=recurrence_id,
+                            sources=sources,
+                            etag=etag,
+                            current_etag=current_etag,
+                            etag_unreadable=etag_unreadable,
+                            href=href,
+                            url=url,
+                            name=name,
+                            before=before,
+                        )
+                    others = other_uids(sources, uid=uid)
+                    if others:
+                        # A DELETE removes the object, and the object is not
+                        # the event: whatever else it holds goes with it.
+                        raise ProtocolError(
+                            _object_holds_other_events(uid, others)
+                        )
+                    return self._remove_series(
+                        client,
+                        calendar,
+                        uid=uid,
+                        etag=etag,
+                        href=href,
+                        url=url,
+                        name=name,
+                    )
+
+        raise NotFound(
+            _no_such_event(
+                uid,
+                tried=tried,
+                unreadable_calendars=0,
+                calendar_url=calendar_url,
+            )
+        )
+
+    def _cancel_instance(
+        self,
+        client: object,
+        calendar: object,
+        *,
+        uid: str,
+        recurrence_id: date | datetime | None,
+        sources: list,
+        etag: str,
+        current_etag: str | None,
+        etag_unreadable: bool,
+        href: str,
+        url: str,
+        name: str,
+        before: EventRecord,
+    ) -> DeletedEvent:
+        """Cancel one instance: a conditional write, not a removal."""
+        assert recurrence_id is not None  # settled by check_instance_matches_scope
+
+        def already_gone() -> DeletedEvent:
+            # Nothing is sent. The instance is off, which is what was asked
+            # for, and a write would spend the caller's precondition and
+            # everyone else's for a change that is not one.
+            #
+            # Both reads here are of the *series*, not of the one instance:
+            # `record` is documented as what the server holds now, and the
+            # record of the cancelled instance carries that instance's own
+            # start and a cancelled status -- the opposite of what a caller
+            # reads it for. Both are also inside the guard, because a document
+            # this server can read as an event but not expand must not turn an
+            # idempotent no-op into an error.
+            remaining: bool | None = None
+            series: EventRecord | None = None
+            unread: str | None = None
+            try:
+                remaining = has_occurrences(sources, uid=uid)
+                series = read_event(sources, uid=uid)
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                unread = (
+                    "the instance is already cancelled and nothing was sent, "
+                    f"but the series it belongs to could not be read ("
+                    f"{type(exc).__name__}: {exc})"
+                )
+            return DeletedEvent(
+                uid=uid,
+                scope=SCOPE_OCCURRENCE,
+                recurrence_id=recurrence_id,
+                href=href,
+                calendar_url=url,
+                calendar_name=name,
+                deleted=False,
+                already_gone=True,
+                confirmed=True,
+                # Nothing was written, so the version the caller holds is still
+                # the current one. A server that supplied none of its own must
+                # not turn that into a null the caller reads as "your
+                # precondition is gone".
+                etag=current_etag or etag,
+                etag_unreadable=etag_unreadable,
+                occurrences_remaining=remaining,
+                confirmation_error=unread,
+                record=series,
+            )
+
+        try:
+            cancelled: CancelledInstance = apply_instance_cancellation(
+                sources[0].ics, uid=uid, recurrence_id=recurrence_id
+            )
+        except ProtocolError:
+            if before.cancelled:
+                # Already off, and the document is one this composer will not
+                # edit. Cancelling it again was never going to write anything,
+                # so the answer is the no-op rather than an error about a
+                # write that was not going to happen.
+                return already_gone()
+            raise
+
+        if not cancelled.changed:
+            # Excluded already, with nothing beside the exclusion contradicting
+            # it. There is nothing to write, and writing anyway would be a
+            # change nobody asked for.
+            return already_gone()
+
+        # `before.cancelled` is deliberately *not* a short circuit of its own.
+        # An instance carrying both an exclusion and an override for the same
+        # moment reads as cancelled and is still a contradiction on the
+        # calendar; the composer says so by reporting a change with no
+        # exclusion added, and that repair is worth the write.
+
+        try:
+            response = client.put(  # type: ignore[attr-defined]
+                href,
+                cancelled.document,
+                {
+                    "Content-Type": "text/calendar; charset=utf-8",
+                    # A cancellation is an edit of the stored object, so it
+                    # gets the protection an edit gets -- which this server
+                    # honours, unlike the one on a DELETE.
+                    "If-Match": etag,
+                },
+            )
+        except http_error.RequestException as exc:
+            raise TransportError(
+                _cancel_outcome_unknown(uid, recurrence_id, calendar_url=url, exc=exc)
+            ) from exc
+        except caldav_error.RateLimitError as exc:
+            raise RateLimited(_update_rate_limited(uid, calendar_url=url)) from exc
+        except caldav_error.AuthorizationError as exc:
+            raise self._write_refused(
+                exc,
+                calendar=url,
+                name=name,
+                wrote=(
+                    "Nothing was cancelled, and the instance is still on the "
+                    "calendar. Cancel it in a calendar this account owns, from "
+                    "`calendar_list`, or ask whoever shares this one for write "
+                    "access to it."
+                ),
+            ) from exc
+
+        _check_update_status(
+            _status_of(response), uid=uid, href=href, etag=etag, what="the cancellation of"
+        )
+
+        etag_after: str | None = None
+        etag_after_unreadable = False
+        confirmed = False
+        confirmation_error: str | None = None
+        occurrences_remaining: bool | None = None
+        record: EventRecord | None = None
+        try:
+            after, etag_after, etag_after_unreadable, found_at = _fetch_sources(
+                calendar, url=url, uid=uid, gather_overrides=True
+            )
+            if found_at:
+                href = found_at
+            if not after:
+                confirmation_error = (
+                    "the server accepted the write but did not return the object "
+                    "when it was read back, so what it now holds is unknown"
+                )
+            else:
+                # Confirmed against the server, through the same reader every
+                # other event goes through: the instance is off, and the series
+                # is still there with whatever it has left.
+                instance = read_event(after, uid=uid, recurrence_id=recurrence_id)
+                # Assigned the moment it is known, and never unassigned. The
+                # two reads below can fail, and a cancellation already verified
+                # against the server must not be reported unconfirmed on
+                # account of them -- that invites the caller to repeat a
+                # destructive request that has already taken effect.
+                confirmed = instance.cancelled
+                if not confirmed:
+                    confirmation_error = (
+                        "the server accepted the write, but reading the instance "
+                        "back shows it is still on the calendar"
+                    )
+                occurrences_remaining = has_occurrences(after, uid=uid)
+                record = read_event(after, uid=uid)
+        except Exception as exc:  # noqa: BLE001 - reported, or re-raised
+            if _is_transport_failure(exc) or isinstance(
+                exc, caldav_error.AuthorizationError
+            ):
+                raise self._readback_broke_off(
+                    exc,
+                    uid=uid,
+                    calendar=url,
+                    verb="cancelled",
+                    again="Do not cancel it again;",
+                ) from exc
+            etag_after, etag_after_unreadable = None, False
+            confirmation_error = f"the readback failed ({type(exc).__name__}: {exc})"
+
+        return DeletedEvent(
+            uid=uid,
+            scope=SCOPE_OCCURRENCE,
+            recurrence_id=recurrence_id,
+            href=href,
+            calendar_url=url,
+            calendar_name=name,
+            deleted=True,
+            already_gone=False,
+            confirmed=confirmed,
+            etag=etag_after,
+            etag_unreadable=etag_after_unreadable,
+            occurrences_remaining=occurrences_remaining,
+            override_removed=cancelled.override_removed,
+            exclusion_added=cancelled.exclusion_added,
+            confirmation_error=confirmation_error,
+            record=record,
+        )
+
+    def _remove_series(
+        self,
+        client: object,
+        calendar: object,
+        *,
+        uid: str,
+        etag: str,
+        href: str,
+        url: str,
+        name: str,
+    ) -> DeletedEvent:
+        """Remove the object, with the only protection this server allows.
+
+        The ETag is read once more, immediately before the delete, and
+        compared.  That is a check and not a precondition: measured on this
+        account, a DELETE carrying a stale ``If-Match`` was answered 204 and
+        the object was removed anyway.  Whoever reads this must not add the
+        header and call the race closed.
+        """
+        rechecked = False
+        try:
+            latest = calendar.event_by_url(href)  # type: ignore[attr-defined]
+        except caldav_error.NotFoundError:
+            raise NotFound(_already_removed(uid, href=href)) from None
+        else:
+            fresh, unreadable = _etag_of(latest)
+            if fresh and not unreadable:
+                rechecked = True
+                if fresh != etag:
+                    raise Conflict(_stale_etag_before_delete(uid, given=etag))
+
+        try:
+            response = client.delete(href)  # type: ignore[attr-defined]
+        except http_error.RequestException as exc:
+            # The request left this process. A repeat could remove whatever has
+            # taken its place, which is the one outcome nobody can undo.
+            raise TransportError(
+                _delete_outcome_unknown(uid, calendar_url=url, exc=exc)
+            ) from exc
+        except caldav_error.RateLimitError as exc:
+            raise RateLimited(_delete_rate_limited(uid, calendar_url=url)) from exc
+        except caldav_error.AuthorizationError as exc:
+            raise self._write_refused(
+                exc,
+                calendar=url,
+                name=name,
+                wrote=(
+                    "Nothing was deleted, and the event is still on the "
+                    "calendar. Delete it in a calendar this account owns, from "
+                    "`calendar_list`, or ask whoever shares this one for write "
+                    "access to it."
+                ),
+            ) from exc
+
+        _check_delete_status(_status_of(response), uid=uid, href=href)
+
+        confirmed = False
+        confirmation_error: str | None = None
+        try:
+            after, _, _, _ = _fetch_sources(
+                calendar, url=url, uid=uid, gather_overrides=True
+            )
+            confirmed = not after
+            if after:
+                confirmation_error = (
+                    "the server accepted the delete, but the event was still "
+                    "there when it was read back afterwards"
+                )
+        except Exception as exc:  # noqa: BLE001 - reported, or re-raised
+            if _is_transport_failure(exc) or isinstance(
+                exc, caldav_error.AuthorizationError
+            ):
+                raise self._readback_broke_off(
+                    exc,
+                    uid=uid,
+                    calendar=url,
+                    verb="deleted",
+                    again="Do not delete it again;",
+                ) from exc
+            confirmation_error = f"the readback failed ({type(exc).__name__}: {exc})"
+
+        return DeletedEvent(
+            uid=uid,
+            scope=SCOPE_SERIES,
+            recurrence_id=None,
+            href=href,
+            calendar_url=url,
+            calendar_name=name,
+            deleted=True,
+            already_gone=False,
+            confirmed=confirmed,
+            # A removed object has no version. Reporting the one it had would
+            # be a precondition for a resource that is not there.
+            etag=None,
+            occurrences_remaining=None,
+            precondition_rechecked=rechecked,
+            confirmation_error=confirmation_error,
+        )
+
     def _readback_broke_off(
         self,
         exc: BaseException,
@@ -1057,7 +1654,15 @@ class CalDAVCalendarClient:
         )
 
     def _write_refused(
-        self, exc: BaseException, *, calendar: str, name: str
+        self,
+        exc: BaseException,
+        *,
+        calendar: str,
+        name: str,
+        wrote: str = (
+            "Nothing was created. Create the event in a calendar this account "
+            "owns, from `calendar_list`."
+        ),
     ) -> Exception:
         """A refused write, told apart from a refused account.
 
@@ -1068,6 +1673,12 @@ class CalDAVCalendarClient:
         instead. A 401, and a refusal that cannot be classified, stay what they
         are: the translator says the credential may be the cause, and that must
         not be softened into a fact about one collection.
+
+        ``wrote`` is the whole of the last sentence, and every caller's version
+        of it ends in an instruction. The parameter exists because a create, a
+        cancellation and a delete leave different things undone; it is not a
+        licence to replace the instruction with a definition, which is what a
+        caller reading a refusal actually needs.
         """
         try:
             forbidden = _is_forbidden(exc)
@@ -1079,8 +1690,7 @@ class CalDAVCalendarClient:
             f"The calendar {name!r} at {calendar} refused the write with 403. "
             "The credential was accepted, so this is a permission on that "
             "calendar -- a shared or subscribed collection this account may "
-            "read but not write to. Nothing was created. Create the event in a "
-            "calendar this account owns, from `calendar_list`."
+            f"read but not write to. {wrote}"
         )
 
     def _calendars_for(
@@ -1434,6 +2044,183 @@ def checked_etag(etag: object) -> str:
     )
 
 
+def checked_delete_scope(scope: object) -> str:
+    """Which of the two things "delete this event" means, never guessed.
+
+    Its own refusal rather than :func:`checked_scope`'s, because the two
+    readings differ here in a way they do not for a change: one of them can be
+    undone by putting the instance back, and the other cannot be undone at all.
+    A caller choosing between them has to be told that, and a message written
+    for an edit does not say it.
+    """
+    if isinstance(scope, str):
+        trimmed = scope.strip()
+        if trimmed in (SCOPE_OCCURRENCE, SCOPE_SERIES):
+            return trimmed
+    given = (
+        "no `scope` was given"
+        if scope is None or (isinstance(scope, str) and not scope.strip())
+        else f"`scope` was {scope!r}"
+    )
+    raise ProtocolError(
+        f"{given}, and there is no default. Say which removal is meant: "
+        f"`{SCOPE_OCCURRENCE}` cancels the one instance named by "
+        f"`recurrence_id` and leaves the rest of the series on the calendar; "
+        f"`{SCOPE_SERIES}` deletes the event itself, and every instance of it "
+        "goes with it. The second is irreversible -- the object is removed and "
+        "this server has no undelete -- so neither is guessed. Nothing was "
+        "deleted."
+    )
+
+
+def checked_delete_etag(etag: object, *, scope: str) -> str:
+    """The version the caller last read, and what it is worth on each path.
+
+    Required for both scopes, and honest about the difference between them.
+    Cancelling an instance is a conditional write, and this server honours the
+    precondition.  Removing a series is a DELETE, and this server does not:
+    measured on the live account, a delete carrying a stale ETag was answered
+    204 and the object was removed anyway.  On that path the ETag is compared
+    against the version stored immediately before the delete instead, which
+    narrows the race and cannot close it.
+
+    Public for the same reason as :func:`checked_etag`: ``tools/`` refuses the
+    same thing with the same words, and two copies of a multi-sentence message
+    are two things to keep in step.
+    """
+    if isinstance(etag, str) and etag.strip():
+        return etag.strip()
+    if scope == SCOPE_OCCURRENCE:
+        raise ProtocolError(
+            "`etag` is required: it is the version of the event you last read, "
+            "and cancelling an instance is a write that carries it as a "
+            "precondition, so a change somebody else made in between is "
+            "refused rather than overwritten. Read the event with "
+            "`calendar_event_get` and pass back the `etag` it returned. Nothing "
+            "was cancelled."
+        )
+    raise ProtocolError(
+        "`etag` is required: it is the version of the event you last read, and "
+        "it is compared against the version stored immediately before the "
+        "event is removed, so a series somebody else changed in the meantime "
+        "is not deleted out from under them. Be clear about what that is "
+        "worth: this server ignores `If-Match` on a delete -- measured -- so "
+        "the comparison narrows the window and does not close it. Read the "
+        "event with `calendar_event_get` and pass back the `etag` it returned. "
+        "Nothing was deleted."
+    )
+
+
+def _stale_etag_before_delete(uid: str, *, given: str) -> str:
+    """The message for a series that changed before it could be removed."""
+    return (
+        f"Event {uid!r} has changed since the ETag {given!r} was read, so it was "
+        "not deleted. Read it again with `calendar_event_get`, look at what is "
+        "there now, and delete it only if you still mean to -- a deletion "
+        "cannot be undone, and what you would be removing is no longer what "
+        "you looked at. Note what this check is and is not: this server ignores "
+        "`If-Match` on a delete, so the ETag is compared against the stored "
+        "version immediately beforehand rather than enforced by the server. It "
+        "narrows the window between reading and removing; it is not a "
+        "guarantee, and a change made inside that window would not be caught."
+    )
+
+
+def _already_removed(uid: str, *, href: str) -> str:
+    """The message for an object that went between the read and the delete."""
+    return (
+        f"Event {uid!r} was read a moment ago at {href} and is no longer there, "
+        "so nothing was deleted by this call: something else removed it in "
+        "between. Nothing here removed anything, and there is nothing left to "
+        "remove."
+    )
+
+
+def _delete_outcome_unknown(
+    uid: str, *, calendar_url: str, exc: BaseException
+) -> str:
+    """The message for a delete whose fate nobody knows.
+
+    The blind retry is worse here than anywhere else in this server: if the
+    first delete landed, the href is free, and a repeat removes whatever has
+    since been created at it -- which is not the event the caller named and is
+    not recoverable.
+    """
+    return (
+        f"The connection failed while deleting event {uid!r} from {calendar_url} "
+        f"({type(exc).__name__}), so the outcome is unknown: the event may or "
+        "may not have been removed. It was not retried, and must not be -- if "
+        "the delete landed, a repeat would remove whatever is at that address "
+        f"now. Read the event with `calendar_event_get` for uid {uid!r} first, "
+        "and delete it again only if it is still there."
+    )
+
+
+def _delete_rate_limited(uid: str, *, calendar_url: str) -> str:
+    """The message for a delete the server refused because of rate limiting."""
+    return (
+        f"Yandex is rate limiting this account and refused the delete, so event "
+        f"{uid!r} in {calendar_url} was not removed. The delete was not "
+        "retried and its outcome is not in doubt: the event is still there. "
+        "Wait, read it again, and repeat the delete with the ETag that read "
+        "returns."
+    )
+
+
+def _cancel_outcome_unknown(
+    uid: str,
+    recurrence_id: date | datetime | None,
+    *,
+    calendar_url: str,
+    exc: BaseException,
+) -> str:
+    """The message for a cancellation whose fate nobody knows."""
+    when = recurrence_id.isoformat() if recurrence_id is not None else "that time"
+    return (
+        f"The connection failed while cancelling the instance of event {uid!r} "
+        f"at {when} in {calendar_url} ({type(exc).__name__}), so the outcome is "
+        "unknown: the instance may or may not have been cancelled. Do not "
+        "repeat it blindly -- read the event with `calendar_event_get` for uid "
+        f"{uid!r} and that `recurrence_id` first, and repeat the cancellation "
+        "only if the instance is still on the calendar."
+    )
+
+
+def _check_delete_status(status: int | None, *, uid: str, href: str) -> None:
+    """Turn a delete's status into either silence or the taxonomy.
+
+    Raises:
+        NotFound: 404 -- the object went between the read and the delete, and
+            nothing here removed it.
+        Conflict: 412, which this server is *not* measured to send: if it ever
+            does, the precondition held and the event is still there.
+        ProtocolError: any other answer, including one with no status at all.
+            "The server said nothing" is not "the event is gone", and a caller
+            told it was gone stops looking.
+    """
+    if status in (200, 202, 204):
+        return
+    if status == 404:
+        raise NotFound(
+            f"Yandex answered the delete of event {uid!r} with 404, so nothing "
+            f"was removed: the object at {href} was read a moment before and is "
+            "no longer there. Something else deleted it in between."
+        )
+    if status == 412:
+        raise Conflict(
+            f"Yandex answered the delete of event {uid!r} with 412, so nothing "
+            "was removed: it changed after it was read. Read it again with "
+            "`calendar_event_get` and delete it only if you still mean to."
+        )
+    raise ProtocolError(
+        f"Yandex answered the delete of event {uid!r} with "
+        f"{status if status is not None else 'no status at all'}, which this "
+        "server cannot read as success, so the event is not reported as gone. "
+        "It may or may not still be there: read it with `calendar_event_get` "
+        f"for uid {uid!r} before trying again."
+    )
+
+
 def _stale_etag(uid: str, *, given: str) -> str:
     """The message for a precondition that no longer holds."""
     return (
@@ -1446,19 +2233,72 @@ def _stale_etag(uid: str, *, given: str) -> str:
     )
 
 
-def _stored_in_several_objects(uid: str, sources: list) -> str:
+def _stored_in_several_objects(
+    uid: str,
+    sources: list,
+    *,
+    act: str = "changed",
+    then: str = "change it",
+    outcome: str = "nothing was written",
+) -> str:
     """The message for a UID spread over more than one CalDAV object.
 
     One ETag names one object.  Editing one of several and sending that single
     precondition would claim a guard over documents it never covered, and a
     caller would be told the whole event was changed when part of it was not.
+
+    The verb is a parameter because the same refusal is reached from a change
+    and from a removal, and the instruction at the end has to be the one the
+    caller asked for: telling somebody who asked to delete an event to go and
+    change it in another client answers a question nobody asked.
     """
     return (
         f"Event {uid!r} is stored across {len(sources)} separate calendar "
-        "objects, and a conditional write covers one object only. This server "
-        "will not change part of an event while reporting the whole of it, so "
-        "nothing was written. Read the event with `calendar_event_get` and "
-        "change it in a client that can address each object."
+        "objects, and one request covers one object only. This server will not "
+        f"leave part of an event {act} while reporting the whole of it, so "
+        f"{outcome}. Read the event with `calendar_event_get` and "
+        f"{then} in a client that can address each object."
+    )
+
+
+def _uid_in_several_calendars(uid: str, calendars: list[str]) -> str:
+    """The message for one UID found in more than one calendar on the account.
+
+    Calendars are searched in listing order, and taking the first hit means
+    choosing which of somebody's calendars to remove a meeting from by an
+    accident of ordering, silently.  On the one tool with no undo that is not a
+    choice this server makes.
+    """
+    listed = ", ".join(calendars)
+    return (
+        f"Event {uid!r} is in {len(calendars)} of this account's calendars: "
+        f"{listed}. Which of them was meant cannot be told from the UID, and "
+        "this server will not remove an event from whichever calendar it "
+        "happens to list first -- there is no undelete here. Nothing was "
+        "removed. Repeat the call with `calendar_url` set to the calendar you "
+        "mean; `calendar_events_list` shows which calendar each occurrence is "
+        "in."
+    )
+
+
+def _object_holds_other_events(uid: str, others: list[str]) -> str:
+    """The message for a delete aimed at an object that holds somebody else's event.
+
+    ``scope: series`` removes the CalDAV object, and a single object may hold
+    several unrelated events.  Removing it would take every one of them, while
+    the answer named only the UID that was asked for -- the one failure this
+    tool must never have.  The neighbouring guard is against the opposite
+    shape, one UID spread over several objects, and does not see this.
+    """
+    listed = ", ".join(repr(other) for other in others)
+    return (
+        f"The stored object holding event {uid!r} also holds "
+        f"{len(others)} other event(s): {listed}. Deleting an event here "
+        "removes the whole object, so this delete would remove them too, and "
+        "this server will not remove an event nobody named -- nothing was "
+        f"deleted and {uid!r} is still there. Cancel or remove {uid!r} in a "
+        "client that can address each component of an object, or delete the "
+        "other events deliberately first if they really are meant to go."
     )
 
 
@@ -1534,7 +2374,12 @@ def _update_rate_limited(uid: str, *, calendar_url: str) -> str:
 
 
 def _check_update_status(
-    status: int | None, *, uid: str, href: str, etag: str
+    status: int | None,
+    *,
+    uid: str,
+    href: str,
+    etag: str,
+    what: str = "the change of",
 ) -> None:
     """Turn a conditional write's status into either silence or the taxonomy.
 
@@ -1566,7 +2411,7 @@ def _check_update_status(
         raise Conflict(_stale_etag(uid, given=etag))
     if status == 409:
         raise Conflict(
-            f"Yandex answered the change of event {uid!r} with 409 and nothing "
+            f"Yandex answered {what} event {uid!r} with 409 and nothing "
             f"was written. That is not the precondition: a stale ETag is "
             "answered 412. On CalDAV a 409 means the request conflicts with "
             f"the state of the collection -- the calendar holding {href} may "
@@ -1577,13 +2422,13 @@ def _check_update_status(
         )
     if status == 404:
         raise NotFound(
-            f"Yandex answered the change of event {uid!r} with 404, so nothing "
+            f"Yandex answered {what} event {uid!r} with 404, so nothing "
             f"was changed: the object at {href} was read a moment before the "
             "write and is no longer there. It has most likely been deleted "
             "since. Read it with `calendar_event_get` for uid " + repr(uid) + "."
         )
     raise ProtocolError(
-        f"Yandex answered the change of event {uid!r} with "
+        f"Yandex answered {what} event {uid!r} with "
         f"{status if status is not None else 'no status at all'}, which this "
         "server cannot read as success. The change may or may not have been "
         f"applied: read the event with `calendar_event_get` for uid {uid!r} "

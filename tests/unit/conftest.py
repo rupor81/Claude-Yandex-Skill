@@ -189,6 +189,21 @@ class FakeCalendar:
                 return
         self._entries.append((str(href), data))
 
+    def remove(self, href):
+        """Drop whatever is at that href, and say whether anything was there.
+
+        A real DELETE removes the whole object, every component in it included.
+        A fake that removed one event out of a shared object would let a delete
+        that destroys somebody else's meeting pass this suite.
+        """
+        for index, entry in enumerate(self._entries):
+            stored = self._href_of(entry)
+            if stored is not None and _same_href(href, stored):
+                del self._entries[index]
+                self._revisions.pop(str(href), None)
+                return True
+        return False
+
     def search(self, **kwargs):
         self.searched = kwargs
         if self._raises is not None:
@@ -339,6 +354,9 @@ def install_fake_dav_client(
     puts=None,
     put_raises=None,
     put_status=_UNSET,
+    deletes=None,
+    delete_raises=None,
+    delete_status=_UNSET,
 ):
     """Replace `caldav.DAVClient` with a fake that answers or fails as asked.
 
@@ -355,6 +373,14 @@ def install_fake_dav_client(
             refuses this particular write.  Passing it as ``None`` explicitly is
             a response carrying no status at all -- distinct from not passing
             it, which lets the fake answer the write normally.
+        deletes: a list the fake appends one href to per DELETE, so a test can
+            see which object a delete was aimed at -- and see that a refused
+            delete sent none at all.
+        delete_raises: raised instead of answering, for a connection lost
+            mid-delete, where the outcome is genuinely unknown.
+        delete_status: answered instead of removing anything, for a server that
+            refuses this particular delete.  ``None`` passed explicitly is a
+            response carrying no status at all.
     """
     import caldav
 
@@ -424,6 +450,26 @@ def install_fake_dav_client(
                 return FakeResponse(204)
             collection.add(url, body)
             return FakeResponse(201)
+
+        def delete(self, url):
+            """A DELETE, as this server is measured to answer one.
+
+            Deliberately unconditional: measured on the live account, a delete
+            carrying a stale ETag was answered 204 and the object was removed
+            anyway. A fake that honoured a precondition here would let code
+            claim a protection this server does not give, and the suite would
+            agree with it.
+            """
+            if deletes is not None:
+                deletes.append(str(url))
+            if delete_raises is not None:
+                raise delete_raises
+            if delete_status is not _UNSET:
+                return FakeResponse(delete_status)
+            collection = _collection_for(url)
+            if collection is None or not collection.remove(url):
+                return FakeResponse(404)
+            return FakeResponse(204)
 
     monkeypatch.setattr(caldav, "DAVClient", FakeDAVClient)
     return closed

@@ -65,7 +65,7 @@ development_status:
   1-5-inspect-busy-time: review
   1-6-create-an-event: review
   1-7-update-an-event-with-an-explicit-scope: review
-  1-8-delete-an-event-with-an-explicit-scope: backlog
+  1-8-delete-an-event-with-an-explicit-scope: review
   epic-1-retrospective: optional
 
   # Epic 2: Mail connector, end to end

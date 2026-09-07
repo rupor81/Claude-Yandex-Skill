@@ -46,14 +46,19 @@ def build(monkeypatch, *, calendars=None, secret="hunter2-app-password", put=Fal
     return server_module.build_calendar_server(PROFILE)
 
 
-WRITING_TOOLS = {"calendar_event_create", "calendar_event_update"}
+WRITING_TOOLS = {
+    "calendar_event_create",
+    "calendar_event_update",
+    "calendar_event_delete",
+}
 
 
-def test_the_registered_tools_are_the_four_reads_and_two_writes(monkeypatch):
+def test_the_registered_tools_are_the_four_reads_and_three_writes(monkeypatch):
     server = build(monkeypatch)
     tools = anyio.run(server.list_tools)
     assert sorted(tool.name for tool in tools) == [
         "calendar_event_create",
+        "calendar_event_delete",
         "calendar_event_get",
         "calendar_event_update",
         "calendar_events_list",
@@ -74,6 +79,10 @@ def test_the_registered_tools_are_the_four_reads_and_two_writes(monkeypatch):
     update = by_name["calendar_event_update"]
     assert update.annotations.read_only_hint is False
     assert update.annotations.destructive_hint is True
+    # Removing one is the least recoverable thing here, and says so too.
+    removal = by_name["calendar_event_delete"]
+    assert removal.annotations.read_only_hint is False
+    assert removal.annotations.destructive_hint is True
 
 
 def test_changing_an_event_declares_scope_and_etag_as_required(monkeypatch):
@@ -245,19 +254,26 @@ def test_a_wrong_app_password_never_reaches_the_caller_as_text(monkeypatch):
 
 
 def test_the_instructions_claim_exactly_the_writes_this_server_can_do(monkeypatch):
-    """Two writes exist now; the instructions must not imply the third."""
+    """Three writes exist now, and the instructions must claim those three."""
     server = build(monkeypatch)
     tools = anyio.run(server.list_tools)
     writes = sorted(
         tool.name for tool in tools if not tool.annotations.read_only_hint
     )
-    assert writes == ["calendar_event_create", "calendar_event_update"]
+    assert writes == [
+        "calendar_event_create",
+        "calendar_event_delete",
+        "calendar_event_update",
+    ]
     text = server_module.INSTRUCTIONS.lower()
     assert "create" in text
     assert "change" in text
-    assert "cannot delete" in text
-    # The one rule a change must not be described without.
+    assert "delete" in text
+    # The two rules neither a change nor a deletion may be described without.
     assert "scope" in text and "etag" in text
+    # And the one thing about a deletion that a caller must not learn by
+    # experiment: the precondition does not protect it here.
+    assert "ignores the precondition on a delete" in text
 
 
 def test_creating_through_the_server_reports_what_was_stored(monkeypatch):
@@ -283,6 +299,48 @@ def test_creating_through_the_server_reports_what_was_stored(monkeypatch):
     assert payload["etag"]
     assert payload["stored"]["summary"] == "Design review"
     assert payload["differs_from_request"] is False
+
+
+def test_deleting_an_event_declares_scope_and_etag_as_required(monkeypatch):
+    """Both are refusals the schema itself should make, before a call is made."""
+    server = build(monkeypatch)
+    (tool,) = [
+        tool
+        for tool in anyio.run(server.list_tools)
+        if tool.name == "calendar_event_delete"
+    ]
+    required = set(tool.input_schema["required"])
+    assert {"uid", "scope", "etag"} <= required
+    scope = tool.input_schema["properties"]["scope"]["description"]
+    assert "occurrence" in scope and "series" in scope
+    assert "no default" in scope.lower()
+    assert "irreversible" in scope.lower()
+
+
+def test_deleting_through_the_server_removes_the_event_and_confirms_it(monkeypatch):
+    """The stdio-shaped call, end to end, against a calendar that holds one."""
+    calendar = FakeCalendar(
+        "Personal", "https://caldav.yandex.ru/c/personal/", [EVENT_DOCUMENT]
+    )
+    server = build(monkeypatch, calendars=[calendar], put=True)
+    result = anyio.run(
+        lambda: server.call_tool(
+            "calendar_event_delete",
+            {
+                "uid": "standup-1",
+                "scope": "series",
+                "etag": "etag-standup-1",
+            },
+        )
+    )
+    payload = result.structuredContent if hasattr(result, "structuredContent") else None
+    if payload is None:
+        payload = result.structured_content
+    assert payload["deleted"] is True
+    assert payload["confirmed"] is True
+    assert payload["etag"] is None
+    assert payload["precondition_note"]
+    assert not calendar.holds(calendar.href_for("standup-1"))
 
 
 def test_the_instructions_admit_a_page_can_be_irrecoverably_short():
@@ -357,22 +415,27 @@ def test_changing_through_the_server_refuses_a_missing_scope(monkeypatch):
         )
 
 
-#: Words that would advertise a capability this server does not have. `delete`
-#: is handled separately, because the instructions have to be able to say the
-#: server *cannot* do it. `update` is checked separately too: this server now
-#: has a tool by that name, and the word may appear only as part of it. `edit`
-#: stays on the list: gaining `calendar_event_update` is a reason to allow the
-#: tool's own name, not a reason to allow every other word for changing things
-#: -- and the instructions have to name the two scopes and the precondition,
-#: which "edit an event" quietly promises to do without either.
+#: Words that would advertise a capability this server does not have. `update`
+#: and `delete` are checked separately: this server now has a tool for each,
+#: and each word is allowed only where the instructions are being precise about
+#: what that tool does. `edit`, `modify` and `manage` stay on the list --
+#: gaining two write tools is a reason to describe those two acts exactly, not
+#: a reason to allow every looser word for changing somebody's calendar, each
+#: of which promises the scope and the precondition without naming either.
+#:
+#: `remove` stays for the same reason, and it is the one worth spelling out.
+#: This server removes exactly two things, and which of the two is meant is the
+#: whole content of `scope`: it deletes an event, or it cancels one instance of
+#: one. "Remove" names neither, and a model that reads it decides for itself
+#: which was offered -- on the one path with no undo. The instructions have the
+#: two precise words available and are asserted below to use them.
 OVERCLAIMING_WORDS = (
     "manage",
     "edit",
     "modify",
     "reschedule",
-    "remove",
     "move",
-    "cancel",
+    "remove",
     "attendee",
     "read-write",
 )
@@ -393,9 +456,18 @@ def test_the_instructions_never_advertise_a_capability_this_server_lacks():
         )
     # `update` may appear only as the name of the tool that does it.
     assert text.count("update") == text.count("calendar_event_update")
-    # `delete` may appear only in the sentence that denies it.
-    assert text.count("delete") == text.count("cannot delete")
-    assert text.count("cannot delete") == 1
+    # Removal is described only as what this server actually does: deleting an
+    # event, or cancelling one instance of one. Nothing here removes a
+    # calendar, and nothing removes an event without being told which of the
+    # two was meant.
+    assert "cancelling one instance" in text
+    assert text.count("cancel") == text.count("cancelling one instance")
+    assert "delete a calendar" not in text and "delete every" not in text
+    # And a claim about removal is never made without the scope beside it: the
+    # sentence that introduces the delete tool has to say what `scope` chooses
+    # between, because a model that guesses cannot be corrected afterwards.
+    assert "scope" in text
+    assert "and so on every instance of it" in text
     assert text.count("invite") == text.count("invites nobody")
     assert text.count("invites nobody") == 1
 

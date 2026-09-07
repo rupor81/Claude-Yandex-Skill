@@ -43,6 +43,8 @@ import icalendar
 import recurring_ical_events
 from yandex_core.errors import ProtocolError
 
+from .compose import FloatingExclusion, exdates
+
 __all__ = [
     "CalendarSource",
     "Occurrence",
@@ -63,6 +65,9 @@ __all__ = [
     "SCOPE_SERIES",
     "SCOPE_OCCURRENCE",
     "read_event",
+    "has_occurrences",
+    "OCCURRENCE_SEARCH_LIMIT",
+    "other_uids",
 ]
 
 
@@ -931,6 +936,136 @@ def read_event(
         ) from exc
 
 
+#: How many expanded instances :func:`has_occurrences` will look at before it
+#: gives up and says it does not know.  An endless rule supplies instances
+#: forever, and every one of them may be skipped -- a master carrying
+#: ``STATUS:CANCELLED`` and ``RRULE:FREQ=DAILY`` is the case that was measured,
+#: and it never returned at all.  The number is a walk of a few years of a
+#: daily series: large enough that a real answer is reached long before it, and
+#: small enough to answer in well under a second.
+OCCURRENCE_SEARCH_LIMIT = 500
+
+
+def has_occurrences(
+    sources: CalendarSource | Sequence[CalendarSource], *, uid: str
+) -> bool | None:
+    """Whether this event still happens at all, once cancellations are applied.
+
+    Asked after an instance has been excluded, so the answer can say whether
+    the series has anything left.  An object holding a series that never
+    happens again is not the same thing as an object that is gone, and this
+    server removes neither by itself: reporting "cancelled" and leaving an
+    empty series behind without saying so is how an operator ends up with a
+    calendar full of objects nothing displays.
+
+    Answered by expanding forwards from the earliest component rather than by
+    reading the ``RRULE``: a rule with a ``COUNT`` every one of whose instances
+    is excluded still looks like a live series to anything that only reads the
+    rule.  The walk stops at the first instance that happens, so a live series
+    answers on its first step; a rule that runs out answers when the expansion
+    does.
+
+    Nothing else stops it.  An endless rule every one of whose instances is
+    skipped -- ``RRULE:FREQ=DAILY`` on a master carrying ``STATUS:CANCELLED``,
+    measured -- supplies skipped instances forever, so the walk gives up after
+    :data:`OCCURRENCE_SEARCH_LIMIT` (500) of them and returns ``None``.
+
+    Returns:
+        ``True`` when an instance that happens was found, ``False`` when the
+        expansion ran out without one, and ``None`` when neither was reached
+        inside the limit -- which is "this was not decided", not "there are
+        none": the object is still there and may still happen.
+
+    A component that cannot be read is not counted as an occurrence; nor is a
+    cancelled one, which is exactly what the listing path does with it.
+    """
+    if isinstance(sources, CalendarSource):
+        sources = [sources]
+
+    parsed: list[tuple[icalendar.Calendar, CalendarSource]] = []
+    for source in sources:
+        try:
+            parsed.append((icalendar.Calendar.from_ical(source.ics), source))
+        except Exception:  # noqa: BLE001 - an unreadable document holds nothing
+            continue
+
+    holders = [
+        (document, source, found)
+        for document, source in parsed
+        if (found := _components_with_uid(document, uid))
+    ]
+    if not holders:
+        return False
+
+    source = holders[0][1]
+    components = [component for _, _, found in holders for component in found]
+    starts: list[datetime] = []
+    for component in components:
+        try:
+            value = _instant(component, "DTSTART")
+        except _NaiveTimestamp:
+            continue
+        if value is not None:
+            starts.append(_as_instant(value))
+    if not starts:
+        return False
+
+    group = _Group(
+        calendar_url=source.calendar_url,
+        uid=uid,
+        components=tuple(components),
+        documents=tuple(document for document, _, _ in holders),
+        source=source,
+    )
+    # A day before the earliest component: an all-day value sorts at midnight
+    # UTC, and starting exactly on it risks losing the first instance to a
+    # boundary comparison.
+    earliest = min(starts) - timedelta(days=1)
+    seen = 0
+    for expanded in recurring_ical_events.of(
+        _calendar_with(group), components=["VEVENT"]
+    ).after(earliest):
+        if not _is_cancelled(expanded):
+            return True
+        seen += 1
+        if seen >= OCCURRENCE_SEARCH_LIMIT:
+            # Every instance so far was skipped and the rule has not run out.
+            # Saying "none left" here would be a claim about a series this
+            # walk never reached the end of.
+            return None
+    return False
+
+
+def other_uids(
+    sources: "CalendarSource | Sequence[CalendarSource]", *, uid: str
+) -> list[str]:
+    """Every *other* event held by the same objects as this one.
+
+    A CalDAV object is not an event.  Most of the time it holds one, but a
+    client that batches may put several unrelated events in one file, and a
+    DELETE removes the file.  This is what the caller has to be told about
+    before that happens: the guard beside it -- one UID spread over several
+    objects -- is the opposite shape and does not see this at all.
+
+    A document that cannot be parsed contributes nothing: it is reported by the
+    reader that tried to read the event itself, and guessing UIDs out of text
+    this parser does not understand would be a worse answer than none.
+    """
+    if isinstance(sources, CalendarSource):
+        sources = [sources]
+    found: list[str] = []
+    for source in sources:
+        try:
+            document = icalendar.Calendar.from_ical(source.ics)
+        except Exception:  # noqa: BLE001 - unreadable here means unreported
+            continue
+        for component in document.walk("VEVENT"):
+            other = str(component.get("UID") or "").strip()
+            if other and other != uid and other not in found:
+                found.append(other)
+    return found
+
+
 def _components_with_uid(
     document: icalendar.Calendar, uid: str
 ) -> list[icalendar.Event]:
@@ -1104,36 +1239,24 @@ def _duration_of(component: icalendar.Event) -> timedelta | None:
 
 
 def _exdates(component: icalendar.Event) -> list[date | datetime]:
-    """Every excluded instance of a series, however the property was spelled.
+    """Every excluded instance of a series, read by the one implementation.
 
-    ``EXDATE`` may appear once with several values or several times with one
-    each, and ``icalendar`` represents the two differently.
+    The reading itself lives in ``compose.exdates``, which the writer uses too.
+    They were written twice and disagreed: on a floating value this one raised
+    while the writer skipped it, so the writer could conclude "not excluded"
+    about an instance this reader refuses to report, and add a duplicate
+    exclusion beside it.
 
-    The values go through the same rule as every other instant here: a floating
-    one is refused rather than decorated.  Read raw, a floating ``EXDATE`` came
-    back as a naive ``start`` and a naive ``recurrence_id`` -- a value this
-    tool's own validator rejects if the caller passes it back.
+    What is still local is what the refusal *means* here: a floating ``EXDATE``
+    read raw came back as a naive ``start`` and a naive ``recurrence_id`` -- a
+    value this tool's own validator rejects if the caller passes it back -- so
+    it becomes the same naive-timestamp answer every other unreadable instant
+    in this module produces.
     """
-    field = component.get("EXDATE")
-    if field is None:
-        return []
-    fields = field if isinstance(field, list) else [field]
-    values: list[date | datetime] = []
-    for entry in fields:
-        dates = getattr(entry, "dts", None)
-        items = [entry] if dates is None else list(dates)
-        for item in items:
-            value = getattr(item, "dt", None if dates is None else item)
-            if isinstance(value, datetime):
-                if value.tzinfo is None or value.utcoffset() is None:
-                    raise _NaiveTimestamp(
-                        "EXDATE has no timezone; a floating exclusion cannot be "
-                        "reported with an explicit offset."
-                    )
-                values.append(value)
-            elif isinstance(value, date):
-                values.append(value)
-    return values
+    try:
+        return exdates(component)
+    except FloatingExclusion as exc:
+        raise _NaiveTimestamp(str(exc)) from exc
 
 
 #: The first absolute link in a text field, when a property did not carry one.

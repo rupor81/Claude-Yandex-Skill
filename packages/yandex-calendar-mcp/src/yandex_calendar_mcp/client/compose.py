@@ -43,12 +43,16 @@ __all__ = [
     "EventDraft",
     "EventEdit",
     "EditedDocument",
+    "CancelledInstance",
     "PRODID",
     "SCOPE_OCCURRENCE",
     "SCOPE_SERIES",
     "UNCHANGED",
     "apply_event_edit",
+    "apply_instance_cancellation",
     "check_event_edit",
+    "exdates",
+    "FloatingExclusion",
     "EDITABLE_FIELDS",
     "new_uid",
     "build_event_document",
@@ -381,6 +385,180 @@ def check_event_edit(edit: EventEdit) -> None:
         )
     if moving_start:
         _check_boundaries(edit.start, edit.end)
+
+
+@dataclass(frozen=True, slots=True)
+class CancelledInstance:
+    """The result of cancelling one instance of a stored series.
+
+    ``changed`` is false when the instance is already excluded.  That is not an
+    error: the meeting is off, which is what the caller wanted, and a write that
+    stored the same exclusion again would bump the object's version and refuse
+    the next caller's precondition for nothing.
+
+    ``override_removed`` says whether the instance also had a
+    ``RECURRENCE-ID`` override that went with it.  An exclusion and an override
+    for the same moment are a contradiction -- this instance does not happen,
+    and here is what happens at it -- and readers disagree about which wins, so
+    the two are never left side by side.
+
+    ``exclusion_added`` is false when the exclusion was already there and this
+    write existed only to remove the override contradicting it.  The two
+    together are what tells a caller which of the acts happened: a cancellation,
+    or the repair of a document that said both things at once.
+    """
+
+    document: str
+    changed: bool
+    override_removed: bool
+    exclusion_added: bool = True
+
+
+def apply_instance_cancellation(
+    ics: str,
+    *,
+    uid: str,
+    recurrence_id: date | datetime,
+    now: datetime | None = None,
+) -> CancelledInstance:
+    """Exclude one instance from a stored series, and hand back the whole object.
+
+    Cancelling one instance is an *edit*: an ``EXDATE`` is added to the
+    component that defines the series, and everything else in the object --
+    other components, the overrides of other instances, the ``VTIMEZONE`` the
+    event's own times refer to -- is carried through untouched.  Nothing is
+    removed from the calendar; the object is written back by a conditional
+    write, exactly as a change is.
+
+    The one thing that *is* removed is an override belonging to the instance
+    being cancelled, in the same write.  That also repairs a document that
+    already held both: an exclusion beside an override for the same moment is
+    the contradiction this function exists to avoid leaving behind, and finding
+    one already there is a reason to write, not a reason to call the instance
+    already gone and leave it showing in half the readers.
+
+    ``changed`` is false only when there is genuinely nothing to do: the
+    instance is excluded and no override contradicts the exclusion.
+
+    Raises:
+        ProtocolError: the document cannot be parsed, does not hold the UID, or
+            holds no component defining the series.  Nothing is returned
+            half-applied.
+    """
+    try:
+        document = icalendar.Calendar.from_ical(ics)
+    except Exception as exc:  # noqa: BLE001 - never a missing event
+        raise ProtocolError(
+            f"The stored calendar object for event {uid!r} could not be read, so "
+            "the instance cannot be cancelled: the server returned something "
+            "this parser does not recognise as iCalendar. Nothing was written."
+        ) from exc
+
+    holder, components = _holder_of(document, uid)
+    master = _master_component(components, uid=uid)
+    if master is None:
+        raise ProtocolError(
+            f"Event {uid!r} is present only as RECURRENCE-ID overrides in the "
+            "stored object: the component that defines the series is not there, "
+            "so an exclusion has nothing to attach to and nothing was written. "
+            "Read the event with `calendar_event_get` and cancel it in a client "
+            "that can address each component."
+        )
+
+    target = _as_instant(recurrence_id)
+    already_excluded = any(
+        _as_instant(excluded) == target for excluded in exdates(master)
+    )
+
+    override_removed = False
+    # Identity, not equality: an ``icalendar`` component is a dict, so two
+    # components that merely look alike compare equal, and removing "the first
+    # one that matches" could take a component belonging to another event that
+    # happens to hold the same properties.
+    doomed = [
+        index
+        for index, component in enumerate(holder.subcomponents)
+        if any(component is held for held in components)
+        and (moment := _component_value(component, "RECURRENCE-ID")) is not None
+        and _as_instant(moment) == target
+    ]
+    for index in reversed(doomed):
+        del holder.subcomponents[index]
+        override_removed = True
+
+    if already_excluded and not override_removed:
+        # Already off, and nothing beside the exclusion disagrees. Said so
+        # rather than written again.
+        return CancelledInstance(
+            document=ics,
+            changed=False,
+            override_removed=False,
+            exclusion_added=False,
+        )
+
+    if not already_excluded:
+        # Added rather than replaced: a series may exclude many instances, and
+        # replacing the property would put every other cancelled meeting back.
+        master.add("EXDATE", written_boundary(recurrence_id))
+    _stamp(master, now=now)
+    return CancelledInstance(
+        document=document.to_ical().decode("utf-8"),
+        changed=True,
+        override_removed=override_removed,
+        exclusion_added=not already_excluded,
+    )
+
+
+class FloatingExclusion(ProtocolError):
+    """An ``EXDATE`` with no timezone, which names no particular instant.
+
+    Its own class because the reader and the writer must do different things
+    with it and both must do *something*: the reader turns it into the message
+    that says the event cannot be reported with an explicit offset, and the
+    writer refuses to write beside it.  Skipping it -- which the writer used to
+    do -- means concluding "not excluded" about an instance the reader will not
+    report at all, and writing a second exclusion for a meeting already off.
+    """
+
+
+def exdates(component: icalendar.Event) -> list[date | datetime]:
+    """Every instance a series excludes, however ``EXDATE`` was spelled.
+
+    ``EXDATE`` may appear once carrying several values or several times
+    carrying one each, and ``icalendar`` represents those two differently.
+
+    The one implementation shared by the writer here and the reader in
+    ``recurrence.py``.  They had one each, and they disagreed: on a floating
+    value the reader raised while the writer skipped it, so the writer could
+    conclude "not excluded" about an instance the reader refuses to report and
+    add a duplicate exclusion beside it.  Which of the two is right is not a
+    question a caller can be expected to arbitrate, so there is now one answer.
+
+    Raises:
+        FloatingExclusion: a value carries no offset. Nothing is guessed: a
+            floating exclusion names a different instant to every reader.
+    """
+    field = component.get("EXDATE")
+    if field is None:
+        return []
+    values: list[date | datetime] = []
+    for entry in field if isinstance(field, list) else [field]:
+        dates = getattr(entry, "dts", None)
+        items = [entry] if dates is None else list(dates)
+        for item in items:
+            value = getattr(item, "dt", None if dates is None else item)
+            if isinstance(value, datetime):
+                if value.tzinfo is None or value.utcoffset() is None:
+                    raise FloatingExclusion(
+                        "EXDATE has no timezone; a floating exclusion names a "
+                        "different instant to every reader, so this server "
+                        "will not decide whether it excludes the instance in "
+                        "hand. Nothing was written."
+                    )
+                values.append(value)
+            elif isinstance(value, date):
+                values.append(value)
+    return values
 
 
 def _holder_of(

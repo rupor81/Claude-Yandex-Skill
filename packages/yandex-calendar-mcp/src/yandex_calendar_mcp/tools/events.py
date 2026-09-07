@@ -37,8 +37,11 @@ from yandex_core.results import Page
 from ..client.caldav_client import (
     CalDAVCalendarClient,
     CreatedEvent,
+    DeletedEvent,
     UpdatedEvent,
     check_instance_matches_scope,
+    checked_delete_etag,
+    checked_delete_scope,
     checked_etag,
     checked_scope,
 )
@@ -97,6 +100,9 @@ __all__ = [
     "UPDATE_TOOL_NAME",
     "EventUpdated",
     "build_calendar_event_update",
+    "DELETE_TOOL_NAME",
+    "EventDeleted",
+    "build_calendar_event_delete",
     "MORE_PAGES",
     "RANGE_TRUNCATED",
     "UNREADABLE_DATA",
@@ -1877,3 +1883,531 @@ def _update_differences(record: EventRecord, sent: dict) -> list[str]:
         if record.all_day != all_day:
             note("all_day", all_day, record.all_day)
     return differences
+
+
+# -- removing one event ---------------------------------------------------
+
+
+DELETE_TOOL_NAME = "calendar_event_delete"
+
+#: What the answer says when one instance was cancelled.
+CANCELLED_NOTE = (
+    "The instance was cancelled: an exclusion was written into the series and "
+    "the server accepted it. The series itself is untouched and every other "
+    "instance keeps its own time."
+)
+
+#: The same, when the cancelled instance had been moved.
+CANCELLED_WITH_OVERRIDE_NOTE = (
+    "The instance was cancelled: an exclusion was written into the series and "
+    "the separate entry holding this instance's own values was removed in the "
+    "same write, because an exclusion and an entry for one moment contradict "
+    "each other. The series itself is untouched and every other instance keeps "
+    "its own time."
+)
+
+#: What the answer says when there was nothing to cancel.
+ALREADY_GONE_NOTE = (
+    "That instance was already cancelled, so no write was sent and nothing "
+    "changed. It is not on the calendar, which is what was asked for; `etag` is "
+    "still the one that was passed in, because a write storing the same "
+    "exclusion again would bump the object's version and refuse the next "
+    "precondition for a change that never happened."
+)
+
+#: What the answer says when the event itself was removed.
+DELETED_NOTE = (
+    "The event was deleted: the object holding it was removed from the "
+    "calendar, and every instance of it went with it. This cannot be undone "
+    "from here -- there is no undelete on this server."
+)
+
+#: What the answer says about a delete's one honest limitation.
+DELETE_PRECONDITION_NOTE = (
+    "The `etag` was compared against the version stored immediately before the "
+    "delete, and the delete was sent only because the two matched. That is a "
+    "check, not a guarantee: measured on this server, a delete carrying a "
+    "stale precondition is answered as success and removes the object anyway, "
+    "so `If-Match` cannot protect a deletion here. The comparison narrows the "
+    "window between reading the event and removing it; it cannot close it, and "
+    "a change made inside that window would not have been caught."
+)
+
+#: The same, when even the comparison could not be made.
+DELETE_UNCHECKED_NOTE = (
+    "The `etag` could NOT be compared before the delete: the server supplied no "
+    "version for the object when it was read again immediately beforehand. The "
+    "delete went ahead with no check of any kind -- this server ignores "
+    "`If-Match` on a delete, measured, so nothing else was protecting it. If "
+    "somebody changed the event after you read it, that change was removed with "
+    "the event."
+)
+
+#: What the answer says when the series has nothing left in it.
+SERIES_EMPTY_NOTE = (
+    "The series now has no occurrences left: every instance of it is "
+    "cancelled. The event object is still on the calendar -- nothing here "
+    "removed it, and this server does not remove one as a side effect of "
+    "cancelling its last instance. Delete it with `scope: series` if it should "
+    "be gone."
+)
+
+#: What the answer says when the series still happens.
+SERIES_REMAINS_NOTE = (
+    "The series still has occurrences after this one: the rest of it is on the "
+    "calendar exactly as it was."
+)
+
+#: The same, when the write existed only to repair a contradiction.
+REPAIRED_CONTRADICTION_NOTE = (
+    "That instance was already excluded from the series, and a separate entry "
+    "holding its own values was still sitting beside the exclusion -- a "
+    "contradiction different calendars resolve differently, which is why some "
+    "readers were still showing the meeting. The entry was removed and the "
+    "exclusion left as it was, so the instance is now off everywhere. The "
+    "series itself is untouched and every other instance keeps its own time."
+)
+
+#: What the answer says when a cancellation was accepted but not seen to work.
+CANCELLED_UNCONFIRMED_NOTE = (
+    "The server accepted the cancellation of that instance, but this server "
+    "could not see afterwards that it had taken effect -- "
+    "`confirmation_note` says what was seen instead. It is not reported as "
+    "cancelled on evidence nobody has. Read the event with "
+    "`calendar_event_get` before doing anything else with it, and do not "
+    "repeat the request first: it may already have been applied."
+)
+
+#: The same, for the removal of an event itself.
+DELETE_UNCONFIRMED_NOTE = (
+    "The server accepted the delete of this event, but reading the calendar "
+    "afterwards did not show that the object is gone -- `confirmation_note` "
+    "says what was seen instead. It is not reported as deleted on evidence "
+    "nobody has. Read the event with `calendar_event_get` to see what is "
+    "there, and do not send the delete again first: it may already have been "
+    "applied, and a repeat would remove whatever now occupies that address."
+)
+
+#: What the answer says when the outcome could not be verified.
+NOT_CONFIRMED_NOTE = (
+    "The server accepted the request, but what it now holds could not be "
+    "confirmed: {reason}. Read the event with `calendar_event_get` to see what "
+    "is there -- and do not repeat the request until you have, because it may "
+    "already have taken effect."
+)
+
+CONFIRMED_NOTE = (
+    "Confirmed by reading the event back afterwards, not claimed from the "
+    "server's answer to the request."
+)
+
+#: The same claim, for the one path where nothing was sent at all.  Saying
+#: "read back afterwards" here would name a request that was never made and a
+#: read that never happened.
+ALREADY_GONE_CONFIRMED_NOTE = (
+    "Confirmed by the read taken before anything would have been sent: that "
+    "read is what showed the instance was already cancelled, which is why no "
+    "write was sent and nothing was read after one. The evidence is that "
+    "earlier read, not a later one."
+)
+
+#: A cancellation that *was* confirmed, on a readback that then broke off.
+CONFIRMED_BUT_SERIES_UNREAD_NOTE = (
+    "The cancellation itself was confirmed: the instance was read back from "
+    "the server and it is off. What became of the rest of the series could "
+    "not be read: {reason}. Do not repeat the cancellation -- it has taken "
+    "effect. Read the event with `calendar_event_get` to see the series as it "
+    "now stands."
+)
+
+#: Why `etag` is null after a cancellation the server accepted.
+UPDATE_ETAG_AFTER_FAILED_READBACK_NOTE = (
+    "`etag` is null because the object could not be read back after the write, "
+    "not because the server supplied no version for it -- "
+    "`confirmation_note` says what went wrong. Nothing was invented in its "
+    "place, and the ETag passed in is spent either way: read the event with "
+    "`calendar_event_get` for the current one."
+)
+
+#: What the answer says when the search for a surviving occurrence was cut short.
+SERIES_UNDECIDED_NOTE = (
+    "Whether the series still has an occurrence left could not be decided: "
+    "every instance examined was cancelled and the recurrence rule has no end, "
+    "so the search was stopped rather than run forever. This says nothing "
+    "against the series -- the object is still on the calendar and may well "
+    "still happen. Read it with `calendar_event_get`, or list the range you "
+    "care about with `calendar_events_list`."
+)
+
+#: What the answer says about the ETag of an object that no longer exists.
+DELETED_ETAG_NOTE = (
+    "`etag` is null because the object is gone: a version is a precondition for "
+    "a resource, and there is no resource. Nothing was invented in its place."
+)
+
+
+class EventDeleted(BaseModel):
+    """One event, or one instance of one, as it stands after a removal."""
+
+    deleted: bool = Field(
+        description=(
+            "True when this call removed something and the server accepted it. "
+            "False only when there was nothing to remove because the instance "
+            "was already cancelled -- `already_gone` says so, and it is not on "
+            "the calendar either way. A removal that was attempted and did not "
+            "happen is an error, never this model."
+        )
+    )
+    already_gone: bool = Field(
+        default=False,
+        description=(
+            "True when no request was sent because the instance was already "
+            "cancelled. Never true for `scope: series`: an event that is not "
+            "there is a not-found, not a quiet success."
+        ),
+    )
+    delete_note: str = Field(
+        description="What happened, in words: what was removed, and what was not."
+    )
+    uid: str = Field(description="Identifier of the event this call was about.")
+    scope: str = Field(
+        description=(
+            f"What was removed. `{SCOPE_OCCURRENCE}`: the one instance named by "
+            "`recurrence_id`, cancelled by an exclusion written into the "
+            f"series, which is otherwise untouched. `{SCOPE_SERIES}`: the event "
+            "object itself, and so every instance of it."
+        )
+    )
+    recurrence_id: str | None = Field(
+        default=None,
+        description=(
+            "Which instance was cancelled, as an ISO 8601 timestamp, or null "
+            "when the event itself was deleted."
+        ),
+    )
+    href: str = Field(
+        description=(
+            "CalDAV URL of the object this call acted on. For `scope: series` "
+            "it is the address the delete was sent to."
+        )
+    )
+    calendar_url: str = Field(
+        description="The calendar it was in, as that calendar's listing gives it."
+    )
+    calendar_name: str = Field(description="Display name of that calendar.")
+    etag: str | None = Field(
+        default=None,
+        description=(
+            "Version of the object now, for use as a precondition next time. "
+            "After a cancellation this is the new one -- the ETag passed in is "
+            "no longer valid. Always null for `scope: series`, where the object "
+            "no longer exists; see `etag_note`, and never a value invented here."
+        ),
+    )
+    etag_note: str | None = Field(
+        default=None,
+        description="Why `etag` is null, or null when an ETag was returned.",
+    )
+    precondition_note: str | None = Field(
+        default=None,
+        description=(
+            "For `scope: series` only: what the ETag check was worth. This "
+            "server ignores `If-Match` on a delete, so the check is a "
+            "comparison made immediately beforehand rather than a precondition "
+            "the server enforced. Null for a cancellation, which is an ordinary "
+            "conditional write and is genuinely protected."
+        ),
+    )
+    occurrences_remaining: bool | None = Field(
+        default=None,
+        description=(
+            "For `scope: occurrence`: whether the series still has any "
+            "occurrence left after this one was cancelled. False means the "
+            "object is still on the calendar holding a series that never "
+            "happens again -- see `series_note`. Null for `scope: series`, "
+            "which has nothing left to have occurrences, and null when the "
+            "question could not be answered -- an endless rule whose every "
+            "instance is cancelled is not walked forever. Null is never "
+            "\"none left\": `series_note` says which of the two it is."
+        ),
+    )
+    series_note: str | None = Field(
+        default=None,
+        description=(
+            "What became of the series the cancelled instance belonged to, in "
+            "words. Null when the event itself was deleted."
+        ),
+    )
+    confirmed: bool = Field(
+        description=(
+            "True when the outcome was verified by reading the event back: for "
+            "an instance, that it is cancelled; for a series, that the object "
+            "is gone. Also true when nothing was sent because the instance was "
+            "already cancelled: there the evidence is the read taken before, "
+            "and `confirmation_note` says so rather than claiming a readback. "
+            "False means it could not be verified, which is NOT the same as "
+            "its having failed -- `confirmation_note` says what was seen."
+        )
+    )
+    confirmation_note: str | None = Field(
+        default=None,
+        description=(
+            "How the outcome was confirmed, or why it could not be. Never null."
+        ),
+    )
+    stored: StoredEvent | None = Field(
+        default=None,
+        description=(
+            "The series as the server holds it now -- the series, not the "
+            "instance that was cancelled -- so a caller can see the rest of it "
+            "survived. Read back after the write; when the instance was "
+            "already cancelled and nothing was sent, it is the read that "
+            "established that. Null for `scope: series`, where there is "
+            "nothing left to read, and null when the read failed."
+        ),
+    )
+
+
+def build_calendar_event_delete(
+    client_provider: ClientProvider,
+) -> Callable[..., Awaitable[EventDeleted]]:
+    """Bind ``calendar_event_delete`` to a source of clients."""
+
+    async def calendar_event_delete(
+        uid: Annotated[
+            str,
+            Field(
+                description=(
+                    "Identifier of the event to remove, as "
+                    "`calendar_events_list` or `calendar_event_get` returned "
+                    "it. There is no deletion by title or by time: this "
+                    "server's UID search returns the whole calendar, so a "
+                    "lookup by anything else could delete the wrong meeting."
+                )
+            ),
+        ],
+        scope: Annotated[
+            str,
+            Field(
+                description=(
+                    f"What to remove. `{SCOPE_OCCURRENCE}` cancels the one "
+                    "instance named by `recurrence_id` and leaves the rest of "
+                    f"the series alone; `{SCOPE_SERIES}` deletes the event "
+                    "itself, and so every instance of it -- and is also what a "
+                    "one-off event takes. Required, with no default: the two "
+                    "are not recoverable from each other and one of them is "
+                    "irreversible."
+                )
+            ),
+        ],
+        etag: Annotated[
+            str,
+            Field(
+                description=(
+                    "The `etag` of the event as you last read it, from "
+                    "`calendar_event_get`. Required for both scopes. Cancelling "
+                    "an instance sends it as a precondition, which this server "
+                    "honours. Deleting a series compares it against the stored "
+                    "version immediately before removing the object, because "
+                    "this server ignores `If-Match` on a delete -- a narrower "
+                    "window, not a guarantee."
+                )
+            ),
+        ],
+        recurrence_id: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Which instance to cancel, as `calendar_events_list` "
+                    f"returned it. Required with `scope: {SCOPE_OCCURRENCE}`, "
+                    f"and refused with `scope: {SCOPE_SERIES}`, which would "
+                    "contradict it."
+                ),
+            ),
+        ] = None,
+        calendar_url: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Restrict the lookup to one calendar, by the URL "
+                    "`calendar_list` or `calendar_events_list` returned. Omit "
+                    "to search every calendar on the account -- all of them, "
+                    "not up to the first hit: a UID that is in more than one "
+                    "is refused and names them, rather than being removed from "
+                    "whichever calendar happens to be listed first. This "
+                    "selects where the event is looked for; it never decides "
+                    "what is removed."
+                ),
+            ),
+        ] = None,
+    ) -> EventDeleted:
+        """Cancel one instance of an event, or delete the event itself.
+
+        This is destructive, and `scope: series` is the least recoverable thing
+        this server can do: the object is removed and there is no undelete.
+
+        `scope` is required and has no default. `occurrence` cancels the one
+        instance named by `recurrence_id`: an exclusion is written into the
+        series, the series and every other instance are left exactly as they
+        are, and if that instance had been moved, the entry holding its own
+        values is removed in the same write -- an exclusion beside such an entry
+        is a contradiction different calendars resolve differently. `series`
+        deletes the event object, and every instance of it goes with it. On a
+        calendar where most meetings recur the two are different acts, one of
+        them destroys a year of history, and neither is guessed.
+
+        `etag` is required, and is worth different things on the two paths.
+        Cancelling an instance is an ordinary conditional write and this server
+        honours the precondition: a change somebody else made in between is
+        refused and nothing is written. **A deletion cannot be made conditional
+        on this server** -- measured, a delete carrying a stale ETag was
+        answered as success and removed the object anyway. So the ETag is
+        compared against the stored version immediately before the delete
+        instead. That narrows the window between your read and the removal; it
+        does not close it -- it is a check and not a guarantee -- and this tool
+        will not pretend otherwise.
+
+        Ask the operator first before deleting every event in a calendar, or a
+        calendar itself -- neither of which this tool does -- and before
+        deleting anything you have not read: a title or a time is a search, and
+        this server's search returns the whole calendar.
+
+        Nothing beyond what you name is removed: not another instance, not
+        another component, not another event that happens to share the object
+        -- an object holding a second event is refused outright with
+        `scope: series`, because a delete removes the object and would take
+        that event too. A UID found in more than one calendar is refused the
+        same way: pass `calendar_url` to say which one you mean.
+        What the answer reports is read back from the server afterwards -- for
+        an instance, that it is cancelled and the others survived; for a series,
+        that the object is gone. When cancelling leaves a series with no
+        occurrences at all, the answer says so and says the object is still
+        there: this server does not remove one as a side effect.
+        """
+        wanted_uid = _checked_uid(uid)
+        wanted_scope = checked_delete_scope(scope)
+        instance = _checked_recurrence_id(recurrence_id)
+        check_instance_matches_scope(wanted_scope, instance)
+        precondition = checked_delete_etag(etag, scope=wanted_scope)
+        wanted_calendar = checked_calendar_url(calendar_url)
+
+        client = await client_provider()
+        removed = await client.delete_event(
+            uid=wanted_uid,
+            scope=wanted_scope,
+            etag=precondition,
+            recurrence_id=instance,
+            calendar_url=wanted_calendar,
+        )
+
+        return EventDeleted(
+            deleted=removed.deleted,
+            already_gone=removed.already_gone,
+            delete_note=_delete_note(removed),
+            uid=removed.uid,
+            scope=removed.scope,
+            recurrence_id=(
+                format_instant(removed.recurrence_id)
+                if removed.recurrence_id is not None
+                else None
+            ),
+            href=removed.href,
+            calendar_url=removed.calendar_url,
+            calendar_name=removed.calendar_name,
+            etag=removed.etag,
+            etag_note=_delete_etag_note(removed),
+            precondition_note=_precondition_note(removed),
+            occurrences_remaining=removed.occurrences_remaining,
+            series_note=_series_note(removed),
+            confirmed=removed.confirmed,
+            confirmation_note=_confirmation_note(removed),
+            stored=_to_stored(removed.record) if removed.record is not None else None,
+        )
+
+    calendar_event_delete.__name__ = DELETE_TOOL_NAME
+    return calendar_event_delete
+
+
+def _delete_note(removed: DeletedEvent) -> str:
+    """What happened, in the words a caller reads first.
+
+    The unconfirmed case comes before the removed one on purpose. A caller
+    reads this sentence and stops; telling them the event was deleted when
+    nothing was seen to confirm it is the one thing this tool must not say.
+    """
+    if removed.scope == SCOPE_SERIES:
+        return DELETED_NOTE if removed.confirmed else DELETE_UNCONFIRMED_NOTE
+    if removed.already_gone:
+        return ALREADY_GONE_NOTE
+    if not removed.confirmed:
+        return CANCELLED_UNCONFIRMED_NOTE
+    if not removed.exclusion_added:
+        # The exclusion was already there; the write removed the entry that
+        # contradicted it. Reporting that as a cancellation would describe an
+        # act nobody performed.
+        return REPAIRED_CONTRADICTION_NOTE
+    return CANCELLED_WITH_OVERRIDE_NOTE if removed.override_removed else CANCELLED_NOTE
+
+
+def _delete_etag_note(removed: DeletedEvent) -> str | None:
+    """Why there is no ETag, or nothing when there is one.
+
+    The failed readback is asked about first: it is the reason the ETag is
+    missing whenever it happened, and the alternatives -- "the server supplied
+    none" and "the property could not be read" -- are both statements about a
+    read that did not get that far.
+    """
+    if removed.etag:
+        return None
+    if removed.scope == SCOPE_SERIES:
+        return DELETED_ETAG_NOTE
+    if removed.confirmation_error:
+        return UPDATE_ETAG_AFTER_FAILED_READBACK_NOTE
+    if removed.record is None or removed.etag_unreadable:
+        return UPDATE_ETAG_UNREADABLE_NOTE
+    return NO_ETAG_NOTE
+
+
+def _precondition_note(removed: DeletedEvent) -> str | None:
+    """What the ETag check was worth on a path the server does not protect."""
+    if removed.scope != SCOPE_SERIES:
+        return None
+    return (
+        DELETE_PRECONDITION_NOTE
+        if removed.precondition_rechecked
+        else DELETE_UNCHECKED_NOTE
+    )
+
+
+def _series_note(removed: DeletedEvent) -> str | None:
+    """What became of the series a cancelled instance belonged to."""
+    if removed.scope == SCOPE_SERIES:
+        return None
+    if removed.occurrences_remaining is None:
+        # Not silence: "we did not find out" is a different answer from "there
+        # are none left", and the caller has to be able to tell them apart.
+        return SERIES_UNDECIDED_NOTE
+    return SERIES_REMAINS_NOTE if removed.occurrences_remaining else SERIES_EMPTY_NOTE
+
+
+def _confirmation_note(removed: DeletedEvent) -> str:
+    """How the outcome was established, or why it could not be.
+
+    Four different things, and the wording of each names the evidence it
+    actually has -- a readback after the write, a read taken before one that
+    was never sent, a confirmed cancellation whose follow-up reads failed, or
+    nothing.
+    """
+    if removed.already_gone:
+        return ALREADY_GONE_CONFIRMED_NOTE
+    if removed.confirmed and removed.confirmation_error:
+        return CONFIRMED_BUT_SERIES_UNREAD_NOTE.format(
+            reason=removed.confirmation_error
+        )
+    if removed.confirmed:
+        return CONFIRMED_NOTE
+    return NOT_CONFIRMED_NOTE.format(
+        reason=removed.confirmation_error or "the reason was not reported"
+    )

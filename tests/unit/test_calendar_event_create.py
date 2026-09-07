@@ -599,6 +599,29 @@ def test_a_forbidden_status_on_the_write_is_not_read_as_success(monkeypatch):
         create()
 
 
+def test_a_calendar_that_refuses_the_write_says_what_to_do_about_it(monkeypatch):
+    """A refusal a caller can act on names the next step, not just the diagnosis.
+
+    "A calendar this account owns is one from `calendar_list`" is a definition;
+    the caller still has to work out that they should create the event in one.
+    """
+    calendar = FakeCalendar("Personal", PERSONAL)
+    install_fake_dav_client(
+        monkeypatch,
+        calendars=[calendar],
+        puts=[],
+        put_raises=caldav_error.AuthorizationError(url=PERSONAL, reason="Forbidden"),
+    )
+
+    with pytest.raises(PolicyError) as caught:
+        create()
+
+    message = str(caught.value)
+    assert "Nothing was created." in message
+    assert "Create the event in a calendar this account owns" in message
+    assert "`calendar_list`" in message
+
+
 def test_a_not_found_on_the_write_does_not_deny_a_calendar_that_is_listed(monkeypatch):
     """This path is reached only *after* the URL matched the principal's listing.
 

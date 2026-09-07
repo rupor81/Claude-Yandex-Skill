@@ -436,10 +436,15 @@ def test_creating_a_real_event_reports_what_the_server_stored_and_leaves_no_trac
     with _dav_client() as client:
         client.principal().make_calendar(name=scratch_name)
 
-    scratch_url = _real_url_of(scratch_name)
-    assert scratch_url, "the throwaway calendar was created but is not in the listing"
-
+    # The `try` opens the moment the calendar exists, and everything else --
+    # including the assertion that the listing knows about it -- happens inside
+    # it. An assertion between the two would fire on the operator's real
+    # account and leave a calendar behind on the way out.
     try:
+        scratch_url = _real_url_of(scratch_name)
+        assert scratch_url, (
+            "the throwaway calendar was created but is not in the listing"
+        )
         # On a whole minute: measured, this server stores an event to the
         # minute and drops the seconds, and the sub-minute case is asserted
         # deliberately further down rather than tripped over here.
@@ -599,10 +604,15 @@ def test_changing_a_real_series_and_one_real_instance_of_it():
     with _dav_client() as client:
         client.principal().make_calendar(name=scratch_name)
 
-    scratch_url = _real_url_of(scratch_name)
-    assert scratch_url, "the throwaway calendar was created but is not in the listing"
-
+    # The `try` opens the moment the calendar exists, and everything else --
+    # including the assertion that the listing knows about it -- happens inside
+    # it. An assertion between the two would fire on the operator's real
+    # account and leave a calendar behind on the way out.
     try:
+        scratch_url = _real_url_of(scratch_name)
+        assert scratch_url, (
+            "the throwaway calendar was created but is not in the listing"
+        )
         first = (
             datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
             + timedelta(days=1)
@@ -731,6 +741,174 @@ def test_changing_a_real_series_and_one_real_instance_of_it():
         )
         assert nothing.changed is False
         assert nothing.etag == after_refusal.etag
+    finally:
+        target = _real_url_of(scratch_name)
+        if target is not None:
+            with _dav_client() as client:
+                client.calendar(url=target).delete()
+
+    after = _listed_calendars()
+    assert scratch_name not in [name for name, _ in after], (
+        "the throwaway calendar is still on the account"
+    )
+    assert sorted(after) == sorted(before), (
+        "the account's calendars are not what they were before this test"
+    )
+
+
+# -- removing a real event, under a real scope ----------------------------
+#
+# One test, in one throwaway calendar, doing the whole story: a real recurring
+# series, one instance cancelled, the others confirmed still there, a stale
+# precondition refused, and then the series itself removed and confirmed gone.
+#
+# It is one test rather than five because the whole live suite shares one
+# rate-limit budget and each of those would otherwise pay again for the same
+# setup. The series is written directly through `caldav`: `calendar_event_create`
+# creates one-off events only, and a recurring one is what this story is about.
+
+LIVE_DELETE_SERIES_UID = "yandex-mcp-live-delete-series"
+
+
+def _live_delete_series_document(start):
+    end = start + timedelta(minutes=30)
+    stamp = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def moment(value):
+        return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    return (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//yandex-mcp//live-test//EN\r\n"
+        "BEGIN:VEVENT\r\n"
+        f"UID:{LIVE_DELETE_SERIES_UID}\r\n"
+        "SUMMARY:yandex-mcp live delete series\r\n"
+        f"DTSTAMP:{moment(stamp)}\r\n"
+        f"DTSTART:{moment(start)}\r\n"
+        f"DTEND:{moment(end)}\r\n"
+        "RRULE:FREQ=DAILY;COUNT=3\r\n"
+        "SEQUENCE:0\r\nTRANSP:OPAQUE\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+
+
+def test_cancelling_one_real_instance_and_then_removing_the_real_series():
+    """The whole of story 1.8 against the real account, inside its own calendar."""
+    import uuid
+
+    from yandex_calendar_mcp.tools.events import build_calendar_event_delete
+    from yandex_core.errors import Conflict
+
+    before = _listed_calendars()
+    scratch_name = f"yandex-mcp-live-{uuid.uuid4().hex[:8]}"
+
+    with _dav_client() as client:
+        client.principal().make_calendar(name=scratch_name)
+
+    # The `try` opens the moment the calendar exists, and everything else --
+    # including the assertion that the listing knows about it -- happens inside
+    # it. An assertion between the two would fire on the operator's real
+    # account and leave a calendar behind on the way out.
+    try:
+        scratch_url = _real_url_of(scratch_name)
+        assert scratch_url, (
+            "the throwaway calendar was created but is not in the listing"
+        )
+        first = (
+            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            + timedelta(days=1)
+        )
+        with _dav_client() as client:
+            client.calendar(url=scratch_url).save_event(
+                _live_delete_series_document(first)
+            )
+
+        remove = build_calendar_event_delete(_provider())
+        get = build_calendar_event_get(_provider())
+
+        original = anyio.run(
+            lambda: get(uid=LIVE_DELETE_SERIES_UID, calendar_url=scratch_url)
+        )
+        assert original.is_series, "the series was not stored as a series"
+        assert original.etag, "no ETag, so no removal can be checked at all"
+
+        # The middle instance, so an assertion about "the others" has something
+        # on both sides of it.
+        instance = first + timedelta(days=1)
+        cancelled = anyio.run(
+            lambda: remove(
+                uid=LIVE_DELETE_SERIES_UID,
+                scope=SCOPE_OCCURRENCE,
+                etag=original.etag,
+                recurrence_id=instance.isoformat(),
+                calendar_url=scratch_url,
+            )
+        )
+        assert cancelled.deleted is True
+        assert cancelled.already_gone is False
+        assert cancelled.confirmed is True, cancelled.confirmation_note
+        assert cancelled.occurrences_remaining is True
+        assert cancelled.etag and cancelled.etag != original.etag, (
+            "the ETag reported after a write is the one from before it"
+        )
+
+        # The others kept their times. Asserted by expanding the real series,
+        # which is the only thing that could show the opposite.
+        expanded = anyio.run(
+            lambda: build_calendar_events_list(_provider())(
+                start=first - timedelta(hours=1),
+                end=first + timedelta(days=4),
+                calendar_url=scratch_url,
+                limit=50,
+            )
+        )
+        starts = sorted(
+            _as_moment(item.start)
+            for item in expanded.items
+            if item.uid == LIVE_DELETE_SERIES_UID
+        )
+        assert starts == [first, first + timedelta(days=2)], (
+            "cancelling one instance did not leave exactly the other two"
+        )
+
+        # A precondition that no longer holds: refused, and the event still there.
+        with pytest.raises(Conflict):
+            anyio.run(
+                lambda: remove(
+                    uid=LIVE_DELETE_SERIES_UID,
+                    scope=SCOPE_SERIES,
+                    etag=original.etag,
+                    calendar_url=scratch_url,
+                )
+            )
+        still_there = anyio.run(
+            lambda: get(uid=LIVE_DELETE_SERIES_UID, calendar_url=scratch_url)
+        )
+        assert still_there.uid == LIVE_DELETE_SERIES_UID, (
+            "a delete went through on a stale ETag"
+        )
+
+        # And now the series itself, with the version that is current.
+        removed = anyio.run(
+            lambda: remove(
+                uid=LIVE_DELETE_SERIES_UID,
+                scope=SCOPE_SERIES,
+                etag=still_there.etag,
+                calendar_url=scratch_url,
+            )
+        )
+        assert removed.deleted is True
+        assert removed.confirmed is True, removed.confirmation_note
+        assert removed.etag is None
+        assert removed.precondition_note, (
+            "a delete this server does not protect said nothing about it"
+        )
+
+        # Confirmed independently, through the read path rather than the
+        # delete's own answer.
+        with pytest.raises(NotFound):
+            anyio.run(
+                lambda: get(uid=LIVE_DELETE_SERIES_UID, calendar_url=scratch_url)
+            )
     finally:
         target = _real_url_of(scratch_name)
         if target is not None:
