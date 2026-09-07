@@ -20,6 +20,7 @@ from .tools.calendars import build_calendar_list
 from .tools.events import (
     build_calendar_event_create,
     build_calendar_event_get,
+    build_calendar_event_update,
     build_calendar_events_list,
 )
 from .tools.freebusy import build_calendar_freebusy_query
@@ -29,15 +30,28 @@ __all__ = ["SERVICE", "build_calendar_server", "main"]
 SERVICE = "calendar"
 
 INSTRUCTIONS = (
-    "Read a Yandex calendar over CalDAV, and create one-off events in it. Four "
-    "of its five tools are read-only: they list the calendars on the configured "
+    "Read a Yandex calendar over CalDAV, create one-off events in it, and "
+    "change events that are already there. Four of its six tools are "
+    "read-only: they list the calendars on the configured "
     "account, the event occurrences in a date range, one event in full by its "
-    "UID, and the merged intervals of time the account is busy. The fifth, "
-    "`calendar_event_create`, writes: it adds one non-recurring event to a "
-    "calendar you name -- it invites nobody, and this server still cannot "
-    "change or delete anything that exists. Creating requires `calendar_url`: "
+    "UID, and the merged intervals of time the account is busy. "
+    "`calendar_event_create` writes: it adds one non-recurring event to a "
+    "calendar you name -- it invites nobody. "
+    "`calendar_event_update` is destructive: it overwrites values on an event "
+    "that exists. It requires `scope`, which has no default -- `occurrence` "
+    "changes the one instance named by `recurrence_id`, `series` changes the "
+    "event itself and so every instance of it -- and it requires the `etag` "
+    "you last read, which is sent as a precondition, so a change somebody else "
+    "made in between is refused rather than overwritten. A refused change is "
+    "never repeated with a fresh ETag: read the event again and decide whether "
+    "the change still applies. Only what you name is changed; everything else "
+    "on the event, including an instance of a series that already differs "
+    "from the rest, is left as it is. This server still cannot delete "
+    "anything. "
+    "Creating requires `calendar_url`: "
     "no calendar is chosen for you, because the account has several and the "
-    "server marks none of them as the default. What a create returns is what "
+    "server marks none of them as the default. What a create or a change "
+    "returns is what "
     "the server stored, read back afterwards, not what was asked for. Busy "
     "time is answered by `calendar_freebusy_query`, which "
     "returns time only and no meeting titles, and which reports a tentative or "
@@ -80,6 +94,7 @@ def build_calendar_server(profile: Profile | None = None):
     register_tool(server, build_calendar_event_get(client_provider))
     register_tool(server, build_calendar_freebusy_query(client_provider))
     register_tool(server, build_calendar_event_create(client_provider))
+    register_tool(server, build_calendar_event_update(client_provider))
     return server
 
 

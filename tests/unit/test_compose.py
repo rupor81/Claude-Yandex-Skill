@@ -246,3 +246,248 @@ def test_a_uid_is_safe_in_an_href():
     uid = new_uid()
     assert uid == uid.strip()
     assert not set(uid) - set("0123456789abcdef-")
+
+
+# -- editing a document the server already holds ---------------------------
+#
+# The other half of this module, and the dangerous one: a creation that goes
+# wrong leaves a bad event, a change that goes wrong destroys a good one.
+# Every fixture below is written out rather than composed, so what is asserted
+# is the editor's reading of a stored document and not its agreement with the
+# composer beside it.
+
+MASTER_WITH_ALARM = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\n"
+    "DTSTART:20260608T060000Z\r\nDTEND:20260608T063000Z\r\n"
+    "RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:20260612T060000Z\r\n"
+    "RDATE:20260613T060000Z\r\n"
+    "DTSTAMP:20260601T000000Z\r\nSEQUENCE:0\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Standup\r\n"
+    "TRIGGER:-PT10M\r\nEND:VALARM\r\n"
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+NINTH = datetime(2026, 6, 9, 6, 0, tzinfo=timezone.utc)
+
+
+def edited(ics, **kwargs):
+    from yandex_calendar_mcp.client.compose import apply_event_edit
+
+    call = dict(uid="standup", scope="series", recurrence_id=None)
+    call.update(kwargs)
+    return apply_event_edit(ics, **call)
+
+
+def components_of(document: str):
+    """The VEVENTs of a written document, parsed as a reader would."""
+    import icalendar
+
+    return list(icalendar.Calendar.from_ical(document).walk("VEVENT"))
+
+
+def override_in(document: str):
+    """The single derived override in a written document."""
+    overrides = [
+        component
+        for component in components_of(document)
+        if component.get("RECURRENCE-ID") is not None
+    ]
+    assert len(overrides) == 1, f"expected one override, got {len(overrides)}"
+    return overrides[0]
+
+
+def test_deriving_an_override_carries_the_reminder_the_series_gave_it(monkeypatch):
+    """Moving one meeting must not silently remove its alarm.
+
+    A VALARM is a subcomponent, not a property: an override copied property by
+    property has no reminder at all, and the caller who moved a standup is
+    never told the notification went with it.
+    """
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    result = edited(
+        MASTER_WITH_ALARM,
+        scope="occurrence",
+        recurrence_id=NINTH,
+        edit=EventEdit(
+            start=datetime(2026, 6, 9, 7, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 9, 7, 30, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result.changed is True
+    override = override_in(result.document)
+    alarms = list(override.walk("VALARM"))
+    assert len(alarms) == 1, "the moved instance lost its reminder"
+    assert str(alarms[0].get("TRIGGER").dt) == "-1 day, 23:50:00"
+    # And the series keeps its own.
+    assert result.document.count("BEGIN:VALARM") == 2
+
+
+def test_a_derived_override_is_not_a_second_series(monkeypatch):
+    """An override carrying the series' RRULE is a whole second recurrence.
+
+    Counted rather than looked for: the master satisfies a `RRULE:` substring
+    on its own, so presence proves nothing about the component beside it.
+    """
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    result = edited(
+        MASTER_WITH_ALARM,
+        scope="occurrence",
+        recurrence_id=NINTH,
+        edit=EventEdit(
+            start=datetime(2026, 6, 9, 7, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 9, 7, 30, tzinfo=timezone.utc),
+        ),
+    )
+
+    document = result.document
+    assert document.count("RRULE") == 1, "the override duplicated the recurrence"
+    assert document.count("EXDATE") == 1, "the override carried the series' EXDATE"
+    assert document.count("RDATE") == 1, "the override carried the series' RDATE"
+    override = override_in(document)
+    for name in ("RRULE", "EXDATE", "RDATE"):
+        assert override.get(name) is None, f"the override carries {name}"
+
+
+DURATION_MASTER = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:sprint-sync\r\nSUMMARY:Sprint sync\r\n"
+    "DTSTART:20260608T060000Z\r\nDURATION:PT45M\r\n"
+    "DTSTAMP:20260601T000000Z\r\nSEQUENCE:0\r\n"
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+
+def test_moving_an_event_timed_by_duration_leaves_only_one_answer_for_its_end():
+    """Yandex writes DURATION. A moved event carrying DTEND *and* DURATION lets
+    two readers disagree about when the meeting finishes."""
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    result = edited(
+        DURATION_MASTER,
+        uid="sprint-sync",
+        edit=EventEdit(
+            start=datetime(2026, 6, 8, 8, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result.changed is True
+    assert "DURATION" not in result.document, "the event states its length twice"
+    assert "DTEND:20260608T090000Z" in result.document
+
+
+ONE_OFF_WITH_LOCATION = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:design-review\r\nSUMMARY:Design review\r\n"
+    "LOCATION:Room 4\r\nDESCRIPTION:Bring the sketches\r\n"
+    "X-YANDEX-THING:keep-me\r\n"
+    "DTSTART:20260608T060000Z\r\nDTEND:20260608T070000Z\r\n"
+    "DTSTAMP:20260601T000000Z\r\nLAST-MODIFIED:20260601T000000Z\r\nSEQUENCE:0\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Design review\r\n"
+    "TRIGGER:-PT15M\r\nEND:VALARM\r\n"
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+
+def test_clearing_a_field_removes_it_rather_than_storing_the_word_none():
+    """`None` is documented as "it has none", and this layer is usable from a
+    plain script. Writing the literal string is the one outcome nobody meant."""
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    result = edited(
+        ONE_OFF_WITH_LOCATION,
+        uid="design-review",
+        edit=EventEdit(location=None),
+    )
+
+    assert result.changed is True
+    assert "LOCATION:None" not in result.document
+    assert "LOCATION" not in result.document
+    assert result.sent["location"] is None
+
+
+TWO_MASTERS = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n"
+    "BEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\n"
+    "DTSTART:20260608T060000Z\r\nDTEND:20260608T063000Z\r\n"
+    "DTSTAMP:20260601T000000Z\r\nSEQUENCE:0\r\nEND:VEVENT\r\n"
+    "BEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup elsewhere\r\n"
+    "DTSTART:20260609T060000Z\r\nDTEND:20260609T063000Z\r\n"
+    "DTSTAMP:20260601T000000Z\r\nSEQUENCE:0\r\nEND:VEVENT\r\n"
+    "END:VCALENDAR\r\n"
+)
+
+
+def test_two_definitions_of_one_event_are_refused_rather_than_half_changed():
+    """Editing the first and reporting the whole event as changed is a lie the
+    caller has no way to detect."""
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    with pytest.raises(ProtocolError) as caught:
+        edited(TWO_MASTERS, edit=EventEdit(summary="Daily standup"))
+
+    message = str(caught.value)
+    assert "standup" in message
+    assert "nothing was written" in message.lower()
+
+
+@pytest.mark.parametrize(
+    "value", ["2026-06-08T09:00:00+03:00", None, 20260608, object()]
+)
+def test_a_boundary_that_is_not_a_date_is_refused_as_a_protocol_error(value):
+    """A caller of this layer gets the documented refusal, not an AttributeError
+    from three frames down."""
+    from yandex_calendar_mcp.client.compose import EventEdit, check_event_edit
+
+    with pytest.raises(ProtocolError):
+        check_event_edit(EventEdit(start=value, end=value))
+
+
+def test_the_round_trip_through_the_parser_keeps_what_it_does_not_understand():
+    """The whole stored document is re-serialised on every edit. An unknown
+    X- property and a VALARM are exactly what a lossy round trip drops."""
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    result = edited(
+        ONE_OFF_WITH_LOCATION,
+        uid="design-review",
+        edit=EventEdit(summary="Design review II"),
+    )
+
+    assert "X-YANDEX-THING:keep-me" in result.document
+    assert "BEGIN:VALARM" in result.document
+    assert "TRIGGER:-PT15M" in result.document
+    assert "DESCRIPTION:Bring the sketches" in result.document
+
+
+def test_the_revision_stamp_can_be_pinned_and_moves_forward():
+    """Without a clock the caller can pin, every written body differs from the
+    last and nothing can assert that LAST-MODIFIED actually advanced."""
+    from yandex_calendar_mcp.client.compose import EventEdit
+
+    result = edited(
+        ONE_OFF_WITH_LOCATION,
+        uid="design-review",
+        edit=EventEdit(summary="Design review II"),
+        now=datetime(2026, 6, 2, 12, 30, 15, 987654, tzinfo=timezone.utc),
+    )
+
+    lines_written = lines(result.document)
+    assert "LAST-MODIFIED:20260602T123015Z" in lines_written
+    assert "DTSTAMP:20260602T123015Z" in lines_written
+    assert "LAST-MODIFIED:20260601T000000Z" not in lines_written
+    assert "SEQUENCE:1" in lines_written
+
+
+def test_the_two_spellings_of_a_scope_are_the_same_two_words():
+    """`compose.py` spells them so it needs nothing from the reader; nothing
+    made the two agree, and a change to one would silently split the tool's
+    vocabulary from the client's."""
+    from yandex_calendar_mcp.client import compose, recurrence
+
+    assert compose.SCOPE_SERIES == recurrence.SCOPE_SERIES
+    assert compose.SCOPE_OCCURRENCE == recurrence.SCOPE_OCCURRENCE

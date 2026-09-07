@@ -34,7 +34,15 @@ from yandex_core.errors import ProtocolError
 from yandex_core.paging import checked_limit, encode_position_cursor
 from yandex_core.results import Page
 
-from ..client.caldav_client import CalDAVCalendarClient, CreatedEvent
+from ..client.caldav_client import (
+    CalDAVCalendarClient,
+    CreatedEvent,
+    UpdatedEvent,
+    check_instance_matches_scope,
+    checked_etag,
+    checked_scope,
+)
+from ..client.compose import UNCHANGED, EventEdit, check_event_edit
 from ..client.recurrence import (
     SCOPE_OCCURRENCE,
     SCOPE_SERIES,
@@ -86,6 +94,9 @@ __all__ = [
     "StoredEvent",
     "EventCreated",
     "build_calendar_event_create",
+    "UPDATE_TOOL_NAME",
+    "EventUpdated",
+    "build_calendar_event_update",
     "MORE_PAGES",
     "RANGE_TRUNCATED",
     "UNREADABLE_DATA",
@@ -1419,3 +1430,450 @@ def _as_moment(value: date | datetime) -> datetime:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc)
     return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+
+# -- changing one event ---------------------------------------------------
+
+
+UPDATE_TOOL_NAME = "calendar_event_update"
+
+#: What the answer says when every named value was already what is stored.
+NO_OP_NOTE = (
+    "No write was sent: every value named was already what the server holds, so "
+    "there was nothing to change. `stored` is the event as it stands, and "
+    "`etag` is still the one that was passed in. A write storing the same "
+    "values would still bump the object's version and refuse the next "
+    "precondition for a change that never happened."
+)
+
+CHANGED_NOTE = (
+    "The change was written and the server accepted it; `stored` is what it "
+    "holds now, read back afterwards."
+)
+
+#: What the answer says when the event was changed but could not be re-read.
+UPDATE_READBACK_FAILED_NOTE = (
+    "The change WAS applied -- the server accepted the write -- but the event "
+    "could not be read back, so this answer carries no stored values: {reason}. "
+    "Do not repeat the change; read the event with `calendar_event_get` using "
+    "the `uid` above."
+)
+
+#: What the answer says about an ETag on a changed object that was not read.
+UPDATE_ETAG_UNREADABLE_NOTE = (
+    "The changed object's new ETag could not be read, so `etag` is null and "
+    "nothing was invented in its place. The old one is no longer valid as a "
+    "precondition. Read the event with `calendar_event_get` to obtain the "
+    "current ETag before changing it again."
+)
+
+
+class EventUpdated(BaseModel):
+    """One event as it stands after a change was asked for."""
+
+    changed: bool = Field(
+        description=(
+            "True when a write was sent and the server accepted it. False when "
+            "every value named was already what the server holds: that is a "
+            "no-op, not a failure, and no write was sent -- `change_note` says "
+            "so. A change that was attempted and did not happen is an error, "
+            "never this model."
+        )
+    )
+    change_note: str = Field(
+        description="What happened, in words: a write, or nothing to write."
+    )
+    uid: str = Field(description="Identifier of the event that was changed.")
+    scope: str = Field(
+        description=(
+            f"What was changed. `{SCOPE_OCCURRENCE}`: the one instance named by "
+            f"`recurrence_id`, with the rest of the series untouched. "
+            f"`{SCOPE_SERIES}`: the event itself, and so every instance of it."
+        )
+    )
+    recurrence_id: str | None = Field(
+        default=None,
+        description=(
+            "Which instance was changed, as an ISO 8601 timestamp, or null when "
+            "the series itself was."
+        ),
+    )
+    href: str = Field(
+        description="CalDAV URL of the object that holds the event."
+    )
+    calendar_url: str = Field(
+        description="The calendar it lives in, as that calendar's listing gives it."
+    )
+    calendar_name: str = Field(description="Display name of that calendar.")
+    etag: str | None = Field(
+        description=(
+            "Version of the object now, for use as a precondition next time. "
+            "After a write this is the new one -- the ETag passed in is no "
+            "longer valid. Null when the server supplied none or it could not "
+            "be read; see `etag_note`, and never a value invented here."
+        )
+    )
+    etag_note: str | None = Field(
+        default=None,
+        description="Why `etag` is null, or null when an ETag was returned.",
+    )
+    sent: dict[str, str | None] = Field(
+        default_factory=dict,
+        description=(
+            "The values that were written, as they were written -- one entry "
+            "per field named in the request, and nothing else. Timestamps are "
+            "in UTC, which is the spelling iCalendar uses; an all-day boundary "
+            "stays a plain date, and a cleared field is null. This is what the "
+            "change did, and it is the only record of it when the readback "
+            "failed and `stored` is null."
+        ),
+    )
+    stored: StoredEvent | None = Field(
+        default=None,
+        description=(
+            "What the server holds, read back after the write. Null only when "
+            "the readback failed, which does not mean the write did: see "
+            "`stored_note`."
+        ),
+    )
+    stored_note: str | None = Field(
+        default=None,
+        description=(
+            "Why `stored` is null, or null when it was read. The change "
+            "happened either way -- this says only that the result could not be "
+            "confirmed."
+        ),
+    )
+    differs_from_request: bool = Field(
+        description=(
+            "True when at least one value the server stored is not the value "
+            "that was asked for. Only the fields named in the request are "
+            "compared; nothing else was meant to change. False also when there "
+            "was nothing to compare -- `difference_note` says which."
+        )
+    )
+    differences: list[str] = Field(
+        default_factory=list,
+        description=(
+            "One line per named value the server stored differently, naming the "
+            "field, what was asked for and what is there."
+        ),
+    )
+    difference_note: str | None = Field(
+        default=None,
+        description=(
+            "What the comparison established, in words: that the stored values "
+            "match the request, that they differ, or that they could not be "
+            "compared at all."
+        ),
+    )
+
+
+def build_calendar_event_update(
+    client_provider: ClientProvider,
+) -> Callable[..., Awaitable[EventUpdated]]:
+    """Bind ``calendar_event_update`` to a source of clients."""
+
+    async def calendar_event_update(
+        uid: Annotated[
+            str,
+            Field(
+                description=(
+                    "Identifier of the event to change, as "
+                    "`calendar_events_list` or `calendar_event_get` returned it."
+                )
+            ),
+        ],
+        scope: Annotated[
+            str,
+            Field(
+                description=(
+                    f"Which change is meant. `{SCOPE_OCCURRENCE}` changes the "
+                    "one instance named by `recurrence_id` and leaves the rest "
+                    f"of the series alone; `{SCOPE_SERIES}` changes the event "
+                    "itself, and so every instance of it -- and is also what a "
+                    "one-off event takes. Required, with no default: on a "
+                    "calendar where most meetings recur the two are genuinely "
+                    "different changes, and they are not recoverable from each "
+                    "other."
+                )
+            ),
+        ],
+        etag: Annotated[
+            str,
+            Field(
+                description=(
+                    "The `etag` of the event as you last read it, from "
+                    "`calendar_event_get`. Required: it is sent as a "
+                    "precondition, so a change somebody else made in between is "
+                    "refused rather than overwritten. If it is refused, read the "
+                    "event again -- never retry with a fresh ETag without "
+                    "looking at what changed."
+                )
+            ),
+        ],
+        recurrence_id: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Which instance to change, as `calendar_events_list` "
+                    f"returned it. Required with `scope: {SCOPE_OCCURRENCE}`, "
+                    f"and refused with `scope: {SCOPE_SERIES}`, which would "
+                    "contradict it."
+                ),
+            ),
+        ] = None,
+        calendar_url: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Restrict the lookup to one calendar, by the URL "
+                    "`calendar_list` or `calendar_events_list` returned. Omit to "
+                    "try every calendar until the event is found. This selects "
+                    "where the event is looked for; it never moves it."
+                ),
+            ),
+        ] = None,
+        summary: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "New title. Omit to leave it alone; a blank string is "
+                    f"refused. At most {MAX_SUMMARY_CHARS} characters."
+                ),
+            ),
+        ] = None,
+        start: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "New start, ISO 8601 with an explicit offset, or a plain "
+                    "date for an all-day event. Must be given together with "
+                    "`end`: moving one end alone would stretch or invert the "
+                    "event, and which was meant is a guess."
+                ),
+            ),
+        ] = None,
+        end: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "New end, exclusive, in the same form as `start`, and given "
+                    "together with it -- pass it unchanged if only the start is "
+                    "moving."
+                ),
+            ),
+        ] = None,
+        description: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "New invitation body. Omit to leave it alone; a blank string "
+                    f"is refused. At most {MAX_DESCRIPTION_INPUT_CHARS} "
+                    "characters."
+                ),
+            ),
+        ] = None,
+        location: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "New location. Omit to leave it alone; a blank string is "
+                    f"refused. At most {MAX_LOCATION_CHARS} characters."
+                ),
+            ),
+        ] = None,
+    ) -> EventUpdated:
+        """Change an event, or one instance of it, under an explicit scope.
+
+        This is destructive: it overwrites values that are already there.
+
+        `scope` is required and has no default. `occurrence` changes the one
+        instance named by `recurrence_id`; `series` changes the event itself and
+        so every instance of it, and is also what a one-off event takes. On a
+        calendar where most meetings recur, "change this meeting" means two
+        different things, one of them affects everyone else in the series, and
+        the two are not recoverable from each other -- so neither is guessed.
+
+        `etag` is required and is sent as a precondition. A change somebody else
+        made since you read the event is refused, and nothing is written; read
+        the event again and decide whether your change still applies. Never
+        repeat a refused change with a fresh ETag without looking -- that is the
+        overwrite the precondition just prevented.
+
+        One race the precondition does not close, measured on this server: it
+        does not evaluate `If-Match` for an object that no longer exists. An
+        event **deleted** between your read and this write is therefore created
+        again from the values you sent -- resurrected, not refused -- and the
+        answer reports an ordinary change. If it matters that the meeting is
+        still there, read it with `calendar_event_get` immediately before
+        changing it; nothing this tool can send makes the server refuse.
+
+        Only what you name is changed. The stored event is read, edited and
+        written back whole, so everything unmentioned survives -- including an
+        instance of a series that somebody had already moved, which lives in the
+        same object as the series itself.
+
+        `start` and `end` go together. Some changes are deliberately not
+        offered: moving an event to another calendar, changing how a series
+        recurs, adding or removing attendees -- the last because it sends mail
+        on the operator's behalf -- and clearing a text field, since omitting
+        one means "leave it alone" and there is no second way to say "make it
+        empty".
+
+        If every value you name is already what the server holds, nothing is
+        written and the answer says so. Otherwise the event is read back and the
+        answer reports the stored values and the new `etag`; `differences` names
+        anything the server stored differently from the request.
+        """
+        wanted_uid = _checked_uid(uid)
+        wanted_scope = checked_scope(scope)
+        instance = _checked_recurrence_id(recurrence_id)
+        check_instance_matches_scope(wanted_scope, instance)
+        precondition = checked_etag(etag)
+        wanted_calendar = checked_calendar_url(calendar_url)
+        edit = EventEdit(
+            summary=(
+                UNCHANGED if summary is None else _checked_summary(summary)
+            ),
+            start=(
+                UNCHANGED if start is None else _checked_boundary(start, "start")
+            ),
+            end=UNCHANGED if end is None else _checked_boundary(end, "end"),
+            description=(
+                UNCHANGED
+                if description is None
+                else _checked_optional_text(description, "description")
+            ),
+            location=(
+                UNCHANGED
+                if location is None
+                else _checked_optional_text(location, "location")
+            ),
+        )
+        # Refused here as well as one layer down, so a change that cannot be
+        # written is refused before a connection is opened at all.
+        check_event_edit(edit)
+
+        client = await client_provider()
+        updated = await client.update_event(
+            uid=wanted_uid,
+            scope=wanted_scope,
+            etag=precondition,
+            edit=edit,
+            recurrence_id=instance,
+            calendar_url=wanted_calendar,
+        )
+
+        stored = _to_stored(updated.record)
+        differences = (
+            _update_differences(updated.record, updated.sent)
+            if updated.record is not None
+            else []
+        )
+        return EventUpdated(
+            changed=updated.changed,
+            change_note=CHANGED_NOTE if updated.changed else NO_OP_NOTE,
+            uid=updated.uid,
+            scope=updated.scope,
+            recurrence_id=(
+                format_instant(updated.recurrence_id)
+                if updated.recurrence_id is not None
+                else None
+            ),
+            href=updated.href,
+            calendar_url=updated.calendar_url,
+            calendar_name=updated.calendar_name,
+            etag=updated.etag,
+            etag_note=_update_etag_note(updated),
+            sent=_written_values(updated.sent),
+            stored=stored,
+            stored_note=(
+                UPDATE_READBACK_FAILED_NOTE.format(
+                    reason=updated.readback_error or "the reason was not reported"
+                )
+                if stored is None
+                else None
+            ),
+            differs_from_request=bool(differences),
+            differences=differences,
+            difference_note=(
+                NO_COMPARISON_NOTE
+                if stored is None
+                else (DIFFERS_NOTE if differences else MATCHES_NOTE)
+            ),
+        )
+
+    calendar_event_update.__name__ = UPDATE_TOOL_NAME
+    return calendar_event_update
+
+
+def _written_values(sent: dict) -> dict[str, str | None]:
+    """The values that were written, spelled for an answer rather than a document.
+
+    Surfaced because in the one case where it matters most -- the write landed
+    and the readback did not -- the answer says the change WAS applied while
+    carrying no stored values at all. Without this the caller is told a change
+    happened and never told what it wrote.
+    """
+    written: dict[str, str | None] = {}
+    for field, value in sent.items():
+        if value is None:
+            written[field] = None
+        elif isinstance(value, datetime):
+            written[field] = format_instant(value)
+        elif isinstance(value, date):
+            written[field] = value.isoformat()
+        else:
+            written[field] = str(value)
+    return written
+
+
+def _update_etag_note(updated: UpdatedEvent) -> str | None:
+    """Why a changed object has no ETag, or nothing when it has one."""
+    if updated.etag:
+        return None
+    if updated.record is None or updated.etag_unreadable:
+        return UPDATE_ETAG_UNREADABLE_NOTE
+    return NO_ETAG_NOTE
+
+
+def _update_differences(record: EventRecord, sent: dict) -> list[str]:
+    """Every named value the server stored differently from the request.
+
+    Only the fields the caller named are compared, which is the difference from
+    a creation: everything else was meant to stay as it was, and reporting an
+    untouched value as a difference would say the server changed something
+    nobody asked it about.
+
+    The values compared against are the ones that were *written*, not the ones
+    the caller spelled: composing truncates microseconds, and blaming the
+    server for that would bury a real difference in noise.
+    """
+    differences: list[str] = []
+
+    def note(field: str, requested: object, stored: object) -> None:
+        differences.append(f"{field}: requested {requested!r}, stored {stored!r}")
+
+    if "summary" in sent and (record.summary or "") != sent["summary"]:
+        note("summary", sent["summary"], record.summary)
+    if "start" in sent and not _same_moment(record.start, sent["start"]):
+        note("start", format_instant(sent["start"]), format_instant(record.start))
+    if "end" in sent and not _same_moment(record.end, sent["end"]):
+        note("end", format_instant(sent["end"]), format_instant(record.end))
+    if "description" in sent and (record.description or None) != sent["description"]:
+        note("description", sent["description"], record.description)
+    if "location" in sent and (record.location or None) != sent["location"]:
+        note("location", sent["location"], record.location)
+    if "start" in sent:
+        all_day = not isinstance(sent["start"], datetime)
+        if record.all_day != all_day:
+            note("all_day", all_day, record.all_day)
+    return differences

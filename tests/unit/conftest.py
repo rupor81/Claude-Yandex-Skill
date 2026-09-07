@@ -134,6 +134,10 @@ class FakeCalendar:
         self._header_etags = dict(header_etags or {})
         self._property_error = property_error
         self._legacy_property = legacy_property
+        #: How many times each href has been written. A real server issues a
+        #: new ETag on every write, and a fake that did not would let a stale
+        #: precondition pass this suite.
+        self._revisions = {}
         self.searched = None
         self.fetched = []
         self.asked_by_uid = []
@@ -149,6 +153,27 @@ class FakeCalendar:
             for entry in self._entries
         )
 
+    def etag_at(self, href):
+        """The ETag of whatever is at that href, or None when nothing is."""
+        for entry in self._entries:
+            stored = self._href_of(entry)
+            if stored is not None and _same_href(href, stored):
+                return self._etag_of(uid_of(entry[1]), stored)
+        return None
+
+    def _etag_of(self, uid, href):
+        """This object's current version.
+
+        An explicitly configured ETag wins, so a test can pin one -- including
+        pinning it to None, which is a server that supplies none at all.
+        Otherwise the value moves with every write, exactly as a real server's
+        does, so an ETag read before a change is stale after it.
+        """
+        if uid in self._etags:
+            return self._etags[uid]
+        revision = self._revisions.get(str(href), 0)
+        return f"etag-{uid}" if not revision else f"etag-{uid}-r{revision}"
+
     def add(self, href, data):
         """Store one object, replacing whatever was at that href.
 
@@ -156,6 +181,7 @@ class FakeCalendar:
         occupied href *does* destroy what was there, and a fake that quietly
         kept both copies would let a missing collision guard pass this suite.
         """
+        self._revisions[str(href)] = self._revisions.get(str(href), 0) + 1
         for index, entry in enumerate(self._entries):
             stored = self._href_of(entry)
             if stored is not None and _same_href(href, stored):
@@ -187,7 +213,7 @@ class FakeCalendar:
         return FakeObject(
             data,
             url=str(href),
-            etag=self._etags.get(uid, f"etag-{uid}"),
+            etag=self._etag_of(uid, href),
             cached_etag=self._cached_etags.get(uid),
             header_etag=self._header_etags.get(uid),
             property_error=self._property_error,
@@ -381,6 +407,16 @@ def install_fake_dav_client(
             collection = _collection_for(url)
             if collection is None:
                 return FakeResponse(404)
+            if "If-Match" in sent:
+                # A conditional write, as a real server honours it: 412 when
+                # the precondition no longer describes what is there, and 404
+                # when there is nothing there at all.
+                if not collection.holds(url):
+                    return FakeResponse(404)
+                if sent["If-Match"] != collection.etag_at(url):
+                    return FakeResponse(412)
+                collection.add(url, body)
+                return FakeResponse(204)
             if collection.holds(url):
                 if sent.get("If-None-Match") == "*":
                     return FakeResponse(412)

@@ -46,25 +46,49 @@ def build(monkeypatch, *, calendars=None, secret="hunter2-app-password", put=Fal
     return server_module.build_calendar_server(PROFILE)
 
 
-def test_the_registered_tools_are_the_four_reads_and_one_write(monkeypatch):
+WRITING_TOOLS = {"calendar_event_create", "calendar_event_update"}
+
+
+def test_the_registered_tools_are_the_four_reads_and_two_writes(monkeypatch):
     server = build(monkeypatch)
     tools = anyio.run(server.list_tools)
     assert sorted(tool.name for tool in tools) == [
         "calendar_event_create",
         "calendar_event_get",
+        "calendar_event_update",
         "calendar_events_list",
         "calendar_freebusy_query",
         "calendar_list",
     ]
     by_name = {tool.name: tool for tool in tools}
-    reads = [tool for name, tool in by_name.items() if name != "calendar_event_create"]
+    reads = [tool for name, tool in by_name.items() if name not in WRITING_TOOLS]
     assert all(tool.annotations.read_only_hint is True for tool in reads)
-    # The one write must say so: a caller that gates writes on the annotation is
-    # told nothing by a hint that lies in the safe-looking direction.
+    assert all(tool.annotations.destructive_hint is False for tool in reads)
+    # A write must say so: a caller that gates writes on the annotation is told
+    # nothing by a hint that lies in the safe-looking direction.
     create = by_name["calendar_event_create"]
     assert create.annotations.read_only_hint is False
-    # And it must not overclaim either: creating removes nothing.
-    assert all(tool.annotations.destructive_hint is False for tool in tools)
+    # And creating must not overclaim either: it removes nothing.
+    assert create.annotations.destructive_hint is False
+    # Changing an event overwrites what was there, and says so.
+    update = by_name["calendar_event_update"]
+    assert update.annotations.read_only_hint is False
+    assert update.annotations.destructive_hint is True
+
+
+def test_changing_an_event_declares_scope_and_etag_as_required(monkeypatch):
+    """Both are refusals the schema itself should make, before a call is made."""
+    server = build(monkeypatch)
+    (tool,) = [
+        tool
+        for tool in anyio.run(server.list_tools)
+        if tool.name == "calendar_event_update"
+    ]
+    required = set(tool.input_schema["required"])
+    assert {"uid", "scope", "etag"} <= required
+    scope = tool.input_schema["properties"]["scope"]["description"]
+    assert "occurrence" in scope and "series" in scope
+    assert "no default" in scope.lower()
 
 
 #: The tools that return a collection, and so must say whether it is whole.
@@ -221,14 +245,19 @@ def test_a_wrong_app_password_never_reaches_the_caller_as_text(monkeypatch):
 
 
 def test_the_instructions_claim_exactly_the_writes_this_server_can_do(monkeypatch):
-    """One write exists now; the instructions must not imply the other two."""
+    """Two writes exist now; the instructions must not imply the third."""
     server = build(monkeypatch)
     tools = anyio.run(server.list_tools)
-    writes = [tool.name for tool in tools if not tool.annotations.read_only_hint]
-    assert writes == ["calendar_event_create"]
+    writes = sorted(
+        tool.name for tool in tools if not tool.annotations.read_only_hint
+    )
+    assert writes == ["calendar_event_create", "calendar_event_update"]
     text = server_module.INSTRUCTIONS.lower()
     assert "create" in text
-    assert "cannot change or delete" in text
+    assert "change" in text
+    assert "cannot delete" in text
+    # The one rule a change must not be described without.
+    assert "scope" in text and "etag" in text
 
 
 def test_creating_through_the_server_reports_what_was_stored(monkeypatch):
@@ -288,14 +317,58 @@ def test_calling_the_freebusy_tool_returns_intervals_and_no_titles(monkeypatch):
     assert "standup" not in str(payload).lower()
 
 
-#: Words that would advertise a capability this server does not have. `change`
-#: and `delete` are handled separately, because the instructions have to be able
-#: to say the server *cannot* do them.
+def test_changing_through_the_server_reports_what_the_server_holds(monkeypatch):
+    """The stdio-shaped call, end to end, including the scope and the ETag."""
+    calendar = FakeCalendar(
+        "Personal", "https://caldav.yandex.ru/c/personal/", [EVENT_DOCUMENT]
+    )
+    server = build(monkeypatch, calendars=[calendar], put=True)
+    result = anyio.run(
+        lambda: server.call_tool(
+            "calendar_event_update",
+            {
+                "uid": "standup-1",
+                "scope": "series",
+                "etag": "etag-standup-1",
+                "summary": "Daily standup",
+            },
+        )
+    )
+    payload = result.structuredContent if hasattr(result, "structuredContent") else None
+    if payload is None:
+        payload = result.structured_content
+    assert payload["changed"] is True
+    assert payload["stored"]["summary"] == "Daily standup"
+    assert payload["etag"] and payload["etag"] != "etag-standup-1"
+
+
+def test_changing_through_the_server_refuses_a_missing_scope(monkeypatch):
+    """The refusal a caller meets most often must be a refusal, not a guess."""
+    calendar = FakeCalendar(
+        "Personal", "https://caldav.yandex.ru/c/personal/", [EVENT_DOCUMENT]
+    )
+    server = build(monkeypatch, calendars=[calendar], put=True)
+    with pytest.raises(ToolError):
+        anyio.run(
+            lambda: server.call_tool(
+                "calendar_event_update",
+                {"uid": "standup-1", "etag": "etag-standup-1", "summary": "Daily"},
+            )
+        )
+
+
+#: Words that would advertise a capability this server does not have. `delete`
+#: is handled separately, because the instructions have to be able to say the
+#: server *cannot* do it. `update` is checked separately too: this server now
+#: has a tool by that name, and the word may appear only as part of it. `edit`
+#: stays on the list: gaining `calendar_event_update` is a reason to allow the
+#: tool's own name, not a reason to allow every other word for changing things
+#: -- and the instructions have to name the two scopes and the precondition,
+#: which "edit an event" quietly promises to do without either.
 OVERCLAIMING_WORDS = (
     "manage",
-    "update",
-    "modify",
     "edit",
+    "modify",
     "reschedule",
     "remove",
     "move",
@@ -315,12 +388,14 @@ def test_the_instructions_never_advertise_a_capability_this_server_lacks():
     text = server_module.INSTRUCTIONS.lower()
     for word in OVERCLAIMING_WORDS:
         assert word not in text, (
-            f"the instructions say {word!r}; this server creates and reads only"
+            f"the instructions say {word!r}; this server reads, creates and "
+            "changes, and does none of those"
         )
-    # These may appear only in the sentences that deny them.
-    assert text.count("change") == text.count("cannot change or delete")
-    assert text.count("delete") == text.count("cannot change or delete")
-    assert text.count("cannot change or delete") == 1
+    # `update` may appear only as the name of the tool that does it.
+    assert text.count("update") == text.count("calendar_event_update")
+    # `delete` may appear only in the sentence that denies it.
+    assert text.count("delete") == text.count("cannot delete")
+    assert text.count("cannot delete") == 1
     assert text.count("invite") == text.count("invites nobody")
     assert text.count("invites nobody") == 1
 

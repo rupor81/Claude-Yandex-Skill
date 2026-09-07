@@ -546,3 +546,201 @@ def test_a_real_write_into_a_url_that_is_not_a_calendar_writes_nothing():
             )
         )
     assert "no-such-calendar-yandex-mcp-live" in str(caught.value)
+
+
+# -- changing a real event, under a real scope ----------------------------
+#
+# One test, in one throwaway calendar, doing the whole story: a real recurring
+# series, one instance moved, the rest left where they were, the series changed
+# afterwards with the moved instance surviving, a stale precondition refused,
+# and a change that changes nothing sending no write at all.
+#
+# It is one test rather than six because the whole live suite shares one
+# rate-limit budget and each of those would otherwise pay again for the same
+# setup. The series is written directly through `caldav`: `calendar_event_create`
+# creates one-off events only, and a recurring one is what this story is about.
+
+#: The series this test writes for itself. Whole minutes, because this server is
+#: measured to store an event to the minute and drop the seconds.
+LIVE_SERIES_UID = "yandex-mcp-live-update-series"
+
+
+def _live_series_document(start):
+    end = start + timedelta(minutes=30)
+    stamp = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def moment(value):
+        return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    return (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//yandex-mcp//live-test//EN\r\n"
+        "BEGIN:VEVENT\r\n"
+        f"UID:{LIVE_SERIES_UID}\r\n"
+        "SUMMARY:yandex-mcp live series\r\n"
+        f"DTSTAMP:{moment(stamp)}\r\n"
+        f"DTSTART:{moment(start)}\r\n"
+        f"DTEND:{moment(end)}\r\n"
+        "RRULE:FREQ=DAILY;COUNT=3\r\n"
+        "SEQUENCE:0\r\nTRANSP:OPAQUE\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+
+
+def test_changing_a_real_series_and_one_real_instance_of_it():
+    """The whole of story 1.7 against the real account, inside its own calendar."""
+    import uuid
+
+    from yandex_calendar_mcp.tools.events import build_calendar_event_update
+    from yandex_core.errors import Conflict
+
+    before = _listed_calendars()
+    scratch_name = f"yandex-mcp-live-{uuid.uuid4().hex[:8]}"
+
+    with _dav_client() as client:
+        client.principal().make_calendar(name=scratch_name)
+
+    scratch_url = _real_url_of(scratch_name)
+    assert scratch_url, "the throwaway calendar was created but is not in the listing"
+
+    try:
+        first = (
+            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            + timedelta(days=1)
+        )
+        with _dav_client() as client:
+            client.calendar(url=scratch_url).save_event(_live_series_document(first))
+
+        update = build_calendar_event_update(_provider())
+        get = build_calendar_event_get(_provider())
+
+        original = anyio.run(
+            lambda: get(uid=LIVE_SERIES_UID, calendar_url=scratch_url)
+        )
+        assert original.is_series, "the series was not stored as a series"
+        assert original.etag, "no ETag, so no change can be made safely"
+
+        # One instance, moved by an hour. The second one, so an assertion about
+        # "the others" has something on both sides of it.
+        instance = first + timedelta(days=1)
+        moved_start = instance + timedelta(hours=1)
+        moved = anyio.run(
+            lambda: update(
+                uid=LIVE_SERIES_UID,
+                scope=SCOPE_OCCURRENCE,
+                etag=original.etag,
+                recurrence_id=instance.isoformat(),
+                calendar_url=scratch_url,
+                start=moved_start.isoformat(),
+                end=(moved_start + timedelta(minutes=30)).isoformat(),
+            )
+        )
+        assert moved.changed is True
+        assert moved.scope == SCOPE_OCCURRENCE
+        assert moved.stored is not None, moved.stored_note
+        assert moved.etag and moved.etag != original.etag, (
+            "the ETag reported after a change is the one from before it"
+        )
+        assert moved.difference_note
+        if moved.differs_from_request:
+            assert moved.differences
+        else:
+            assert moved.stored.start == moved_start
+
+        # The other instances kept their times. Asserted by expanding the real
+        # series, which is the only thing that could show the opposite.
+        expanded = anyio.run(
+            lambda: build_calendar_events_list(_provider())(
+                start=first - timedelta(hours=1),
+                end=first + timedelta(days=4),
+                calendar_url=scratch_url,
+                limit=50,
+            )
+        )
+        occurrences = sorted(
+            (item for item in expanded.items if item.uid == LIVE_SERIES_UID),
+            key=lambda item: _as_moment(item.start),
+        )
+        assert len(occurrences) == 3, (
+            f"the series should still have three instances, got {len(occurrences)}"
+        )
+        starts = [_as_moment(item.start) for item in occurrences]
+        assert starts[0] == first, "an instance nobody touched was moved"
+        assert starts[2] == first + timedelta(days=2), "the last instance moved"
+        assert moved_start in starts, "the instance that was moved is not at its new time"
+        assert instance not in starts, "the moved instance is still at its old time too"
+
+        # Now the series itself. The instance already moved must survive with
+        # its own values: on this server both live in one object, so a
+        # replacement rather than an edit would take it with it.
+        renamed = anyio.run(
+            lambda: update(
+                uid=LIVE_SERIES_UID,
+                scope=SCOPE_SERIES,
+                etag=moved.etag,
+                calendar_url=scratch_url,
+                summary="yandex-mcp live series (renamed)",
+            )
+        )
+        assert renamed.changed is True
+        assert renamed.stored is not None, renamed.stored_note
+
+        # Addressed by the instance's recurrence id -- the time the series says
+        # it happens -- not by the time it was moved to.
+        survivor = anyio.run(
+            lambda: get(
+                uid=LIVE_SERIES_UID,
+                recurrence_id=instance.isoformat(),
+                calendar_url=scratch_url,
+            )
+        )
+        assert survivor.summary == "yandex-mcp live series", (
+            "the moved instance was overwritten by the change to the series"
+        )
+        assert _as_moment(survivor.start) == _as_moment(moved.stored.start), (
+            "the moved instance was put back where the series says it should be"
+        )
+
+        # A precondition that no longer holds: refused, and nothing written.
+        with pytest.raises(Conflict):
+            anyio.run(
+                lambda: update(
+                    uid=LIVE_SERIES_UID,
+                    scope=SCOPE_SERIES,
+                    etag=original.etag,
+                    calendar_url=scratch_url,
+                    summary="yandex-mcp live series (must not happen)",
+                )
+            )
+        after_refusal = anyio.run(
+            lambda: get(uid=LIVE_SERIES_UID, calendar_url=scratch_url)
+        )
+        assert after_refusal.summary == "yandex-mcp live series (renamed)", (
+            "a write went through on a stale ETag"
+        )
+
+        # And a change that changes nothing sends no write: the ETag is still
+        # the one from before, which it could not be if anything had been PUT.
+        nothing = anyio.run(
+            lambda: update(
+                uid=LIVE_SERIES_UID,
+                scope=SCOPE_SERIES,
+                etag=after_refusal.etag,
+                calendar_url=scratch_url,
+                summary="yandex-mcp live series (renamed)",
+            )
+        )
+        assert nothing.changed is False
+        assert nothing.etag == after_refusal.etag
+    finally:
+        target = _real_url_of(scratch_name)
+        if target is not None:
+            with _dav_client() as client:
+                client.calendar(url=target).delete()
+
+    after = _listed_calendars()
+    assert scratch_name not in [name for name, _ in after], (
+        "the throwaway calendar is still on the account"
+    )
+    assert sorted(after) == sorted(before), (
+        "the account's calendars are not what they were before this test"
+    )

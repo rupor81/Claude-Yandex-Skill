@@ -54,13 +54,28 @@ from .recurrence import DEFAULT_CEILING as EXPANSION_CEILING
 from .recurrence import expand as expand_occurrences
 from .recurrence import read_event
 from .recurrence import with_unreadable_calendars
-from .compose import EventDraft, build_event_document, new_uid, written_boundary
+from .compose import (
+    SCOPE_OCCURRENCE,
+    SCOPE_SERIES,
+    EditedDocument,
+    EventDraft,
+    EventEdit,
+    apply_event_edit,
+    check_event_edit,
+    build_event_document,
+    new_uid,
+    written_boundary,
+)
 
 __all__ = [
     "CalendarRef",
     "CalDAVCalendarClient",
     "CreatedEvent",
     "FetchedEvent",
+    "UpdatedEvent",
+    "check_instance_matches_scope",
+    "checked_scope",
+    "checked_etag",
     "EXPANSION_CEILING",
 ]
 
@@ -137,6 +152,41 @@ class CreatedEvent:
     etag: str | None
     sent_start: date | datetime
     sent_end: date | datetime
+    etag_unreadable: bool = False
+    record: EventRecord | None = None
+    readback_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UpdatedEvent:
+    """One event as it stands after a change was asked for.
+
+    ``changed`` is false when every value the caller named was already what the
+    server held.  That is a no-op, not a failure: no write was sent, ``record``
+    is the event as it was read, and ``etag`` is still the one the caller
+    passed in.  A PUT that stored the same values would bump the object's
+    version and refuse the next caller's precondition for a change that never
+    happened.
+
+    ``record`` is what the server *holds*, read back after the write.  It is
+    ``None`` only when the readback failed, and ``readback_error`` says so: the
+    change happened either way, and reporting it as a failure would send
+    somebody to make it a second time.
+
+    ``sent`` is the values as they were *written*, which is the only honest
+    thing to compare the stored ones against: composing truncates microseconds,
+    and blaming the server for that would bury a real difference in noise.
+    """
+
+    uid: str
+    scope: str
+    recurrence_id: date | datetime | None
+    href: str
+    calendar_url: str
+    calendar_name: str
+    etag: str | None
+    sent: dict
+    changed: bool
     etag_unreadable: bool = False
     record: EventRecord | None = None
     readback_error: str | None = None
@@ -341,6 +391,78 @@ class CalDAVCalendarClient:
         def run() -> CreatedEvent:
             return self._create_event_blocking(
                 draft=draft, document=document, calendar_url=calendar_url
+            )
+
+        return await anyio.to_thread.run_sync(run)
+
+    async def update_event(
+        self,
+        *,
+        uid: str,
+        scope: str | None,
+        etag: str | None,
+        edit: EventEdit,
+        recurrence_id: date | datetime | None = None,
+        calendar_url: str | None = None,
+    ) -> UpdatedEvent:
+        """Change one event, or one instance of it, and read it back.
+
+        The stored object is fetched, edited and written back whole.  It is
+        never replaced with a freshly composed document: measured on this
+        account, a series and the ``RECURRENCE-ID`` overrides of its instances
+        live in a single object, so a replacement would take a moved instance
+        with it while answering as a success.
+
+        The write carries ``If-Match`` with the ETag the caller last read.  A
+        change somebody else made in between is refused by the server with 412
+        and nothing is written -- and the refusal is never retried with a fresh
+        ETag, which would defeat the precondition entirely.
+
+        ``scope`` is required here as well as in ``tools/``, because this module
+        is usable from a plain script and the two meanings are not recoverable
+        from each other: ``occurrence`` changes one instance, ``series`` changes
+        every one of them.
+
+        Args:
+            uid: the event to change.
+            scope: ``occurrence`` or ``series``. There is no default.
+            etag: the ETag last read for this event, sent as a precondition.
+            edit: the values to change; everything else is left alone.
+            recurrence_id: which instance, required for ``occurrence`` scope and
+                refused for ``series`` scope.
+            calendar_url: restrict the lookup to one calendar, or search them
+                all in listing order.
+
+        Returns:
+            What the server now holds, and whether anything was written at all.
+
+        Raises:
+            ProtocolError: the scope, the ETag or the edit is not one that can
+                be honoured, or the stored object cannot be edited. Nothing was
+                written.
+            NotFound: no such event, or no such instance of it -- the message
+                says which. Nothing was written.
+            Conflict: the ETag is stale. Nothing was written, and the caller is
+                told to read the event again.
+            TransportError: the connection failed. When it failed *during* the
+                write the message says the outcome is unknown, because a blind
+                repeat could apply the change on top of somebody else's.
+        """
+        wanted = checked_scope(scope)
+        check_instance_matches_scope(wanted, recurrence_id)
+        precondition = checked_etag(etag)
+        # Checked before the connection is opened, so a change that cannot be
+        # written is refused without a request being made at all.
+        check_event_edit(edit)
+
+        def run() -> UpdatedEvent:
+            return self._update_event_blocking(
+                uid=uid,
+                scope=wanted,
+                etag=precondition,
+                edit=edit,
+                recurrence_id=recurrence_id,
+                calendar_url=calendar_url,
             )
 
         return await anyio.to_thread.run_sync(run)
@@ -681,8 +803,242 @@ class CalDAVCalendarClient:
                     readback_error=readback_error,
                 )
 
+    def _update_event_blocking(
+        self,
+        *,
+        uid: str,
+        scope: str,
+        etag: str,
+        edit: EventEdit,
+        recurrence_id: date | datetime | None,
+        calendar_url: str | None,
+    ) -> UpdatedEvent:
+        with self._translated():
+            with caldav.DAVClient(
+                url=self._url,
+                username=self._username,
+                password=self._password,
+                timeout=self._timeout,
+                # As for a create: the library sleeps on 429 and re-issues the
+                # request, PUT included. A repeated conditional write is not
+                # harmless -- if the first one landed, the second meets a new
+                # ETag and is refused, and this code would report "nothing was
+                # changed" about a change that happened.
+                rate_limit_handle=False,
+            ) as client:
+                calendars, unlisted = self._calendars_for(client, calendar_url)
+                if calendar_url is not None and (unlisted or not calendars):
+                    # Nothing is written through a URL the account does not
+                    # list: on this server such a write is not reliably refused,
+                    # it simply goes somewhere nothing will find it.
+                    raise NotFound(
+                        _not_a_calendar(calendar_url, wrote="nothing was changed")
+                    )
+
+                tried = 0
+                for calendar in calendars:
+                    tried += 1
+                    url = str(getattr(calendar, "url", "") or calendar_url or "")
+                    # Unlike a read, a failure here is never counted as a miss
+                    # and carried past: a partial search that ended in a
+                    # not-found would deny an event that is really there, and
+                    # one that ended in the wrong calendar would write to it.
+                    sources, current_etag, etag_unreadable, found_at = _fetch_sources(
+                        calendar, url=url, uid=uid, gather_overrides=True
+                    )
+                    if not sources:
+                        continue
+                    try:
+                        before = read_event(
+                            sources, uid=uid, recurrence_id=recurrence_id
+                        )
+                    except EventNotInDocument:
+                        continue
+                    except InstanceNotInSeries:
+                        raise NotFound(
+                            _no_such_instance(uid, recurrence_id)
+                        ) from None
+
+                    if current_etag and current_etag != etag:
+                        # Compared as soon as this really is the caller's event,
+                        # and before anything about the document's shape. A
+                        # caller holding a stale ETag needs to be told to read
+                        # the event again; an error about how the object is
+                        # laid out is not something they can act on, and is not
+                        # what made this call fail. The precondition on the
+                        # write is still the real guard -- this only spares the
+                        # server a write it would refuse.
+                        raise Conflict(_stale_etag(uid, given=etag))
+                    if len(sources) > 1:
+                        raise ProtocolError(_stored_in_several_objects(uid, sources))
+
+                    if before.cancelled:
+                        # A cancelled instance is not in the series' expansion
+                        # at all, and a cancelled event is a meeting that was
+                        # called off. Editing either one puts it back on
+                        # somebody's calendar -- and for an instance leaves the
+                        # object saying both at once. The scope changes only
+                        # which of the two messages fits.
+                        raise ProtocolError(
+                            _instance_is_cancelled(uid, recurrence_id)
+                            if scope == SCOPE_OCCURRENCE
+                            else _event_is_cancelled(uid)
+                        )
+
+                    name = _display_name(calendar)
+                    href = found_at or _object_href(url, uid)
+                    edited = apply_event_edit(
+                        sources[0].ics,
+                        uid=uid,
+                        scope=scope,
+                        recurrence_id=recurrence_id,
+                        edit=edit,
+                    )
+                    if not edited.changed:
+                        # Nothing to write. Reported as what it is, with the
+                        # event as it stands, rather than as a change that did
+                        # not happen or a write that was not needed.
+                        return UpdatedEvent(
+                            uid=uid,
+                            scope=scope,
+                            recurrence_id=recurrence_id,
+                            href=href,
+                            calendar_url=url,
+                            calendar_name=name,
+                            # Nothing was written, so the version the caller
+                            # holds is still current -- which is what the
+                            # docstring promises. A server that supplied no
+                            # ETag of its own must not turn that into a null
+                            # the caller reads as "your precondition is gone".
+                            etag=current_etag or etag,
+                            sent=edited.sent,
+                            changed=False,
+                            etag_unreadable=etag_unreadable,
+                            record=before,
+                        )
+
+                    return self._write_update(
+                        client,
+                        calendar,
+                        uid=uid,
+                        scope=scope,
+                        recurrence_id=recurrence_id,
+                        etag=etag,
+                        href=href,
+                        url=url,
+                        name=name,
+                        edited=edited,
+                    )
+
+        raise NotFound(
+            _no_such_event(
+                uid,
+                tried=tried,
+                unreadable_calendars=0,
+                calendar_url=calendar_url,
+            )
+        )
+
+    def _write_update(
+        self,
+        client: object,
+        calendar: object,
+        *,
+        uid: str,
+        scope: str,
+        recurrence_id: date | datetime | None,
+        etag: str,
+        href: str,
+        url: str,
+        name: str,
+        edited: EditedDocument,
+    ) -> UpdatedEvent:
+        """The conditional PUT, and the readback that confirms it."""
+        try:
+            response = client.put(  # type: ignore[attr-defined]
+                href,
+                edited.document,
+                {
+                    "Content-Type": "text/calendar; charset=utf-8",
+                    # The whole point. Without it, a change somebody else made
+                    # between the read and this write is silently destroyed.
+                    "If-Match": etag,
+                },
+            )
+        except http_error.RequestException as exc:
+            raise TransportError(
+                _update_outcome_unknown(uid, calendar_url=url, exc=exc)
+            ) from exc
+        except caldav_error.RateLimitError as exc:
+            # Not an unknown outcome: the library's own retry is disabled for
+            # this client, so a 429 is the write being refused before it was
+            # applied. Calling it unknown would cost every rate-limited caller
+            # a needless re-read and blunt the phrase for the transport case,
+            # where nobody really does know.
+            raise RateLimited(_update_rate_limited(uid, calendar_url=url)) from exc
+        except caldav_error.AuthorizationError as exc:
+            raise self._write_refused(exc, calendar=url, name=name) from exc
+
+        _check_update_status(_status_of(response), uid=uid, href=href, etag=etag)
+
+        record: EventRecord | None = None
+        etag_after: str | None = None
+        etag_unreadable = False
+        readback_error: str | None = None
+        try:
+            sources, etag_after, etag_unreadable, found_at = _fetch_sources(
+                calendar, url=url, uid=uid, gather_overrides=recurrence_id is not None
+            )
+            if found_at:
+                href = found_at
+            if not sources:
+                readback_error = (
+                    "the server accepted the write but did not return the object "
+                    "when it was read back"
+                )
+            else:
+                record = read_event(sources, uid=uid, recurrence_id=recurrence_id)
+        except Exception as exc:  # noqa: BLE001 - reported, or re-raised
+            if _is_transport_failure(exc) or isinstance(
+                exc, caldav_error.AuthorizationError
+            ):
+                # The account itself has become unusable, and every later call
+                # fails the same way. Raised as itself, saying plainly that the
+                # change nonetheless happened.
+                raise self._readback_broke_off(
+                    exc,
+                    uid=uid,
+                    calendar=url,
+                    verb="changed",
+                    again="Do not repeat the change;",
+                ) from exc
+            record = None
+            etag_after, etag_unreadable = None, False
+            readback_error = f"the readback failed ({type(exc).__name__}: {exc})"
+
+        return UpdatedEvent(
+            uid=uid,
+            scope=scope,
+            recurrence_id=recurrence_id,
+            href=href,
+            calendar_url=url,
+            calendar_name=name,
+            etag=etag_after,
+            sent=edited.sent,
+            changed=True,
+            etag_unreadable=etag_unreadable,
+            record=record,
+            readback_error=readback_error,
+        )
+
     def _readback_broke_off(
-        self, exc: BaseException, *, uid: str, calendar: str
+        self,
+        exc: BaseException,
+        *,
+        uid: str,
+        calendar: str,
+        verb: str = "created",
+        again: str = "Do not create it again;",
     ) -> Exception:
         """A readback that failed for a reason bigger than the readback.
 
@@ -690,13 +1046,13 @@ class CalDAVCalendarClient:
         credential is an ``AuthError``, an unreachable host a ``TransportError``
         -- so a caller that branches on the type is not told the wrong thing.
         The message carries the one fact that must not be lost with it: the
-        event was created, and creating it again would make two.
+        write happened, and repeating it would do the damage twice.
         """
         translated = self._translated()._translate(exc)
         return type(translated)(
-            f"Event {uid!r} WAS created in {calendar} -- the server accepted the "
+            f"Event {uid!r} WAS {verb} in {calendar} -- the server accepted the "
             f"write -- but reading it back failed: {translated} Its stored "
-            "values are therefore unknown. Do not create it again; read it with "
+            f"values are therefore unknown. {again} read it with "
             f"`calendar_event_get` for uid {uid!r} once the cause is fixed."
         )
 
@@ -806,22 +1162,22 @@ def _fetch_sources(
     found_at: str | None = None
     name: str | None = None
 
-    def keep(obj: object) -> None:
+    def keep(obj: object) -> bool:
         # The display name is read only once something was found: on this server
         # it can cost a request of its own, and a calendar that does not hold
         # the event should not be asked for its name during a scan.
         nonlocal name
-        href = str(getattr(obj, "url", "") or "")
+        href = _object_key(str(getattr(obj, "url", "") or ""))
         if href and href in hrefs:
-            return
+            return False
+        data = _object_data(obj)
         hrefs.add(href)
         if name is None:
             name = _display_name(calendar)
         sources.append(
-            CalendarSource(
-                ics=_object_data(obj), calendar_url=url, calendar_name=name
-            )
+            CalendarSource(ics=data, calendar_url=url, calendar_name=name)
         )
+        return True
 
     try:
         addressed = calendar.event_by_url(_object_href(url, uid))  # type: ignore[attr-defined]
@@ -834,12 +1190,9 @@ def _fetch_sources(
 
     if addressed is None or gather_overrides:
         other = _object_by_uid(calendar, uid)
-        if other is not None:
-            before = len(sources)
-            keep(other)
-            if addressed is None and len(sources) > before:
-                etag, etag_unreadable = _etag_of(other)
-                found_at = str(getattr(other, "url", "") or "") or None
+        if other is not None and keep(other) and addressed is None:
+            etag, etag_unreadable = _etag_of(other)
+            found_at = str(getattr(other, "url", "") or "") or None
 
     return sources, etag, etag_unreadable, found_at
 
@@ -961,11 +1314,11 @@ def _no_such_event(
     return f"No event with UID {uid!r} exists in {where}."
 
 
-def _not_a_calendar(calendar_url: str) -> str:
+def _not_a_calendar(calendar_url: str, *, wrote: str = "nothing was created") -> str:
     """The message for a write aimed at a URL the account does not list."""
     return (
         f"{calendar_url!r} is not one of the calendars this account lists, so "
-        "nothing was created. A URL this server hands back is not always the "
+        f"{wrote}. A URL this server hands back is not always the "
         "address of the thing it names, and a write aimed at one that is not a "
         "calendar is not reliably refused -- it simply goes somewhere nothing "
         "will find it. Use `calendar_list` to get the URL of a calendar on this "
@@ -993,6 +1346,248 @@ def _write_outcome_unknown(
         "may not have been created. Do not retry blindly -- check first with "
         f"`calendar_event_get` for uid {uid!r}, and create it again only if it "
         "is not there."
+    )
+
+
+def checked_scope(scope: object) -> str:
+    """Which of the two things "change this event" means, never guessed.
+
+    Public, and the only spelling of this refusal: ``tools/`` calls it too, so
+    the wording a caller reads cannot drift between the layer that checks it
+    before a connection is opened and the layer that checks it again.
+
+    There is no default and no charitable reading.  On a calendar where most
+    meetings recur, "change this meeting" is genuinely ambiguous at the protocol
+    level, the two answers are not recoverable from each other, and one of them
+    rewrites every instance of a series that somebody else may also be in.
+    """
+    if isinstance(scope, str):
+        trimmed = scope.strip()
+        if trimmed in (SCOPE_OCCURRENCE, SCOPE_SERIES):
+            return trimmed
+    return _refuse_scope(scope)
+
+
+def _refuse_scope(scope: object) -> str:
+    given = (
+        "no `scope` was given"
+        if scope is None or (isinstance(scope, str) and not scope.strip())
+        else f"`scope` was {scope!r}"
+    )
+    raise ProtocolError(
+        f"{given}, and there is no default. Say which change is meant: "
+        f"`{SCOPE_OCCURRENCE}` changes the one instance named by "
+        f"`recurrence_id` and leaves the rest of the series alone; "
+        f"`{SCOPE_SERIES}` changes the event itself, and so every instance of "
+        "it. The two are not recoverable from each other, so neither is "
+        "guessed. Nothing was changed."
+    )
+
+
+def check_instance_matches_scope(
+    scope: str, recurrence_id: date | datetime | None
+) -> None:
+    """The instance and the scope must agree, or one of them was a mistake.
+
+    Neither is quietly ignored.  Ignoring the ``recurrence_id`` rewrites the
+    whole series for a caller who named one day; ignoring the scope does the
+    opposite.  Both are silent, and both are wrong.
+    """
+    if scope == SCOPE_OCCURRENCE and recurrence_id is None:
+        raise ProtocolError(
+            f"`scope` is `{SCOPE_OCCURRENCE}` but no `recurrence_id` was given, "
+            "so no instance was named and there is nothing to change. Pass the "
+            "`recurrence_id` `calendar_events_list` returned for the instance, "
+            f"or use `{SCOPE_SERIES}` to change every instance. Nothing was "
+            "changed."
+        )
+    if scope == SCOPE_SERIES and recurrence_id is not None:
+        raise ProtocolError(
+            f"`scope` is `{SCOPE_SERIES}` -- every instance -- but a "
+            "`recurrence_id` naming one instance was also given. The two "
+            "contradict each other and neither is ignored: honouring the scope "
+            "would rewrite a series for somebody who named one day, and "
+            "honouring the instance would ignore the scope they asked for. Use "
+            f"`{SCOPE_OCCURRENCE}` with the `recurrence_id`, or drop the "
+            "`recurrence_id`. Nothing was changed."
+        )
+
+
+def checked_etag(etag: object) -> str:
+    """The version the caller last read, without which no write may be sent.
+
+    Public for the same reason as :func:`checked_scope`: ``tools/`` refuses the
+    same thing with the same words, and two copies of a multi-sentence message
+    are two things to keep in step.
+
+    An unconditional write silently destroys whatever somebody else did in the
+    meantime, and neither party ever finds out.
+    """
+    if isinstance(etag, str) and etag.strip():
+        return etag.strip()
+    raise ProtocolError(
+        "`etag` is required: it is the version of the event you last read, and "
+        "the write carries it as a precondition so a change somebody else made "
+        "in between is refused rather than overwritten. Read the event with "
+        "`calendar_event_get` and pass back the `etag` it returned. Nothing was "
+        "changed."
+    )
+
+
+def _stale_etag(uid: str, *, given: str) -> str:
+    """The message for a precondition that no longer holds."""
+    return (
+        f"Event {uid!r} has changed since the ETag {given!r} was read, so "
+        "nothing was written and the other change was not overwritten. Read the "
+        "event again with `calendar_event_get`, decide whether your change "
+        "still applies to what is there now, and repeat it with the ETag that "
+        "read returns. Do not repeat it with a fresh ETag without looking: that "
+        "is exactly the overwrite the precondition prevented."
+    )
+
+
+def _stored_in_several_objects(uid: str, sources: list) -> str:
+    """The message for a UID spread over more than one CalDAV object.
+
+    One ETag names one object.  Editing one of several and sending that single
+    precondition would claim a guard over documents it never covered, and a
+    caller would be told the whole event was changed when part of it was not.
+    """
+    return (
+        f"Event {uid!r} is stored across {len(sources)} separate calendar "
+        "objects, and a conditional write covers one object only. This server "
+        "will not change part of an event while reporting the whole of it, so "
+        "nothing was written. Read the event with `calendar_event_get` and "
+        "change it in a client that can address each object."
+    )
+
+
+def _instance_is_cancelled(uid: str, recurrence_id: date | datetime | None) -> str:
+    """The message for a change aimed at an instance that is not happening."""
+    when = (
+        recurrence_id.isoformat() if recurrence_id is not None else "that time"
+    )
+    return (
+        f"The instance of event {uid!r} at {when} is cancelled, so there is "
+        "nothing there to change and nothing was written. Changing it would put "
+        "a meeting that was called off back on the calendar, which is a "
+        "different act from editing one -- and would leave the stored event "
+        "saying the instance is both cancelled and not. Create a new event "
+        "instead, or change the series with `scope: series`."
+    )
+
+
+def _event_is_cancelled(uid: str) -> str:
+    """The message for a change aimed at an event that was called off."""
+    return (
+        f"Event {uid!r} is marked CANCELLED, so it is a meeting that was called "
+        "off and there is nothing there to change; nothing was written. Editing "
+        "it would put it back on the calendar of everybody who holds it, which "
+        "is a different act from changing a meeting that is happening, and this "
+        "server will not do it as a side effect of an edit. Create a new event "
+        "instead."
+    )
+
+
+def _update_outcome_unknown(
+    uid: str, *, calendar_url: str, exc: BaseException
+) -> str:
+    """The message for a change whose fate nobody knows.
+
+    A blind repeat is the one thing that must not happen next: the write may
+    have landed, in which case repeating it means sending a second conditional
+    write with an ETag that is now stale -- or, worse, re-reading and applying
+    the change on top of somebody else's.
+
+    This is the only genuinely unknown outcome on the update path, which is why
+    it no longer shares its wording with anything: a refused write -- a rate
+    limit, a status the server chose -- has an outcome nobody has to guess at,
+    and describing those as unknown too would cost every one of those callers a
+    re-read and leave the phrase meaning nothing here.
+    """
+    return (
+        f"The connection failed while changing event {uid!r} in {calendar_url} "
+        f"({type(exc).__name__}), so the outcome is unknown: the change may or "
+        "may not have been applied. Do not repeat it blindly -- read the event "
+        f"with `calendar_event_get` for uid {uid!r} first, and repeat the change "
+        "only if what is stored is still the old value."
+    )
+
+
+def _update_rate_limited(uid: str, *, calendar_url: str) -> str:
+    """The message for a change the server refused because of rate limiting.
+
+    Creation answers the same refusal with "the outcome is unknown", and the
+    difference is deliberate: do not harmonise them. What a wrong guess costs
+    is what differs. Told "refused" after a create that actually landed, a
+    caller repeats it and ends up with two copies of one meeting. Told the same
+    after an update that landed, a caller repeats it with the same ETag and is
+    answered 412 -- the precondition catches the mistake. Certainty is
+    affordable here and is not affordable there.
+    """
+    return (
+        f"Yandex is rate limiting this account and refused the write, so "
+        f"nothing was changed to event {uid!r} in {calendar_url}. The write was "
+        "not retried and its outcome is not in doubt: the event still holds "
+        "what it held. Wait and repeat the change with the same ETag."
+    )
+
+
+def _check_update_status(
+    status: int | None, *, uid: str, href: str, etag: str
+) -> None:
+    """Turn a conditional write's status into either silence or the taxonomy.
+
+    A 412 is the precondition doing its job and is the *expected* answer when
+    somebody else got there first -- it is a conflict, never a failure to
+    report as "the server said no".
+
+    201 is accepted here, and deliberately is not on a create.  Measured: this
+    server answers 201 to a successful conditional update of an object that
+    plainly existed a moment earlier.  What makes that safe to accept is the
+    precondition itself -- ``If-Match`` on an href holding nothing is answered
+    412, never 201, so under this header a 201 cannot mean "there was nothing
+    there".  On a create the guard is the opposite one, ``If-None-Match: *``,
+    where 201 is the *only* answer that is not a replacement; the two writes
+    read the same number differently because they asked different questions.
+
+    Raises:
+        Conflict: 412 -- somebody else changed the event first; nothing written.
+            409 as well, but with its own message: on CalDAV a 409 is normally
+            a missing collection or a UID that conflicts with another object,
+            and telling that caller to re-read and retry sends them to do the
+            one thing that cannot help.
+        NotFound: 404 -- the object is gone.
+        ProtocolError: any other answer, including one with no status at all.
+    """
+    if status in (200, 201, 204):
+        return
+    if status == 412:
+        raise Conflict(_stale_etag(uid, given=etag))
+    if status == 409:
+        raise Conflict(
+            f"Yandex answered the change of event {uid!r} with 409 and nothing "
+            f"was written. That is not the precondition: a stale ETag is "
+            "answered 412. On CalDAV a 409 means the request conflicts with "
+            f"the state of the collection -- the calendar holding {href} may "
+            "have been removed, or the object may clash with another one "
+            "already there. Re-reading and repeating the change will not help. "
+            "Check the calendar with `calendar_list` and the event with "
+            f"`calendar_event_get` for uid {uid!r}."
+        )
+    if status == 404:
+        raise NotFound(
+            f"Yandex answered the change of event {uid!r} with 404, so nothing "
+            f"was changed: the object at {href} was read a moment before the "
+            "write and is no longer there. It has most likely been deleted "
+            "since. Read it with `calendar_event_get` for uid " + repr(uid) + "."
+        )
+    raise ProtocolError(
+        f"Yandex answered the change of event {uid!r} with "
+        f"{status if status is not None else 'no status at all'}, which this "
+        "server cannot read as success. The change may or may not have been "
+        f"applied: read the event with `calendar_event_get` for uid {uid!r} "
+        "before trying again."
     )
 
 
@@ -1076,6 +1671,32 @@ def _no_such_instance(uid: str, recurrence_id: date | datetime | None) -> str:
 def _normalised_url(url: str) -> str:
     """A collection URL compared without caring about one trailing slash."""
     return url.rstrip("/")
+
+
+def _object_key(href: str) -> str:
+    """Two hrefs for the same object, reduced to one string.
+
+    Measured on the live account: the address built from the UID and the one
+    the library's UID lookup reports differ only in whether the ``@`` in the
+    principal's own path segment is percent-encoded, and the two documents they
+    return are the same event serialised twice -- with a DTSTAMP the server
+    re-stamps per response, so they are not even equal as text. Treating those
+    as two objects made an ordinary event look like one stored across several,
+    and refused every change to it.
+
+    Normalised one path segment at a time, and re-encoded: unquoting the whole
+    href in a single pass folds two genuinely different addresses into one --
+    ``<calendar>/a%2Fb.ics`` names an object whose own name contains a slash,
+    and ``<calendar>/a/b.ics`` names one in a subordinate path. Reduced to the
+    same key, the second document is dropped as a duplicate of the first, the
+    "several objects" guard never fires, and the PUT lands on whichever of them
+    happened to be addressed. Segment by segment, ``%70ersonal`` and
+    ``personal`` still agree while those two do not.
+    """
+    return "/".join(
+        urllib.parse.quote(urllib.parse.unquote(segment), safe="")
+        for segment in href.rstrip("/").split("/")
+    )
 
 
 def _display_name(calendar: object) -> str:

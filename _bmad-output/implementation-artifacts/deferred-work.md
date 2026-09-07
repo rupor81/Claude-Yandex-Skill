@@ -10,6 +10,10 @@
   summary: Every page of an event query re-opens a TLS connection and re-fetches the whole range, so paging a wide range at a small limit repeats the full account-wide fetch once per page.
   evidence: Correct but wasteful, and invisible at present scale — a 60-day window over the real account returns 422 occurrences in one page. It becomes load-bearing for wide ranges or a small limit; a short-lived expansion cache keyed by the cursor's query stamp is the natural fix, and the stamp needed for it already exists.
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-update-an-event-with-an-explicit-scope.md`
+  summary: The live suite cannot be run back to back. This server's rate limit is per account and does not reset between runs, so the second and third run in quick succession fail somewhere — and never in the same place twice.
+  evidence: Diagnosed properly the second time. Story 1.6 narrowed two sixty-day windows and a five-item page size, which halved the suite and made two consecutive runs green; that was a real improvement and a wrong diagnosis. The cause is the shared budget, not any one test: after four runs inside an hour the failure simply moves to whichever test is unlucky, and each of those tests passes alone in ten to fifteen seconds. There is nothing to fix in the code. What is needed is a rule — leave several minutes between full live runs — and, if that ever stops being enough, a session-scoped fixture that spaces the tests rather than a cheaper test.
+
 ## Resolved
 
 - Calendar paging by index (raised in story 1.1, closed 2026-09-06). `calendar_list` now
@@ -31,6 +35,13 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-6-create-an-event.md`
   summary: A write whose outcome is unknown names the UID and tells the caller to check, but nothing yet performs that check for them.
   evidence: Correct and honest as far as it goes — the alternative, retrying blindly, is what creates duplicate meetings. A follow-up could read by UID and report whether the write landed, turning "check this yourself" into an answer. That belongs with the update story, which needs the same read-then-decide shape.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-update-an-event-with-an-explicit-scope.md`
+  summary: A conditional update cannot be made to refuse an event that was deleted between the read and the write, so such an event is resurrected rather than refused.
+  evidence: Measured against the live account: a PUT carrying `If-Match: <etag>` to an href holding nothing answered 201 and created the object. This server does not evaluate the precondition for a resource that does not exist, so no header this client can send turns the race into a refusal — the earlier claim that such a write must be answered 412 was wrong and has been corrected in the spec's change log. What is available is narrowing, not closing: a HEAD or PROPFIND immediately before the PUT shrinks the window without removing it, and would cost a request on every change. Stated plainly in the tool's documentation instead, so nobody builds on a guarantee this server does not give.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-update-an-event-with-an-explicit-scope.md`
+  summary: An event cannot be moved between calendars, a series' recurrence cannot be changed, attendees cannot be added or removed, and a text field cannot be cleared through the tool.
+  evidence: Named only in a docstring until now, which is not where scope decisions belong. Moving an event between calendars is a delete and a create, and this server has no delete — doing it as a copy would leave the original behind on any partial failure. Changing an RRULE rewrites every future instance of a series other people are also in, and needs the same explicit-scope treatment the times got. Attendees send mail on the operator's behalf, held back from story 1.6 for the same reason. Clearing a field is the one that is nearly free: `client/compose.py` already distinguishes "not named" from `None` and now removes the property for `None`, but the tool's parameters use `None` as "omitted", so a second spelling — a sentinel, or an explicit `clear` list — has to be chosen before it can be offered.
 
 ## Resolved
 
