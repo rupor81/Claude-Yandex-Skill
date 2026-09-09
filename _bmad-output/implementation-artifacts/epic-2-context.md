@@ -1,0 +1,110 @@
+# Epic 2 Context: Mail connector, end to end
+
+<!-- Compiled from planning artifacts, epic 1's retrospective, and measurements taken
+     against the live Yandex servers on 2026-09-09 before any story was specified. -->
+
+## Goal
+
+Deliver a working Mail MCP server: list folders, fetch headers over a date range, read
+bodies with honest truncation, inspect and download attachments, set flags, draft, reply,
+send, move and trash. The OAuth Authorization Code flow is built here, because Mail is the
+first service that needs it — Calendar got by on an app password.
+
+Two stories exist for reasons outside Mail. Story 2.5 revisits the shared core now that a
+second protocol is in hand: epic 1 built it against CalDAV alone, and IMAP is the first
+evidence of what is genuinely common. Story 2.10 is the acceptance check the PRD's own
+scenario needs, and it belongs to neither epic on its own.
+
+## Stories
+
+- Story 2.1: Authorise the mailbox and list its folders
+- Story 2.2: List message headers over a date range
+- Story 2.3: Read a message body with honest truncation
+- Story 2.4: Inspect and download attachments
+- Story 2.5: Correct the shared core against a second protocol
+- Story 2.6: Set message flags
+- Story 2.7: Create drafts and replies
+- Story 2.8: Send a message
+- Story 2.9: Move and trash messages in bulk
+- Story 2.10: Answer a real cross-service question
+
+## Measured before specifying — 2026-09-09
+
+Epic 1 established that this platform's documentation is not a substitute for measurement:
+five documented behaviours were measured false, three of them unguessable. These were taken
+against the live servers before story 2.1 was written. **Anything here marked measured is
+evidence; anything marked unverified is not, and must be measured before it is relied on.**
+
+| Measured | Consequence |
+|---|---|
+| `imap.yandex.ru:993` advertises `IMAP4rev1 CHILDREN UNSELECT LITERAL+ NAMESPACE XLIST UIDPLUS ENABLE ID AUTH=PLAIN AUTH=XOAUTH2 IDLE MOVE` | XOAUTH2 is real, not aspirational. `MOVE` is available for story 2.9; `UIDPLUS` gives new UIDs on append, for story 2.7 |
+| That list carries **no `UTF8=ACCEPT`, no `ESEARCH`, no `SORT`, no `THREAD`, no `CONDSTORE`** | folder and mailbox names arrive as modified UTF-7; there is no server-side sort or bounded search. Ordering and bounding are ours, in `tools/` — which is what AD-9 already says |
+| `smtp.yandex.ru:465` (implicit TLS) advertises `AUTH LOGIN PLAIN XOAUTH2` | the send path is viable on 465 |
+| **`smtp.yandex.ru:587` closes the connection immediately** — no greeting, no STARTTLS | the conventional submission port is a dead end here. Use 465. A reader who "fixes" this to 587 because 587 is standard will produce a connector that cannot send |
+| Yandex OAuth supports PKCE, and with `code_verifier` the client secret is not required | the connector is a **public client**: there is no application secret to store, and none should be invented. See "The redirect URI" below |
+| **The registration form rejects `http://localhost:8765/callback` as a redirect URI** | FR4.1's "transient local listener" is not achievable on this platform. Amended in story 2.1 |
+| Scopes are `mail:imap_full` (read and delete), `mail:imap_ro` (read), `mail:smtp` (send) | the PRD's scope names are correct |
+| `imap_tools` 1.15.0 exposes `MailBox.xoauth2(username, access_token, initial_folder='INBOX')` | a direct fit; no hand-rolled SASL |
+| `imap_tools` decodes modified UTF-7 in `folder.list()` via `imap_tools.imap_utf7`. Verified by roundtrip on `Входящие`, `Отправленные`, `Спам`, `Удалённые`, `Черновики`, and a name containing the hierarchy delimiter | folder names need no decoding at our layer. **This corrects a wrong finding taken minutes earlier**: `imap_tools.utils` has `utf7_encode` and no `utf7_decode`, and generalising from that absence produced "the library cannot decode" — which reading `folder.list()` disproved. One module's contents are not the library's |
+| `folder.status(folder, options)` returns `Dict[str, int]` — one request per folder | message counts are **N+1**. Story 2.1 bounds this by taking `STATUS` only for the folders a page actually returns |
+
+**Still unverified, and load-bearing.** Cyrillic IMAP `SEARCH` is reported broken by many
+users and has never been measured by this project. AD-9 already routes around it — fetch by
+date, filter in `tools/` — so nothing depends on it working. Do not add a text-match
+parameter to `client/` on the strength of a successful one-off test.
+
+## The redirect URI, and why the flow changed
+
+FR4.1 and story 2.1 both specify a transient local listener. Measured: the Yandex OAuth
+registration form refuses `http://localhost:8765/callback`, and the documentation for
+API-access applications states the redirect URI is fixed at
+`https://oauth.yandex.ru/verification_code` and cannot be edited.
+
+The flow is therefore: the CLI prints the authorization URL, the operator opens it and
+approves, Yandex displays a code, and the operator pastes it into the waiting prompt. It is
+the same shape as the app-password step epic 1 already asks of them, and it works on a
+machine with no browser — which the listener would not have.
+
+Nothing else about FR4.1 changes: PKCE protects the exchange, the refresh token goes to the
+keychain, renewal is automatic, and no secret is ever passed as a command-line argument.
+
+## Practices carried from epic 1's retrospective
+
+These are not style preferences. Each names a defect that actually shipped and was caught.
+
+**Measure the live server before writing a spec that writes.** Five for five in epic 1; the
+table above is this epic's first instalment.
+
+**Test-first belongs in the spec's acceptance criteria, not in instructions to the
+implementer.** The build skill forwards the spec as the single source of truth, so a
+requirement stated anywhere else does not arrive. Epic 1 lost three stories to this.
+
+**A fake models the *server's observed behaviour*, never the code under test.**
+(Action item ai-1-6.) Two of eight stories in epic 1 shipped a fake that agreed with the
+code because it was built from the code: one pre-set a value the code was supposed to
+derive, the other normalised both sides of a comparison so a mis-encoded address matched
+itself. Both tests passed. Both were worthless. If a fake's behaviour cannot be traced to
+something the real server was seen doing, it is a mirror.
+
+**Verify a cross-layer rule against the library's behaviour, not our call site.**
+(Action item ai-1-7.) Epic 1 forbade blind retries of a write and enforced it correctly in
+its own code — while `caldav` retried a PUT on 429 one layer below. A rule is only held if
+the layer that actually issues the request holds it. For this epic that means reading what
+`imap_tools` and `smtplib` do on failure before claiming anything about retries or
+idempotence.
+
+**Prove a test is load-bearing by breaking the code.** Mutation caught eight tests in epic 1
+that passed against broken code, and one more on the work that closed it.
+
+**A settled outcome beats an honest hedge.** Epic 1 ended by replacing "the write may or may
+not have happened" with one read that says which. **In this epic that pattern does not
+transfer intact**: a sent message cannot be read back the way a calendar object can. Story
+2.8 owes an explicit answer for what a lost SMTP answer means, and it is the most dangerous
+unknown in the epic — a blind retry sends the message twice, to real people.
+
+## Cross-story dependencies
+
+Story 2.1 builds OAuth and is a hard prerequisite for every other story here, and for all of
+epic 3. Read stories (2.2–2.4) precede write stories (2.6–2.9). Story 2.5 needs at least one
+read and one write path in place to have evidence to reason from. Story 2.10 needs the whole
+epic plus epic 1.

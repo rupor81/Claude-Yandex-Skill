@@ -69,8 +69,8 @@ development_status:
   epic-1-retrospective: done
 
   # Epic 2: Mail connector, end to end
-  epic-2: backlog
-  2-1-authorise-the-mailbox-and-list-its-folders: backlog
+  epic-2: in-progress
+  2-1-authorise-the-mailbox-and-list-its-folders: ready-for-dev
   2-2-list-message-headers-over-a-date-range: backlog
   2-3-read-a-message-body-with-honest-truncation: backlog
   2-4-inspect-and-download-attachments: backlog
@@ -156,9 +156,19 @@ action_items:
     epic: 1
     source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
     summary: Write the rule "a fake models the server's observed behaviour, never the code under test" into the epic 2 context; two of eight stories shipped a self-validating fake.
-    status: open
+    status: done
+    outcome: >-
+      Done 2026-09-09. Written into epic-2-context.md as "a fake models the server's observed
+      behaviour, never the code under test", with both epic 1 failures named: one fake pre-set
+      a value the code was supposed to derive, the other normalised both sides of a comparison
+      so a mis-encoded address matched itself.
   - id: ai-1-7
     epic: 1
     source: '{project-root}/_bmad-output/implementation-artifacts/epic-1-retro-2026-09-07.md'
     summary: Verify each cross-layer rule against the library's actual behaviour rather than our call site; caldav retried a PUT on 429 under a no-retry rule.
-    status: open
+    status: done
+    outcome: >-
+      Done 2026-09-09. Written into epic-2-context.md, with the epic 1 instance named: the
+      no-blind-retry rule was held correctly in our code while caldav retried a PUT on 429 one
+      layer below. For this epic it means reading what imap_tools and smtplib do on failure
+      before claiming anything about retries or idempotence.
