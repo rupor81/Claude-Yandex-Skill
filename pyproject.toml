@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "yandex-core",
     "yandex-calendar-mcp",
+    "yandex-mail-mcp",
     "yandex-mcp-cli",
 ]
 
@@ -18,6 +19,7 @@ members = ["packages/*"]
 [tool.uv.sources]
 yandex-core = { workspace = true }
 yandex-calendar-mcp = { workspace = true }
+yandex-mail-mcp = { workspace = true }
 yandex-mcp-cli = { workspace = true }
 
 [tool.pytest.ini_options]
@@ -29,6 +31,7 @@ addopts = "-p no:cacheprovider"
 pythonpath = [
     "packages/yandex-core/src",
     "packages/yandex-calendar-mcp/src",
+    "packages/yandex-mail-mcp/src",
     "packages/yandex-mcp-cli/src",
 ]
 
@@ -51,6 +54,7 @@ extend-exclude = ["_bmad", "_bmad-output", ".venv"]
 src = [
     "packages/yandex-core/src",
     "packages/yandex-calendar-mcp/src",
+    "packages/yandex-mail-mcp/src",
     "packages/yandex-mcp-cli/src",
 ]
 

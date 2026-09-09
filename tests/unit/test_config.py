@@ -141,3 +141,71 @@ def test_a_stray_name_key_inside_a_profile_does_not_duplicate_the_keyword():
     profile = load_profile("x")
     assert profile.name == "x"
     assert profile.login == "me@yandex.ru"
+
+
+# -- the mail additions, epic 2 -------------------------------------------
+
+
+def test_mail_hosts_default_to_the_ones_that_were_measured_to_work():
+    """587 is the conventional submission port and it is a dead end here.
+
+    Measured against the live server: smtp.yandex.ru:587 closes the connection
+    immediately, with no greeting. A reader who "corrects" 465 to 587 because
+    587 is standard produces a connector that cannot send at all, so the
+    default is asserted rather than left to whoever edits this next.
+    """
+    profile = Profile(name="personal", login="me@yandex.ru")
+
+    assert (profile.imap_host, profile.imap_port) == ("imap.yandex.ru", 993)
+    assert (profile.smtp_host, profile.smtp_port) == ("smtp.yandex.ru", 465)
+
+
+def test_a_profile_without_mail_set_up_has_no_client_id():
+    """Calendar needs none, and inventing one would make `login mail` look done."""
+    assert Profile(name="personal", login="me@yandex.ru").oauth_client_id is None
+
+
+def test_the_client_id_round_trips_and_is_not_a_secret_store():
+    """It travels in the authorization URL by design, so it belongs in config.
+
+    The keychain is for the refresh token. Putting a public identifier there
+    would mean the operator cannot see or edit what their connector claims to be.
+    """
+    write_profile(
+        Profile(name="personal", login="me@yandex.ru", oauth_client_id="abc123")
+    )
+    assert load_profile().oauth_client_id == "abc123"
+
+    from yandex_core.config import config_path
+
+    assert "abc123" in config_path().read_text(), "the client_id is not in the file"
+
+
+def test_setting_up_calendar_again_does_not_forget_the_mail_login():
+    """`setup calendar` writes a Profile that knows nothing about mail.
+
+    If that write dropped the client_id, an operator repairing their calendar
+    password would silently break their mailbox, and nothing would say so.
+    """
+    write_profile(
+        Profile(name="personal", login="me@yandex.ru", oauth_client_id="abc123")
+    )
+    write_profile(Profile(name="personal", login="me@yandex.ru"))
+
+    assert load_profile().oauth_client_id == "abc123"
+
+
+def test_hosts_written_by_hand_into_the_file_are_honoured():
+    """A Yandex 360 domain may front these on its own names."""
+    write_profile(Profile(name="personal", login="me@yandex.ru"))
+    from yandex_core.config import config_path
+
+    path = config_path()
+    path.write_text(
+        path.read_text().replace(
+            "[profiles.personal]", '[profiles.personal]\nimap_host = "imap.example.ru"'
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_profile().imap_host == "imap.example.ru"

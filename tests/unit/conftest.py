@@ -504,3 +504,124 @@ def install_fake_dav_client(
 
     monkeypatch.setattr(caldav, "DAVClient", FakeDAVClient)
     return closed
+
+
+# =========================================================================
+# Mail: IMAP fakes, epic 2
+# =========================================================================
+#
+# Modelled on what `imap_tools` 1.15.0 and the live Yandex server were observed
+# to do, never on what the client under test finds convenient:
+#
+# * `MailBox(host, port, timeout)` then `.xoauth2(login, token, initial_folder)`,
+#   which returns itself and raises `MailboxLoginError` when the server refuses.
+# * `folder.list()` answers `FolderInfo(name, delim, flags)` with the name
+#   already decoded from modified UTF-7 -- verified by roundtrip, including
+#   Cyrillic and a name containing the hierarchy delimiter.
+# * Yandex's LIST uses `|` as the delimiter and marks containers `\Noselect`.
+# * `folder.status(folder, options)` answers `Dict[str, int]` and costs one
+#   request per folder -- which is why this fake counts them.
+
+
+class FakeFolderInfo:
+    """What `imap_tools.folder.list()` hands back."""
+
+    __slots__ = ("delim", "flags", "name")
+
+    def __init__(self, name, delim="|", flags=("\\HasNoChildren",)):
+        self.name = name
+        self.delim = delim
+        self.flags = tuple(flags)
+
+
+class FakeFolderManager:
+    def __init__(self, box):
+        self._box = box
+
+    def list(self, folder="", search_args="*", subscribed_only=False):
+        self._box.listed += 1
+        if self._box.list_raises is not None:
+            raise self._box.list_raises
+        return list(self._box.folders)
+
+    def status(self, folder=None, options=None):
+        # One request per folder. The test that bounds counts to a page counts
+        # exactly these.
+        self._box.statused.append(folder)
+        error = (self._box.status_raises or {}).get(folder)
+        if error is not None:
+            raise error
+        return dict(self._box.status_by_folder.get(folder, {}))
+
+    def set(self, folder):
+        self._box.selected.append(folder)
+
+
+class FakeMailBox:
+    """One IMAP connection, as `imap_tools` presents one."""
+
+    def __init__(
+        self,
+        folders=(),
+        status_by_folder=None,
+        login_raises=None,
+        list_raises=None,
+        status_raises=None,
+        connect_raises=None,
+    ):
+        self.folders = [
+            f if isinstance(f, FakeFolderInfo) else FakeFolderInfo(f) for f in folders
+        ]
+        self.status_by_folder = dict(status_by_folder or {})
+        self.login_raises = login_raises
+        self.list_raises = list_raises
+        self.status_raises = dict(status_raises or {})
+        self.connect_raises = connect_raises
+        #: Everything a test may want to hold the client to.
+        self.authenticated_as = None
+        self.initial_folder = "<not called>"
+        self.listed = 0
+        self.statused = []
+        self.selected = []
+        self.logged_out = 0
+        self.folder = FakeFolderManager(self)
+
+    def xoauth2(self, username, access_token, initial_folder="INBOX"):
+        if self.login_raises is not None:
+            raise self.login_raises
+        self.authenticated_as = (username, access_token)
+        self.initial_folder = initial_folder
+        if initial_folder is not None:
+            self.folder.set(initial_folder)
+        return self
+
+    def logout(self):
+        self.logged_out += 1
+        return ("OK", [b"logged out"])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.logged_out += 1
+        return False
+
+
+def install_fake_mailbox(monkeypatch, box, *, module=None):
+    """Replace the `MailBox` the mail client constructs.
+
+    Returns a list of the (host, port, timeout) triples it was constructed with,
+    so a test can see that the measured hosts were the ones actually dialled.
+    """
+    from yandex_mail_mcp.client import imap_client
+
+    built = []
+
+    def factory(host="", port=993, timeout=None, **kwargs):
+        built.append({"host": host, "port": port, "timeout": timeout})
+        if box.connect_raises is not None:
+            raise box.connect_raises
+        return box
+
+    monkeypatch.setattr(module or imap_client, "MailBox", factory)
+    return built

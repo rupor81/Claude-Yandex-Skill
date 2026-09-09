@@ -18,6 +18,11 @@ from pydantic import BaseModel, Field, ValidationError
 from .errors import NotConfigured, ProtocolError
 
 __all__ = [
+    "DEFAULT_CALDAV_URL",
+    "DEFAULT_IMAP_HOST",
+    "DEFAULT_IMAP_PORT",
+    "DEFAULT_SMTP_HOST",
+    "DEFAULT_SMTP_PORT",
     "Profile",
     "config_dir",
     "config_path",
@@ -27,6 +32,16 @@ __all__ = [
 ]
 
 DEFAULT_CALDAV_URL = "https://caldav.yandex.ru"
+
+#: Measured 2026-09-09 against the live servers. The IMAP host advertises
+#: ``AUTH=XOAUTH2``; the SMTP host advertises it on **465**, and **587 closes the
+#: connection immediately, with no greeting at all**. 587 is the conventional
+#: submission port, which makes it exactly the kind of thing a later reader
+#: "corrects" this to -- and a connector that cannot send is the result.
+DEFAULT_IMAP_HOST = "imap.yandex.ru"
+DEFAULT_IMAP_PORT = 993
+DEFAULT_SMTP_HOST = "smtp.yandex.ru"
+DEFAULT_SMTP_PORT = 465
 PROFILE_ENV_VAR = "YANDEX_MCP_PROFILE"
 CONFIG_DIR_ENV_VAR = "YANDEX_MCP_CONFIG_DIR"
 DEFAULT_PROFILE_NAME = "default"
@@ -43,6 +58,18 @@ class Profile(BaseModel):
     name: str
     login: str = Field(description="Yandex login or full email address.")
     caldav_url: str = DEFAULT_CALDAV_URL
+
+    #: The OAuth application this connector presents itself as. Not a secret --
+    #: it travels in the authorization URL by design -- so it lives here, where
+    #: the operator can read and edit it, rather than in the keychain. The
+    #: refresh token is the secret, and that is `credentials`' business.
+    oauth_client_id: str | None = None
+
+    #: Overridable because a Yandex 360 domain may front these on its own names.
+    imap_host: str = DEFAULT_IMAP_HOST
+    imap_port: int = DEFAULT_IMAP_PORT
+    smtp_host: str = DEFAULT_SMTP_HOST
+    smtp_port: int = DEFAULT_SMTP_PORT
 
 
 def config_dir() -> Path:
@@ -150,6 +177,14 @@ def write_profile(profile: Profile, *, make_default: bool = True) -> Path:
     entry = dict(existing) if isinstance(existing, dict) else {}
     entry["login"] = profile.login
     entry["caldav_url"] = profile.caldav_url
+    # Written only when set, and never cleared by a write that does not carry
+    # one: `setup calendar` builds a Profile that knows nothing about mail, and
+    # an operator repairing their calendar password must not lose their mailbox
+    # authorisation without being told. Hosts stay out of the file entirely
+    # unless somebody put them there, in which case the read-modify-write above
+    # has already preserved them.
+    if profile.oauth_client_id:
+        entry["oauth_client_id"] = profile.oauth_client_id
     entry.pop("name", None)
     profiles[profile.name] = entry
 

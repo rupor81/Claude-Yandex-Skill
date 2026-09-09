@@ -1,0 +1,23 @@
+[project]
+name = "yandex-mail-mcp"
+version = "0.1.0"
+description = "MCP server exposing a Yandex mailbox over IMAP and SMTP."
+requires-python = ">=3.13"
+# imap-tools is the IMAP client; it is imported directly by client/imap_client.py.
+# It arrives with nothing else here, so it is named in its own right.
+dependencies = [
+    "yandex-core",
+    "imap-tools>=1.15",
+    "anyio>=4",
+    "mcp>=2",
+]
+
+[project.scripts]
+yandex-mail-mcp = "yandex_mail_mcp.server:main"
+
+[tool.uv.sources]
+yandex-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

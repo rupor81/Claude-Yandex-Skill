@@ -5,8 +5,9 @@ Disk to follow. Each connector is a local stdio MCP server; the parts that are n
 transport-specific live in a shared core, so the same tools can later be served over
 HTTP with OAuth without being rewritten.
 
-**Status:** the Calendar connector is complete — seven tools, 691 unit tests, 12 live
-tests against a real account. Mail and Disk are planned.
+**Status:** the Calendar connector is complete — seven tools, 12 live tests against a
+real account. The Mail connector is under way: it is authorised and lists its folders.
+Disk is planned.
 
 ---
 
@@ -21,6 +22,7 @@ tests against a real account. Mail and Disk are planned.
 | `calendar_event_create` | write | Adds an event, and reports what the server stored |
 | `calendar_event_update` | destructive | Changes an event, conditionally, with an explicit scope |
 | `calendar_event_delete` | destructive | Removes an event, with an explicit scope |
+| `mail_folders_list` | read | Which folders the mailbox has, and how much is in them |
 
 Two rules shape every one of them:
 
@@ -36,7 +38,8 @@ recoverable from each other and guessing is catastrophic in one direction.
 
 - Python 3.13 (pinned in `.python-version`)
 - [`uv`](https://docs.astral.sh/uv/)
-- A Yandex account, and an **app password** for CalDAV
+- A Yandex account
+- An **app password** for CalDAV, and a registered **OAuth application** for Mail
 
 Yandex CalDAV rejects OAuth bearer tokens — a token that works for every other Yandex
 API is refused by the calendar endpoint. The only credential it accepts is an app
@@ -44,6 +47,15 @@ password, and app passwords can only be created by hand at
 <https://id.yandex.ru/security/app-passwords>. On a Yandex 360 account an administrator
 can disable them entirely; the server then reports organisation policy rather than a
 wrong password.
+
+Mail is the opposite: IMAP will not take an app password, so it needs OAuth — and that
+needs an application you register once at <https://oauth.yandex.ru>, with the rights
+`mail:imap_full` and `mail:smtp`. The connector is a **public client**: it proves itself
+with PKCE, so there is no application secret to store or to leak.
+
+Yandex does not accept a `localhost` redirect URI for these applications — measured, not
+assumed — so it displays the authorization code on a page and you paste it back. That is
+also why this works on a machine with no browser.
 
 ## Install
 
@@ -63,6 +75,18 @@ The command explains how to create the app password, then reads it from a hidden
 prompt. It is stored in the system keychain, falling back to a `0600` file under the
 config directory. It never appears in this repository, in tool arguments, or in logs.
 
+For Mail, authorise instead of setting up — pass your application's ClientID once and it
+is remembered:
+
+```bash
+uv run yandex-mcp login mail --client-id <ClientID>
+```
+
+It prints a URL naming exactly the rights it asks for, so you can read them before you
+grant them. Approve it, and paste back the code Yandex shows (the whole address of that
+page works too). The refresh token goes to the keychain; the access token is not stored
+at all, and is renewed silently whenever a mail tool runs.
+
 Then check that it actually works — one real call per service:
 
 ```bash
@@ -81,7 +105,8 @@ and Yandex 360 domain accounts.
 |---|---|
 | `YANDEX_MCP_PROFILE` | Which profile to use; otherwise the file's default |
 | `YANDEX_MCP_CONFIG_DIR` | Where the config and fallback secret file live |
-| `YANDEX_MCP_CALENDAR_<PROFILE>_PASSWORD` | Overrides the stored secret, consulted first |
+| `YANDEX_MCP_CALENDAR_<PROFILE>_PASSWORD` | Overrides the stored calendar app password |
+| `YANDEX_MCP_MAIL_<PROFILE>_PASSWORD` | Overrides the stored mail refresh token |
 
 ## Wire it into a client
 
@@ -90,6 +115,9 @@ and Yandex 360 domain accounts.
   "mcpServers": {
     "yandex-calendar": {
       "command": "/absolute/path/to/.venv/bin/yandex-calendar-mcp"
+    },
+    "yandex-mail": {
+      "command": "/absolute/path/to/.venv/bin/yandex-mail-mcp"
     }
   }
 }
@@ -146,11 +174,12 @@ and never twice in the same place.
 packages/
   yandex-core/          contracts shared by every connector:
                         errors, Page/Chunk results, cursors, risk registry,
-                        credentials, server construction
+                        credentials, OAuth with PKCE, server construction
   yandex-calendar-mcp/  the calendar server
     client/             CalDAV; the only place that touches the network
     tools/              MCP tools; filtering and validation live here
-  yandex-mcp-cli/       yandex-mcp setup / verify
+  yandex-mail-mcp/      the mail server, same shape over IMAP
+  yandex-mcp-cli/       yandex-mcp setup / login / verify
 tests/unit/             no network
 tests/live/             a real account, opt-in
 ```
@@ -166,9 +195,11 @@ before changing anything:
 - `planning-artifacts/architecture/.../ARCHITECTURE-SPINE.md` — the twelve invariants
 - `implementation-artifacts/deferred-work.md` — every known limit, with its reasoning
 
-Six documented behaviours of this server were measured to be false, including that
-`If-Match` is ignored on DELETE and that a successful conditional PUT answers 201. Each
-is recorded where the code that works around it lives. Measure before you assume.
+Several documented behaviours of this platform were measured to be false, including that
+`If-Match` is ignored on DELETE, that a successful conditional PUT answers 201, and that
+`smtp.yandex.ru:587` — the conventional submission port — closes the connection outright
+while 465 works. Each is recorded where the code that works around it lives. Measure
+before you assume.
 
 ## License
 

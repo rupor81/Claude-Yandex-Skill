@@ -49,21 +49,33 @@ jobs:
 
       # The connectors are useless if the server cannot be started and asked what
       # it offers, and that path imports every module the tests import separately.
-      - name: Server starts and lists its tools
+      - name: Servers start and list their tools
         run: |
           env -u PYTHONPATH uv run --no-sync python - <<'PY'
           import anyio
           from yandex_calendar_mcp.server import build_calendar_server
+          from yandex_core.config import Profile
           from yandex_core.risk import RISK_REGISTRY
+          from yandex_mail_mcp.server import build_mail_server
 
-          server = build_calendar_server()
-          tools = anyio.run(server.list_tools)
-          names = sorted(t.name for t in tools)
-          expected = sorted(RISK_REGISTRY)
-          assert names == expected, f"{names} != {expected}"
-          destructive = sorted(
-              t.name for t in tools if t.annotations and t.annotations.destructive_hint
+          # A profile is supplied rather than loaded: CI has no configuration,
+          # and what is under test is the wiring, not the operator's machine.
+          profile = Profile(
+              name="ci", login="ci@example.invalid", oauth_client_id="ci"
           )
-          assert destructive == ["calendar_event_delete", "calendar_event_update"], destructive
+          names, destructive = [], []
+          for build in (build_calendar_server, build_mail_server):
+              for tool in anyio.run(build(profile).list_tools):
+                  names.append(tool.name)
+                  if tool.annotations and tool.annotations.destructive_hint:
+                      destructive.append(tool.name)
+
+          # Every registered tool, and nothing that is not in the registry --
+          # which is what makes the annotations trustworthy.
+          assert sorted(names) == sorted(RISK_REGISTRY), sorted(names)
+          assert sorted(destructive) == [
+              "calendar_event_delete",
+              "calendar_event_update",
+          ], sorted(destructive)
           print(f"{len(names)} tools, {len(destructive)} destructive")
           PY

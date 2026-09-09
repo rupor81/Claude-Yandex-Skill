@@ -49,6 +49,7 @@ RISK_REGISTRY: dict[str, RiskClass] = {
     "calendar_event_create": RiskClass.WRITE,
     "calendar_event_update": RiskClass.DESTRUCTIVE,
     "calendar_event_delete": RiskClass.DESTRUCTIVE,
+    "mail_folders_list": RiskClass.READ,
 }
 
 _ANNOTATIONS: dict[RiskClass, dict[str, bool]] = {

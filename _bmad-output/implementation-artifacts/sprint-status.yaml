@@ -70,7 +70,7 @@ development_status:
 
   # Epic 2: Mail connector, end to end
   epic-2: in-progress
-  2-1-authorise-the-mailbox-and-list-its-folders: ready-for-dev
+  2-1-authorise-the-mailbox-and-list-its-folders: review
   2-2-list-message-headers-over-a-date-range: backlog
   2-3-read-a-message-body-with-honest-truncation: backlog
   2-4-inspect-and-download-attachments: backlog

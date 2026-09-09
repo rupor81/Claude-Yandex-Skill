@@ -21,14 +21,55 @@ import sys
 from yandex_core.config import (
     DEFAULT_CALDAV_URL,
     Profile,
+    load_profile,
     write_profile,
 )
 from yandex_core.credentials import delete_secret, store_secret
-from yandex_core.errors import YandexError
+from yandex_core.errors import ProtocolError, YandexError
+from yandex_core.oauth import (
+    default_post as oauth_post,
+)
+from yandex_core.oauth import (
+    exchange_code,
+    extract_code,
+    start_login,
+)
 
 from .verify import render_results, run_checks
 
 __all__ = ["build_parser", "main"]
+
+#: What the mail connector asks for, and nothing more. `mail:imap_full` covers
+#: reading and deleting; `mail:smtp` covers sending. Both are requested at login
+#: because widening the grant later means another trip through the browser for
+#: the operator, and this epic's write stories will need the second one.
+MAIL_SCOPES = ("mail:imap_full", "mail:smtp")
+
+LOGIN_MAIL_DESCRIPTION = (
+    "Authorise the mailbox over OAuth and store the refresh token. Yandex IMAP "
+    "will not take a password you can create by hand, the way the calendar does."
+)
+
+LOGIN_MAIL_EXPLANATION = """\
+This connector is a *public client*: it proves itself with PKCE rather than with
+an application secret, so there is no secret to store or to leak.
+
+You need a registered application once, and only once:
+
+  1. Open https://oauth.yandex.ru and create an application.
+  2. Give it the rights `mail:imap_full` and `mail:smtp`.
+  3. Copy its ClientID and pass it as --client-id; it is remembered afterwards.
+
+Yandex does not accept a `localhost` redirect for these applications -- measured,
+not assumed -- so it displays the authorization code on a page instead of sending
+it anywhere. This command prints a URL, you approve it in a browser, and you
+paste back the code Yandex shows. Pasting the whole address of that page works
+too. Nothing is ever passed as a command-line argument.
+
+The refresh token is stored in your system keychain (falling back to a 0600 file
+under the config directory). The access token is not stored at all: it lasts
+about an hour and is renewed silently whenever a mail tool runs.
+"""
 
 APP_PASSWORD_EXPLANATION = """\
 Yandex CalDAV does not accept OAuth access tokens: a bearer token that works for
@@ -114,6 +155,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calendar.set_defaults(handler=setup_calendar)
 
+    login = commands.add_parser(
+        "login",
+        help="Authorise a service over OAuth.",
+        description="Authorise one Yandex service that requires OAuth.",
+    )
+    login_services = login.add_subparsers(dest="service", required=True)
+
+    login_mail = login_services.add_parser(
+        "mail",
+        help="Authorise the mailbox and store its refresh token.",
+        description=LOGIN_MAIL_DESCRIPTION,
+        epilog=LOGIN_MAIL_EXPLANATION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    login_mail.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            "Profile to authorise (default: the profile selected by "
+            "YANDEX_MCP_PROFILE, or the configured default)."
+        ),
+    )
+    login_mail.add_argument(
+        "--client-id",
+        default=None,
+        help=(
+            "ClientID of your Yandex OAuth application. Public by design -- it "
+            "travels in the authorization URL -- so it is an argument, and it "
+            "is remembered in the profile afterwards."
+        ),
+    )
+    login_mail.set_defaults(handler=login_mail_command)
+
     verify = commands.add_parser(
         "verify",
         help="Check that each configured service actually works.",
@@ -186,6 +260,81 @@ def setup_calendar(args: argparse.Namespace) -> int:
     print(f"\nApp password stored in: {location}")
     print(f"Profile {args.profile!r} written to: {path}")
     print(f"Select it at server start with YANDEX_MCP_PROFILE={args.profile}.")
+    return 0
+
+
+def login_mail_command(args: argparse.Namespace) -> int:
+    """Run the Authorization Code flow for Mail and store what it yields.
+
+    The order matters: the code is exchanged *before* anything is written, so a
+    login that fails leaves the previous authorisation exactly as it was. An
+    operator whose re-login failed still has the mailbox they had before.
+    """
+    profile = load_profile(args.profile)
+    client_id = args.client_id or profile.oauth_client_id
+    if not client_id:
+        print(
+            "This profile has no OAuth application yet, so there is nothing to "
+            "authorise as.\n\n"
+            "Register one at https://oauth.yandex.ru with the rights "
+            "`mail:imap_full` and `mail:smtp`, then run:\n"
+            "  yandex-mcp login mail --client-id <ClientID>\n\n"
+            "Nothing was stored.",
+            file=sys.stderr,
+        )
+        return 2
+
+    request = start_login(client_id=client_id, scopes=MAIL_SCOPES)
+    # `request.state` is sent and deliberately not checked here, because there
+    # is nothing to check it against: Yandex displays the code on a page rather
+    # than redirecting, so no response comes back carrying a `state` at all. The
+    # parameter it guards against -- a forged callback -- does not exist in this
+    # flow; the operator is the channel. `oauth.checked_state` stays for a flow
+    # that does redirect, and this comment stays so nobody reads its absence
+    # here as an oversight.
+    print(LOGIN_MAIL_EXPLANATION)
+    print("Open this address, approve the access, and copy the code it shows:\n")
+    print(f"  {request.url}\n")
+
+    # Hidden, like the app-password prompt: a code is short-lived but it is a
+    # credential while it lives, and terminals get scrolled back through.
+    pasted = getpass.getpass("Code from Yandex (input hidden): ")
+    try:
+        code = extract_code(pasted)
+    except ProtocolError as exc:
+        print(f"{exc} Nothing was stored.", file=sys.stderr)
+        return 2
+
+    tokens = exchange_code(
+        client_id=client_id,
+        code=code,
+        code_verifier=request.code_verifier,
+        post=oauth_post,
+    )
+
+    location = store_secret("mail", profile.name, tokens.refresh_token or "")
+    try:
+        path = write_profile(
+            profile.model_copy(update={"oauth_client_id": client_id}),
+            make_default=False,
+        )
+    except BaseException:
+        # A stored token with no profile naming it is an orphan nothing will
+        # ever read or clean up, so it does not outlive the failure.
+        try:
+            delete_secret("mail", profile.name)
+        except Exception as cleanup_failure:  # noqa: BLE001 - reported, not hidden
+            print(
+                f"warning: the refresh token could not be removed after the "
+                f"profile write failed ({cleanup_failure}); remove it by hand.",
+                file=sys.stderr,
+            )
+        raise
+
+    # Deliberately reports where, never what.
+    print(f"\nRefresh token stored in: {location}")
+    print(f"Profile {profile.name!r} updated in: {path}")
+    print("Check it with: yandex-mcp verify")
     return 0
 
 

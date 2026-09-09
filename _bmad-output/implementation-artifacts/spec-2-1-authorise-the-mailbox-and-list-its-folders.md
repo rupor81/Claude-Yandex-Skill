@@ -2,7 +2,7 @@
 title: 'Story 2.1 — Authorise the mailbox and list its folders'
 type: 'feature'
 created: '2026-09-09'
-status: 'ready-for-dev'
+status: 'review'
 review_loop_iteration: 0
 baseline_commit: '514b7e058d1edf490ec9e0f42dd0849616c48646'
 context:
@@ -104,14 +104,14 @@ returning the account's real folders — the vertical slice story 1.1 was for Ca
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] Failing tests for every matrix row, before any implementation
-- [ ] `core/oauth.py` -- PKCE authorization URL, exchange, refresh, with `state` checked
-- [ ] `core/config.py` -- `client_id` and mail hosts on the profile
-- [ ] `yandex-mail-mcp` package skeleton, wired like the calendar server
-- [ ] `client/imap_client.py` -- XOAUTH2 connect, folder list, bounded `STATUS`
-- [ ] `tools/folders.py` -- `mail_folders_list` returning a `Page`
-- [ ] `cli` -- `login mail`, and `verify` covering mail
-- [ ] `tests/live` -- authorise a real mailbox and list its real folders
+- [x] Failing tests for every matrix row, before any implementation
+- [x] `core/oauth.py` -- PKCE authorization URL, exchange, refresh, with `state` checked
+- [x] `core/config.py` -- `client_id` and mail hosts on the profile
+- [x] `yandex-mail-mcp` package skeleton, wired like the calendar server
+- [x] `client/imap_client.py` -- XOAUTH2 connect, folder list, bounded `STATUS`
+- [x] `tools/folders.py` -- `mail_folders_list` returning a `Page`
+- [x] `cli` -- `login mail`, and `verify` covering mail
+- [x] `tests/live` -- authorise a real mailbox and list its real folders
 
 **Acceptance Criteria:**
 - Given no stored Mail credentials, when `yandex-mcp login mail` runs, then it prints an
@@ -182,6 +182,58 @@ story uses it.
 - `uv run --no-sync python scripts/check_bookkeeping.py` -- expected: records agree
 - a stdio `tools/list` against the mail server -- expected: one tool, read-only
 
+## Verification (measured)
+
+788 unit tests pass with no network -- 62 of them new, and every one of them
+failing before the code it names existed. `ruff check` and `ruff format --check`
+are clean; `scripts/check_bookkeeping.py` reports the records agree. Both
+servers start over stdio and list eight tools between them, `mail_folders_list`
+alone being the new one and read-only. The live mail suite is written and skips
+with the reason named, because the mailbox is not authorised yet -- it needs an
+OAuth application the operator registers.
+
+**Mutation-proved.** 26 mutations were run and 26 are caught. Six survived on
+first pass and each exposed a real gap rather than a redundant check:
+
+- the client's guard against asking a `\Noselect` folder for counts was invisible
+  from the tool, which filters those out first -- so the client is now tested on
+  its own, as anything another caller may use should be;
+- a "the selector was never called" fallback in the tool was dead code that would
+  have masked a broken client while returning a page whose limit and request cost
+  were both unapplied. It is a refusal now;
+- the command's own missing-`client_id` guard was indistinguishable from
+  `start_login`'s, so the test now asserts the one thing only it gives: the exact
+  command to type next;
+- three branches of the mail check in `verify` -- an unusable stored token, a
+  half-configured profile, and redaction of a token quoted by a library's own
+  error -- had no test at all.
+
+**Two defects the new tests found in existing code.** `verify` advised
+`yandex-mcp setup mail`, a command that has never existed; it was a plausible
+placeholder written in epic 1 and became wrong advice the moment mail was built.
+And `test_layering.py` asserted that `tools/` imports no `mcp` while AD-1's
+actual rule is that `tools/` imports no *protocol library* -- an `import caldav`
+in a tool module would have passed for all of epic 1.
+
 ## Suggested Review Order
 
-To be filled by the implementation report.
+**The flow this platform actually allows**
+
+- PKCE, the fixed redirect, and why no application secret exists.
+  [`oauth.py`](../../packages/yandex-core/src/yandex_core/oauth.py)
+
+- Why nothing checks `state`, said out loud rather than left as an absence.
+  [`main.py`](../../packages/yandex-mcp-cli/src/yandex_mcp_cli/main.py)
+
+**Costing only what was asked for**
+
+- The window is decided above and handed down, so one STATUS is spent per folder returned.
+  [`folders.py`](../../packages/yandex-mail-mcp/src/yandex_mail_mcp/tools/folders.py)
+
+- `initial_folder=None`: the library's default SELECTs a folder nobody needs.
+  [`imap_client.py`](../../packages/yandex-mail-mcp/src/yandex_mail_mcp/client/imap_client.py)
+
+**Absent is not zero**
+
+- A container and a failed STATUS both say why, and neither reports a count.
+  [`imap_client.py`](../../packages/yandex-mail-mcp/src/yandex_mail_mcp/client/imap_client.py)

@@ -52,6 +52,7 @@ from yandex_core.errors import (
     TransportError,
     YandexError,
 )
+from yandex_core.oauth import refresh_access_token
 
 __all__ = [
     "CHECKS",
@@ -127,14 +128,21 @@ def _cause_for(exc: BaseException) -> str:
     return "unexpected"
 
 
+#: Not every service is configured by `setup`. Mail is authorised with `login`,
+#: because what it stores is an OAuth grant and not a password anyone can type.
+#: A hint naming a command that does not exist is worse than none: the operator
+#: reads it as the fix, runs it, and gets an argparse error about `setup mail`.
+_CONFIGURE_COMMAND = {"mail": "login mail"}
+
+
 def setup_hint(service: str, profile: str | None = None) -> str:
     """The command that would configure exactly what was just checked.
 
-    A hint naming a different service, or writing the default profile when a
-    named one was verified, tells the operator to fix something other than the
-    thing that is broken.
+    A hint naming a different service, a command that does not exist, or the
+    default profile when a named one was verified, all tell the operator to fix
+    something other than the thing that is broken.
     """
-    command = f"yandex-mcp setup {service}"
+    command = f"yandex-mcp {_CONFIGURE_COMMAND.get(service, f'setup {service}')}"
     if profile and profile != DEFAULT_PROFILE_NAME:
         command += f" --profile {profile}"
     return f"Run `{command}` to configure it."
@@ -279,13 +287,134 @@ def check_calendar(profile_name: str | None = None) -> ServiceResult:
     )
 
 
+def _load_mail_client_class() -> type:
+    """Import the mail client here, and not at module import time.
+
+    The CLI does not depend on the mail package either. Importing it lazily is
+    what keeps a missing or broken connector to one reported line.
+    """
+    from yandex_mail_mcp.client.imap_client import IMAPMailClient
+
+    return IMAPMailClient
+
+
 def check_mail(profile_name: str | None = None) -> ServiceResult:
-    return ServiceResult(
-        "mail",
-        State.NOT_YET_BUILT,
-        NOT_YET_BUILT_DETAIL,
-        profile=_profile_label(profile_name),
+    """Renew the token and make one real ``list_folders`` call.
+
+    Both halves are real on purpose. A check that only renewed the token would
+    report a mailbox reachable when IMAP itself is refused -- and a check that
+    only dialled IMAP could not get a token to dial it with. Between them they
+    are the whole chain story 2.1 exists to prove.
+    """
+    service = "mail"
+    profile = _profile_label(profile_name)
+
+    try:
+        client_class = _load_mail_client_class()
+    except Exception as exc:  # noqa: BLE001 - a broken connector is a reported line
+        return ServiceResult(
+            service,
+            State.FAILED,
+            f"The mail connector could not be loaded ({type(exc).__name__}: "
+            f"{_describe(exc)}). Reinstall the yandex-mail-mcp package.",
+            cause="connector unavailable",
+            profile=profile,
+        )
+
+    try:
+        loaded = load_profile(profile_name)
+    except NotConfigured as exc:
+        return _unconfigured(service, profile, exc)
+    except ProtocolError as exc:
+        return ServiceResult(
+            service,
+            State.FAILED,
+            _describe(exc),
+            cause="configuration",
+            profile=profile,
+        )
+
+    profile = loaded.name
+
+    if not loaded.oauth_client_id:
+        # No application registered yet. Nothing is broken; the login has simply
+        # not been done, which is the same state as no stored credential.
+        return _unconfigured(
+            service,
+            profile,
+            NotConfigured(
+                "No OAuth application is configured for mail.",
+                reason=(
+                    "no OAuth application is configured for mail -- register "
+                    "one at https://oauth.yandex.ru with the rights "
+                    "`mail:imap_full` and `mail:smtp`, then pass its ClientID "
+                    "as --client-id"
+                ),
+            ),
+        )
+
+    try:
+        stored = get_secret(service, profile)
+    except CredentialNotFound as exc:
+        return _unconfigured(service, profile, exc)
+    except AuthError as exc:
+        return ServiceResult(
+            service, State.FAILED, _describe(exc), cause="credential", profile=profile
+        )
+
+    client = client_class(
+        host=loaded.imap_host,
+        port=loaded.imap_port,
+        login=loaded.login,
+        access_token_provider=lambda: _mail_access_token(loaded, stored),
     )
+
+    try:
+        folders = asyncio.run(
+            asyncio.wait_for(
+                client.list_folders(count_for=lambda listed: []),
+                CHECK_TIMEOUT_SECONDS,
+            )
+        )
+    except TimeoutError:
+        return ServiceResult(
+            service,
+            State.TIMED_OUT,
+            f"{loaded.imap_host}:{loaded.imap_port} did not answer within "
+            f"{CHECK_TIMEOUT_SECONDS:g} seconds.",
+            cause="deadline",
+            profile=profile,
+        )
+    except Exception as exc:  # noqa: BLE001 - every cause becomes a reported line
+        return ServiceResult(
+            service,
+            State.FAILED,
+            _describe(exc, stored),
+            cause=_cause_for(exc),
+            profile=profile,
+        )
+
+    count = len(folders)
+    return ServiceResult(
+        service,
+        State.REACHABLE,
+        f"Answered with {count} {'folder' if count == 1 else 'folders'}.",
+        profile=profile,
+    )
+
+
+async def _mail_access_token(loaded: object, stored: str) -> str:
+    """One renewal, inside the check's own deadline.
+
+    ``count_for`` above returns nothing on purpose: this is a reachability
+    check, and folder counts cost one request each. Proving the mailbox answers
+    a LIST is the whole question.
+    """
+    return refresh_access_token(
+        client_id=loaded.oauth_client_id,  # type: ignore[attr-defined]
+        refresh_token=stored,
+        profile=loaded.name,  # type: ignore[attr-defined]
+    ).access_token
 
 
 def check_disk(profile_name: str | None = None) -> ServiceResult:
