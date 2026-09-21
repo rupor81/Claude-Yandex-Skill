@@ -50,6 +50,32 @@ LOGIN_MAIL_DESCRIPTION = (
     "will not take a password you can create by hand, the way the calendar does."
 )
 
+REGISTER_APPLICATION_EXPLANATION = """\
+This profile has no Yandex OAuth application yet, so there is nothing to
+authorise as. Registering one takes a minute and is done once:
+
+  1. Open https://oauth.yandex.ru and create an application.
+  2. Choose the kind that is for API access, so its redirect address is fixed
+     at https://oauth.yandex.ru/verification_code -- which is the one this
+     command uses.
+  3. Give it the rights `mail:imap_full` and `mail:smtp`.
+  4. Copy its ClientID and paste it below. It is remembered afterwards, so this
+     is the only time you are asked.
+
+A ClientID is not a secret: it travels in the authorization URL by design, so
+it is stored in your config file where you can read and edit it.
+"""
+
+#: What the operator needs at the moment they are standing at the prompt. The
+#: long version below is the `--help` epilog: printing both at runtime made the
+#: registration steps appear twice in one run, once from each.
+LOGIN_MAIL_STEPS = """\
+Yandex will show you a code rather than sending it anywhere -- it does not
+accept a `localhost` redirect for these applications, measured rather than
+assumed. Approve the access, then paste back the code it displays; pasting the
+whole address of that page works too.
+"""
+
 LOGIN_MAIL_EXPLANATION = """\
 This connector is a *public client*: it proves itself with PKCE rather than with
 an application secret, so there is no secret to store or to leak.
@@ -58,7 +84,8 @@ You need a registered application once, and only once:
 
   1. Open https://oauth.yandex.ru and create an application.
   2. Give it the rights `mail:imap_full` and `mail:smtp`.
-  3. Copy its ClientID and pass it as --client-id; it is remembered afterwards.
+  3. Copy its ClientID. This command asks for it if the profile has none, and
+     remembers it afterwards; --client-id is there for scripts.
 
 Yandex does not accept a `localhost` redirect for these applications -- measured,
 not assumed -- so it displays the authorization code on a page instead of sending
@@ -271,15 +298,21 @@ def login_mail_command(args: argparse.Namespace) -> int:
     operator whose re-login failed still has the mailbox they had before.
     """
     profile = load_profile(args.profile)
-    client_id = args.client_id or profile.oauth_client_id
+    client_id = (args.client_id or profile.oauth_client_id or "").strip()
+    if not client_id:
+        # Asked for rather than demanded on the command line. A ClientID is a
+        # long opaque string the operator copies out of a browser, and telling
+        # them to paste it after a flag invites a placeholder like `<ClientID>`
+        # going in verbatim -- where the shell reads `<` as a redirection and
+        # fails before this program ever runs.
+        print(REGISTER_APPLICATION_EXPLANATION)
+        client_id = input("ClientID of your Yandex OAuth application: ").strip()
     if not client_id:
         print(
-            "This profile has no OAuth application yet, so there is nothing to "
-            "authorise as.\n\n"
-            "Register one at https://oauth.yandex.ru with the rights "
-            "`mail:imap_full` and `mail:smtp`, then run:\n"
-            "  yandex-mcp login mail --client-id <ClientID>\n\n"
-            "Nothing was stored.",
+            "No ClientID was given, so there is nothing to authorise as. "
+            "Register an application at https://oauth.yandex.ru with the "
+            "rights `mail:imap_full` and `mail:smtp`, then run "
+            "`yandex-mcp login mail` again. Nothing was stored.",
             file=sys.stderr,
         )
         return 2
@@ -292,9 +325,13 @@ def login_mail_command(args: argparse.Namespace) -> int:
     # flow; the operator is the channel. `oauth.checked_state` stays for a flow
     # that does redirect, and this comment stays so nobody reads its absence
     # here as an oversight.
-    print(LOGIN_MAIL_EXPLANATION)
+    print(LOGIN_MAIL_STEPS)
     print("Open this address, approve the access, and copy the code it shows:\n")
     print(f"  {request.url}\n")
+    # The prompt below writes to the terminal directly, so buffered stdout would
+    # otherwise arrive after it -- and the operator would be asked for a code
+    # before being shown the address to get one from.
+    sys.stdout.flush()
 
     # Hidden, like the app-password prompt: a code is short-lived but it is a
     # credential while it lives, and terminals get scrolled back through.

@@ -347,8 +347,8 @@ def check_mail(profile_name: str | None = None) -> ServiceResult:
                 reason=(
                     "no OAuth application is configured for mail -- register "
                     "one at https://oauth.yandex.ru with the rights "
-                    "`mail:imap_full` and `mail:smtp`, then pass its ClientID "
-                    "as --client-id"
+                    "`mail:imap_full` and `mail:smtp`; the login command asks "
+                    "for its ClientID"
                 ),
             ),
         )

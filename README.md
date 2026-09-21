@@ -49,8 +49,10 @@ can disable them entirely; the server then reports organisation policy rather th
 wrong password.
 
 Mail is the opposite: IMAP will not take an app password, so it needs OAuth — and that
-needs an application you register once at <https://oauth.yandex.ru>, with the rights
-`mail:imap_full` and `mail:smtp`. The connector is a **public client**: it proves itself
+needs an application you register once at <https://oauth.yandex.ru>. Register the kind
+that is **for API access**: its redirect address is fixed at
+`https://oauth.yandex.ru/verification_code`, which is the one this flow uses. Give it the
+rights `mail:imap_full` and `mail:smtp`. The connector is a **public client**: it proves itself
 with PKCE, so there is no application secret to store or to leak.
 
 Yandex does not accept a `localhost` redirect URI for these applications — measured, not
@@ -75,15 +77,18 @@ The command explains how to create the app password, then reads it from a hidden
 prompt. It is stored in the system keychain, falling back to a `0600` file under the
 config directory. It never appears in this repository, in tool arguments, or in logs.
 
-For Mail, authorise instead of setting up — pass your application's ClientID once and it
-is remembered:
+For Mail, authorise instead of setting up:
 
 ```bash
-uv run yandex-mcp login mail --client-id <ClientID>
+uv run yandex-mcp login mail
 ```
 
-It prints a URL naming exactly the rights it asks for, so you can read them before you
-grant them. Approve it, and paste back the code Yandex shows (the whole address of that
+The first time, it explains how to register the application and asks for its ClientID at
+a prompt — then remembers it, so you are asked once. (`--client-id` exists for scripts;
+at a prompt there is no placeholder for a shell to misread.)
+
+It then prints a URL naming exactly the rights it asks for, so you can read them before
+you grant them. Approve it, and paste back the code Yandex shows (the whole address of that
 page works too). The refresh token goes to the keychain; the access token is not stored
 at all, and is renewed silently whenever a mail tool runs.
 

@@ -33,6 +33,17 @@ def paste(monkeypatch):
 
 
 @pytest.fixture
+def typed(monkeypatch):
+    """Answer the visible ClientID prompt without a terminal.
+
+    Defaults to typing nothing, which is the "I have not registered one" case.
+    """
+    given = {"client_id": ""}
+    monkeypatch.setattr("builtins.input", lambda prompt="": given["client_id"])
+    return given
+
+
+@pytest.fixture
 def token_endpoint(monkeypatch):
     """Stand in for Yandex's token endpoint, recording what it was sent."""
     seen: list = []
@@ -114,6 +125,21 @@ def test_the_exchange_sends_the_verifier_that_matches_the_url_it_printed(
     assert query["code_challenge"] == expected
 
 
+def test_no_advice_this_command_gives_needs_a_placeholder_substituted():
+    """Help text is copied straight into a shell. `<` and `>` break it there."""
+    from yandex_mcp_cli.main import build_parser
+
+    parser = build_parser()
+    for source in (
+        parser.format_help(),
+        cli.LOGIN_MAIL_EXPLANATION,
+        cli.REGISTER_APPLICATION_EXPLANATION,
+    ):
+        for line in source.splitlines():
+            if "yandex-mcp" in line:
+                assert "<" not in line and ">" not in line, line
+
+
 def test_no_secret_is_ever_a_command_line_argument():
     """NFR7. A code on the command line is in the shell history forever."""
     from yandex_mcp_cli.main import build_parser
@@ -124,9 +150,10 @@ def test_no_secret_is_ever_a_command_line_argument():
         assert forbidden not in text
 
 
-def test_a_login_without_a_client_id_refuses_before_touching_the_network(
-    paste, token_endpoint, capsys
+def test_a_login_with_no_application_anywhere_refuses_without_touching_the_network(
+    paste, typed, token_endpoint, capsys
 ):
+    """Nothing given on the command line, nothing in the profile, nothing typed."""
     _profile()
 
     assert main(["login", "mail"]) != 0
@@ -136,11 +163,48 @@ def test_a_login_without_a_client_id_refuses_before_touching_the_network(
     message = capsys.readouterr().err
     assert "oauth.yandex.ru" in message, "the operator is not told where to register"
     assert "mail:imap_full" in message
-    # The exact command, with the flag filled in. `start_login` refuses an empty
-    # client_id too and says where to register -- so without this the command's
-    # own guard is indistinguishable from that one, and could be deleted with
-    # every test still green. What only this guard gives is the next thing to type.
-    assert "yandex-mcp login mail --client-id" in message
+    # The command to run next, with nothing in it for a shell to interpret.
+    # `start_login` refuses an empty client_id too and names the same page, so
+    # without this the command's own guard is indistinguishable from that one.
+    assert "yandex-mcp login mail" in message
+    assert "<" not in message, "the advice contains shell redirection characters"
+
+
+def test_the_client_id_is_asked_for_rather_than_demanded_on_the_command_line(
+    paste, typed, token_endpoint, capsys
+):
+    """A ClientID pasted after a flag invites a `<ClientID>` placeholder going in
+    verbatim -- where zsh reads `<` as a redirection and the command never runs."""
+    _profile()
+    typed["client_id"] = CLIENT_ID
+
+    assert main(["login", "mail"]) == 0
+
+    seen, _ = token_endpoint
+    assert seen[0]["data"]["client_id"] == CLIENT_ID
+    assert load_profile("default").oauth_client_id == CLIENT_ID
+    explained = capsys.readouterr().out
+    assert "oauth.yandex.ru" in explained
+    # Asserted against the explanation itself, not the captured output: the
+    # authorization URL carries `redirect_uri=...verification_code` in its query
+    # string, so an output-wide search passes even when the instructions say
+    # nothing about which kind of application to register.
+    assert "verification_code" in cli.REGISTER_APPLICATION_EXPLANATION, (
+        "the operator is not told which application kind has the right redirect"
+    )
+    assert cli.REGISTER_APPLICATION_EXPLANATION in explained
+
+
+def test_a_profile_that_already_has_one_is_not_asked_again(
+    paste, typed, token_endpoint, capsys
+):
+    _profile(oauth_client_id=CLIENT_ID)
+    typed["client_id"] = "SHOULD-NOT-BE-READ"
+
+    assert main(["login", "mail"]) == 0
+
+    seen, _ = token_endpoint
+    assert seen[0]["data"]["client_id"] == CLIENT_ID
 
 
 def test_a_client_id_given_on_the_command_line_is_remembered(
@@ -200,3 +264,45 @@ def test_logging_in_again_replaces_the_stored_authorisation(paste, token_endpoin
 
     assert main(["login", "mail"]) == 0
     assert get_secret("mail", "default") == "REFRESH-2"
+
+
+def test_the_registration_steps_are_not_explained_twice_in_one_run(
+    paste, typed, token_endpoint, capsys
+):
+    """Two overlapping essays in one run is worse than one.
+
+    The long version is the `--help` epilog; what runs at the prompt is what the
+    operator needs while standing at it.
+    """
+    _profile()
+    typed["client_id"] = CLIENT_ID
+
+    main(["login", "mail"])
+
+    output = capsys.readouterr().out
+    assert output.count("Open https://oauth.yandex.ru and create an application") == 1
+    assert output.count("`mail:imap_full` and `mail:smtp`") == 1
+    assert cli.LOGIN_MAIL_EXPLANATION not in output, "the help epilog was printed too"
+
+
+def test_the_address_is_shown_before_the_code_is_asked_for(
+    paste, typed, token_endpoint, capsys, monkeypatch
+):
+    """Buffered stdout arriving after the prompt asks for a code from nowhere."""
+    order: list[str] = []
+    monkeypatch.setattr(
+        getpass, "getpass", lambda prompt="": (order.append("prompt"), CODE)[1]
+    )
+    real_print = print
+
+    def watched(*args, **kwargs):
+        if args and "oauth.yandex.ru/authorize" in str(args[0]):
+            order.append("url")
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr("builtins.print", watched)
+    _profile(oauth_client_id=CLIENT_ID)
+
+    main(["login", "mail"])
+
+    assert order[: order.index("prompt")].count("url") == 1, order
