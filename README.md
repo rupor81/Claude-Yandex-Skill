@@ -48,16 +48,19 @@ password, and app passwords can only be created by hand at
 can disable them entirely; the server then reports organisation policy rather than a
 wrong password.
 
-Mail is the opposite: IMAP will not take an app password, so it needs OAuth — and that
-needs an application you register once at <https://oauth.yandex.ru>. Register the kind
-that is **for API access**: its redirect address is fixed at
-`https://oauth.yandex.ru/verification_code`, which is the one this flow uses. Give it the
-rights `mail:imap_full` and `mail:smtp`. The connector is a **public client**: it proves itself
-with PKCE, so there is no application secret to store or to leak.
+Mail is the opposite: IMAP will not take an app password, so it signs in with OAuth — the
+ordinary way: the command opens your browser, you sign in to Yandex however you normally do
+(password, QR code, Yandex ID), and the browser returns you to the command.
 
-For now the application is registered for API access, whose redirect Yandex fixes to a
-page that displays the authorization code; you paste it back. That is a choice, not a
-platform limit — see the correction in story 2.1's change log.
+That needs an application registered once at <https://oauth.yandex.ru>:
+
+- platform **Web services** — not the kind for API access, whose return address Yandex fixes
+  to a page you would have to copy a code from;
+- Redirect URI exactly `http://localhost:8765/callback`;
+- rights `mail:imap_full` and `mail:smtp`.
+
+The connector is a **public client**: it proves itself with PKCE, so there is no application
+secret to store or to leak.
 
 ## Install
 
@@ -77,20 +80,16 @@ The command explains how to create the app password, then reads it from a hidden
 prompt. It is stored in the system keychain, falling back to a `0600` file under the
 config directory. It never appears in this repository, in tool arguments, or in logs.
 
-For Mail, authorise instead of setting up:
+For Mail, sign in instead of setting up:
 
 ```bash
 uv run yandex-mcp login mail
 ```
 
-The first time, it explains how to register the application and asks for its ClientID at
-a prompt — then remembers it, so you are asked once. (`--client-id` exists for scripts;
-at a prompt there is no placeholder for a shell to misread.)
-
-It then prints a URL naming exactly the rights it asks for, so you can read them before
-you grant them. Approve it, and paste back the code Yandex shows (the whole address of that
-page works too). The refresh token goes to the keychain; the access token is not stored
-at all, and is renewed silently whenever a mail tool runs.
+The first time, it explains the one-time registration and asks for the application's
+ClientID at a prompt, then remembers it. After that it opens your browser, you sign in and
+approve, and the browser comes back on its own. The refresh token goes to the keychain; the
+access token is not stored at all, and is renewed silently whenever a mail tool runs.
 
 Then check that it actually works — one real call per service:
 

@@ -67,11 +67,13 @@ returning the account's real folders — the vertical slice story 1.1 was for Ca
 
 | Scenario | Input / State | Expected Output / Behavior | Error Handling |
 |---|---|---|---|
-| First login | No stored credentials, a `client_id` in config | Prints the authorization URL naming both scopes; reads a pasted code; exchanges it with `code_verifier`; stores the refresh token | N/A |
+| First login | No stored credentials, a `client_id` in config | Opens the browser at an authorization URL naming both scopes; receives the code on a loopback listener; exchanges it with `code_verifier` and the same `redirect_uri`; stores the refresh token | N/A |
 | Login without a `client_id` | Nothing in config | Refused before any network call, naming the registration page and the two scopes to request | Validation error |
-| Code pasted with surrounding whitespace or a full URL | Operator pastes what the browser gave them | Accepted; the code is extracted | N/A |
+| Operator declines in the browser | `error=access_denied` comes back | Reported as their decision; nothing exchanged or stored | Never stored |
+| Browser never comes back | No callback within the time allowed | Times out; nothing stored | Never stored |
+| Loopback port busy | Another process holds it | Reported naming the port *before* the browser opens | Nothing opened |
 | Wrong or expired code | Yandex answers `invalid_grant` | Reported as a code that is wrong or already used, with what to do; nothing stored | Never stored |
-| `state` mismatch | Response carries a different `state` | Refused, nothing exchanged | Never exchanged |
+| `state` mismatch | Callback carries a different or no `state` | Refused, nothing exchanged | Never exchanged |
 | Expired access token | Any mail tool called | Refreshed once from the refresh token and the call proceeds, silently | N/A |
 | Revoked refresh token | Refresh answers an error | Reported as needing `yandex-mcp login mail` again, naming the profile | Never a bare protocol error |
 | No credentials at all | Any mail tool called | `NotConfigured`, naming the command that fixes it | Never an empty page |
@@ -114,10 +116,11 @@ returning the account's real folders — the vertical slice story 1.1 was for Ca
 - [x] `tests/live` -- authorise a real mailbox and list its real folders
 
 **Acceptance Criteria:**
-- Given no stored Mail credentials, when `yandex-mcp login mail` runs, then it prints an
-  authorization URL naming `mail:imap_full` and `mail:smtp`, exchanges the pasted code
-  using `code_verifier`, and stores the refresh token in the keychain — with no secret in
-  any command-line argument.
+- Given no stored Mail credentials, when `yandex-mcp login mail` runs, then it opens the
+  browser at an authorization URL naming `mail:imap_full` and `mail:smtp`, receives the
+  code on a loopback listener bound to 127.0.0.1, exchanges it using `code_verifier`, and
+  stores the refresh token in the keychain -- with no secret in any command-line argument
+  and no code in any output.
 - Given a response whose `state` differs from the one issued, when login runs, then the
   code is not exchanged and nothing is stored.
 - Given an expired access token, when any mail tool is called, then the token is refreshed
@@ -170,6 +173,21 @@ returning the account's real folders — the vertical slice story 1.1 was for Ca
   **Avoids:** building on a guarantee nobody measured. This is the same defect
   class epic 1's retrospective named: the first plausible explanation that agrees
   with what was expected, recorded as fact.
+
+- **Amendment (2026-09-25, renegotiated by the operator):** the operator asked for the
+  standard sign-in -- "a browser opens, I sign in with QR or Yandex ID, and I come back
+  to an authorised connector" -- and it is what FR4.1 specified in the first place.
+  Restored: the command binds a loopback listener on 127.0.0.1, opens the browser,
+  and receives the code at `http://localhost:8765/callback`; the application is
+  registered as a **web service** with exactly that Redirect URI. `state` is checked
+  on the callback -- it guards something again, where in the paste flow nothing came
+  back to compare. The paste flow is removed rather than kept as a fallback: two ways
+  in is the complexity the operator asked not to have.
+  **Still to be measured on the first real sign-in:** that Yandex accepts this exact
+  Redirect URI for a web-service application, and whether a *refresh* needs the
+  client secret despite PKCE. Neither is assumed.
+  **Avoids:** a second trip through the same mistake. Both open questions are named
+  here so they are measured, not inferred.
 
 ## Design Notes
 

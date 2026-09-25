@@ -17,6 +17,7 @@ import argparse
 import getpass
 import os
 import sys
+import webbrowser
 
 from yandex_core.config import (
     DEFAULT_CALDAV_URL,
@@ -25,14 +26,17 @@ from yandex_core.config import (
     write_profile,
 )
 from yandex_core.credentials import delete_secret, store_secret
-from yandex_core.errors import ProtocolError, YandexError
+from yandex_core.errors import YandexError
+from yandex_core.loopback import CallbackListener
 from yandex_core.oauth import (
-    default_post as oauth_post,
+    LOOPBACK_PORT,
+    code_from_callback,
+    exchange_code,
+    loopback_redirect_uri,
+    start_login,
 )
 from yandex_core.oauth import (
-    exchange_code,
-    extract_code,
-    start_login,
+    default_post as oauth_post,
 )
 
 from .verify import render_results, run_checks
@@ -51,46 +55,38 @@ LOGIN_MAIL_DESCRIPTION = (
 )
 
 REGISTER_APPLICATION_EXPLANATION = """\
-This profile has no Yandex OAuth application yet, so there is nothing to
-authorise as. Registering one takes a minute and is done once:
+This profile has no Yandex OAuth application yet, so there is nothing to sign in
+as. Registering one takes a minute and is done once:
 
   1. Open https://oauth.yandex.ru and create an application.
-  2. Choose the kind that is for API access, so its redirect address is fixed
-     at https://oauth.yandex.ru/verification_code -- which is the one this
-     command uses.
-  3. Give it the rights `mail:imap_full` and `mail:smtp`.
-  4. Copy its ClientID and paste it below. It is remembered afterwards, so this
+  2. Choose the platform "Web services" -- not the kind for API access, whose
+     return address Yandex fixes to a page you would have to copy a code from.
+  3. Set its Redirect URI to exactly:  {redirect_uri}
+  4. Give it the rights `mail:imap_full` and `mail:smtp`.
+  5. Copy its ClientID and paste it below. It is remembered afterwards, so this
      is the only time you are asked.
 
-A ClientID is not a secret: it travels in the authorization URL by design, so
-it is stored in your config file where you can read and edit it.
+A ClientID is not a secret: it travels in the sign-in address by design, so it
+is stored in your config file where you can read and edit it.
 """
 
-#: What the operator needs at the moment they are standing at the prompt. The
-#: long version below is the `--help` epilog: printing both at runtime made the
-#: registration steps appear twice in one run, once from each.
 LOGIN_MAIL_STEPS = """\
-Yandex will show you a code rather than sending it anywhere, because an
-application registered for API access has its redirect fixed to that page.
-Approve the access, then paste back the code it displays; pasting the whole
-address of that page works too.
+Opening your browser to sign in to Yandex. Sign in however you normally do --
+password, QR code, Yandex ID -- and approve the access. The browser comes back
+here on its own when you are done.
 """
 
 LOGIN_MAIL_EXPLANATION = """\
+This is the standard desktop sign-in: the command opens your browser, you sign in
+to Yandex however it offers, and the browser returns to a listener on this
+machine at {redirect_uri}. Nothing is pasted by hand.
+
+You need a registered application once. Register it as a *Web service* with
+exactly that Redirect URI and the rights `mail:imap_full` and `mail:smtp`; this
+command asks for its ClientID the first time and remembers it.
+
 This connector is a *public client*: it proves itself with PKCE rather than with
 an application secret, so there is no secret to store or to leak.
-
-You need a registered application once, and only once:
-
-  1. Open https://oauth.yandex.ru and create an application.
-  2. Give it the rights `mail:imap_full` and `mail:smtp`.
-  3. Copy its ClientID. This command asks for it if the profile has none, and
-     remembers it afterwards; --client-id is there for scripts.
-
-An application registered for API access has its redirect fixed, so Yandex
-displays the authorization code on a page instead of sending it anywhere. This command prints a URL, you approve it in a browser, and you
-paste back the code Yandex shows. Pasting the whole address of that page works
-too. Nothing is ever passed as a command-line argument.
 
 The refresh token is stored in your system keychain (falling back to a 0600 file
 under the config directory). The access token is not stored at all: it lasts
@@ -143,6 +139,15 @@ SETUP_CALENDAR_DESCRIPTION = (
     "OAuth tokens, so an app password must be created by hand in Yandex ID first."
 )
 
+#: How long the command waits for the browser to come back. Long enough to find a
+#: phone for a QR code; short enough that a forgotten terminal does not hold the
+#: port indefinitely.
+SIGN_IN_TIMEOUT_SECONDS = 300
+
+#: Opens a URL in the operator's browser. A name of its own so tests can play the
+#: browser -- and play it the way Yandex does, by sending it back with a code.
+open_browser = webbrowser.open
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -192,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mail",
         help="Authorise the mailbox and store its refresh token.",
         description=LOGIN_MAIL_DESCRIPTION,
-        epilog=LOGIN_MAIL_EXPLANATION,
+        epilog=LOGIN_MAIL_EXPLANATION.format(redirect_uri=loopback_redirect_uri()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     login_mail.add_argument(
@@ -210,6 +215,16 @@ def build_parser() -> argparse.ArgumentParser:
             "ClientID of your Yandex OAuth application. Public by design -- it "
             "travels in the authorization URL -- so it is an argument, and it "
             "is remembered in the profile afterwards."
+        ),
+    )
+    login_mail.add_argument(
+        "--port",
+        type=int,
+        default=LOOPBACK_PORT,
+        help=(
+            f"Port the browser returns to (default: {LOOPBACK_PORT}). Only change "
+            "it if you registered a different one: Yandex matches the Redirect "
+            "URI exactly, port included."
         ),
     )
     login_mail.set_defaults(handler=login_mail_command)
@@ -290,61 +305,50 @@ def setup_calendar(args: argparse.Namespace) -> int:
 
 
 def login_mail_command(args: argparse.Namespace) -> int:
-    """Run the Authorization Code flow for Mail and store what it yields.
+    """Sign in to Yandex in the browser and store what comes back.
 
-    The order matters: the code is exchanged *before* anything is written, so a
-    login that fails leaves the previous authorisation exactly as it was. An
-    operator whose re-login failed still has the mailbox they had before.
+    The order is deliberate. The listener is bound *before* the browser opens, so
+    a busy port is reported while the operator has done nothing yet. The code is
+    exchanged *before* anything is written, so a login that fails leaves the
+    previous authorisation exactly as it was.
     """
     profile = load_profile(args.profile)
+    redirect_uri = loopback_redirect_uri(args.port)
     client_id = (args.client_id or profile.oauth_client_id or "").strip()
     if not client_id:
-        # Asked for rather than demanded on the command line. A ClientID is a
-        # long opaque string the operator copies out of a browser, and telling
-        # them to paste it after a flag invites a placeholder like `<ClientID>`
-        # going in verbatim -- where the shell reads `<` as a redirection and
-        # fails before this program ever runs.
-        print(REGISTER_APPLICATION_EXPLANATION)
+        # Asked for rather than demanded after a flag: a placeholder like
+        # `<ClientID>` pasted into zsh is read as a redirection.
+        print(REGISTER_APPLICATION_EXPLANATION.format(redirect_uri=redirect_uri))
         client_id = input("ClientID of your Yandex OAuth application: ").strip()
     if not client_id:
         print(
-            "No ClientID was given, so there is nothing to authorise as. "
-            "Register an application at https://oauth.yandex.ru with the "
-            "rights `mail:imap_full` and `mail:smtp`, then run "
-            "`yandex-mcp login mail` again. Nothing was stored.",
+            "No ClientID was given, so there is nothing to sign in as. Register "
+            "an application at https://oauth.yandex.ru as a Web service, with the "
+            f"Redirect URI {redirect_uri} and the rights `mail:imap_full` and "
+            "`mail:smtp`, then run `yandex-mcp login mail` again. Nothing was "
+            "stored.",
             file=sys.stderr,
         )
         return 2
 
-    request = start_login(client_id=client_id, scopes=MAIL_SCOPES)
-    # `request.state` is sent and deliberately not checked here, because there
-    # is nothing to check it against: Yandex displays the code on a page rather
-    # than redirecting, so no response comes back carrying a `state` at all. The
-    # parameter it guards against -- a forged callback -- does not exist in this
-    # flow; the operator is the channel. `oauth.checked_state` stays for a flow
-    # that does redirect, and this comment stays so nobody reads its absence
-    # here as an oversight.
-    print(LOGIN_MAIL_STEPS)
-    print("Open this address, approve the access, and copy the code it shows:\n")
-    print(f"  {request.url}\n")
-    # The prompt below writes to the terminal directly, so buffered stdout would
-    # otherwise arrive after it -- and the operator would be asked for a code
-    # before being shown the address to get one from.
-    sys.stdout.flush()
+    with CallbackListener(port=args.port) as listener:
+        request = start_login(
+            client_id=client_id, scopes=MAIL_SCOPES, redirect_uri=redirect_uri
+        )
+        print(LOGIN_MAIL_STEPS)
+        # Printed as well as opened: the browser may open on another screen, or
+        # not at all on a machine with no desktop.
+        print(f"If it does not open, visit:\n\n  {request.url}\n")
+        sys.stdout.flush()
+        open_browser(request.url)
+        answer = listener.wait(timeout=SIGN_IN_TIMEOUT_SECONDS)
 
-    # Hidden, like the app-password prompt: a code is short-lived but it is a
-    # credential while it lives, and terminals get scrolled back through.
-    pasted = getpass.getpass("Code from Yandex (input hidden): ")
-    try:
-        code = extract_code(pasted)
-    except ProtocolError as exc:
-        print(f"{exc} Nothing was stored.", file=sys.stderr)
-        return 2
-
+    code = code_from_callback(answer, issued_state=request.state)
     tokens = exchange_code(
         client_id=client_id,
         code=code,
         code_verifier=request.code_verifier,
+        redirect_uri=request.redirect_uri,
         post=oauth_post,
     )
 
@@ -368,7 +372,7 @@ def login_mail_command(args: argparse.Namespace) -> int:
         raise
 
     # Deliberately reports where, never what.
-    print(f"\nRefresh token stored in: {location}")
+    print(f"Signed in. Refresh token stored in: {location}")
     print(f"Profile {profile.name!r} updated in: {path}")
     print("Check it with: yandex-mcp verify")
     return 0

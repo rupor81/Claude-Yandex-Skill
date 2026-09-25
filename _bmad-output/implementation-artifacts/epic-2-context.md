@@ -71,7 +71,20 @@ What Yandex's documentation actually establishes:
 
 So FR4.1's original design -- open the browser, let the operator sign in however
 Yandex offers (password, QR, Yandex ID), receive the code on a transient loopback
-listener -- stands. It is also what the operator asked for, in those words.
+listener -- stands. It is also what the operator asked for, in those words, and it
+is what is now built: `yandex_core.loopback` binds 127.0.0.1:8765, and the
+application is registered as a web service with `http://localhost:8765/callback`.
+
+Two things are still unmeasured and must be measured on the first real sign-in,
+not inferred: that Yandex accepts that exact Redirect URI, and whether a refresh
+needs the client secret despite PKCE.
+
+**A remote connector** -- where Claude itself says "authorisation required" when
+the connector is added -- was discussed on 2026-09-25 and deliberately deferred by
+the operator until Mail and Calendar work. It needs a hosted HTTPS server acting as
+an OAuth authorisation server in front of Yandex. Calendar would still need its app
+password there: CalDAV does not take OAuth tokens. That claim dates from epic 1 and
+will be re-verified live once a real token exists.
 
 The error compounded: having concluded the redirect was fixed, the operator was
 advised to register an API-access application, which is the one type where it

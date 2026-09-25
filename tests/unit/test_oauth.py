@@ -18,12 +18,13 @@ import pytest
 from yandex_core.errors import AuthError, PolicyError, ProtocolError, TransportError
 from yandex_core.oauth import (
     AUTHORIZE_URL,
+    LOOPBACK_PORT,
     TOKEN_URL,
-    VERIFICATION_REDIRECT,
     LoginRequest,
     checked_state,
+    code_from_callback,
     exchange_code,
-    extract_code,
+    loopback_redirect_uri,
     refresh_access_token,
     start_login,
 )
@@ -92,17 +93,29 @@ def test_every_login_gets_its_own_verifier_and_state():
     assert len(first.code_verifier) >= 43
 
 
-def test_the_url_uses_the_redirect_this_platform_actually_allows():
-    """The redirect fixed for API-access applications.
+def test_the_url_sends_the_browser_back_to_this_machine():
+    """The standard desktop flow: sign in in the browser, come back to the command.
 
-    An earlier docstring here said the registration form refuses a localhost
-    redirect, "measured". It was never measured -- see spec 2.1's change log.
-    This pins today's behaviour; it is not evidence of a platform constraint.
+    An earlier version sent the operator to a page that displayed a code to paste
+    by hand, on the strength of a "measurement" that was never taken. See spec
+    2.1's change log.
     """
     request = start_login(client_id=CLIENT_ID, scopes=SCOPES)
 
-    assert _query(request.url)["redirect_uri"] == VERIFICATION_REDIRECT
-    assert "localhost" not in request.url
+    redirect = _query(request.url)["redirect_uri"]
+    assert redirect == loopback_redirect_uri()
+    assert redirect == f"http://localhost:{LOOPBACK_PORT}/callback"
+    assert request.redirect_uri == redirect, (
+        "the exchange would name a different redirect"
+    )
+
+
+def test_a_redirect_can_be_chosen_for_a_different_registered_port():
+    request = start_login(
+        client_id=CLIENT_ID, scopes=SCOPES, redirect_uri=loopback_redirect_uri(9001)
+    )
+
+    assert _query(request.url)["redirect_uri"] == "http://localhost:9001/callback"
 
 
 # -- what comes back from the operator ------------------------------------
@@ -119,27 +132,73 @@ def test_a_matching_state_passes_quietly():
     checked_state(issued="same", returned="same")
 
 
-@pytest.mark.parametrize(
-    "pasted",
-    [
-        "1234567",
-        "  1234567  ",
-        "\n1234567\n",
-        "https://oauth.yandex.ru/verification_code?code=1234567",
-        "https://oauth.yandex.ru/verification_code#code=1234567",
-    ],
-)
-def test_a_code_is_read_out_of_whatever_the_operator_pasted(pasted):
-    """They are copying from a browser. Refusing a stray newline helps nobody."""
-    assert extract_code(pasted) == "1234567"
+def test_the_code_is_taken_from_a_callback_that_proves_it_is_ours():
+    assert code_from_callback(
+        {"code": "1234567", "state": "ours"}, issued_state="ours"
+    ) == ("1234567")
 
 
-@pytest.mark.parametrize(
-    "pasted", ["", "   ", "https://oauth.yandex.ru/verification_code"]
-)
-def test_a_paste_with_no_code_in_it_is_refused_rather_than_sent(pasted):
+def test_a_callback_with_a_foreign_state_is_refused_and_nothing_is_exchanged():
+    """With a real redirect, `state` is what stops a forged callback.
+
+    In the paste flow nothing ever came back carrying one, so the check was
+    vacuous there. It is not vacuous now.
+    """
+    with pytest.raises(ProtocolError) as caught:
+        code_from_callback({"code": "1234567", "state": "theirs"}, issued_state="ours")
+
+    assert "state" in str(caught.value).lower()
+
+
+def test_a_callback_with_no_state_at_all_is_refused():
     with pytest.raises(ProtocolError):
-        extract_code(pasted)
+        code_from_callback({"code": "1234567"}, issued_state="ours")
+
+
+def test_the_operator_pressing_cancel_is_reported_as_their_decision():
+    """`access_denied` is not a failure of anything. It is an answer."""
+    with pytest.raises(AuthError) as caught:
+        code_from_callback(
+            {"error": "access_denied", "state": "ours"}, issued_state="ours"
+        )
+
+    message = str(caught.value).lower()
+    assert "declined" in message or "cancel" in message
+    assert "nothing was stored" in message
+
+
+def test_an_error_yandex_sent_back_is_reported_with_its_own_words():
+    with pytest.raises(ProtocolError) as caught:
+        code_from_callback(
+            {
+                "error": "invalid_request",
+                "error_description": "redirect_uri mismatch",
+                "state": "ours",
+            },
+            issued_state="ours",
+        )
+
+    assert "redirect_uri mismatch" in str(caught.value)
+
+
+def test_a_redirect_mismatch_says_which_address_to_register():
+    """The one registration mistake worth naming precisely: it is a typo away."""
+    with pytest.raises(ProtocolError) as caught:
+        code_from_callback(
+            {
+                "error": "invalid_request",
+                "error_description": "redirect_uri does not match",
+                "state": "ours",
+            },
+            issued_state="ours",
+        )
+
+    assert loopback_redirect_uri() in str(caught.value)
+
+
+def test_a_callback_with_neither_code_nor_error_is_refused():
+    with pytest.raises(ProtocolError):
+        code_from_callback({"state": "ours"}, issued_state="ours")
 
 
 # -- exchanging the code --------------------------------------------------
@@ -151,7 +210,11 @@ def test_the_exchange_sends_the_verifier_and_no_secret():
     )
 
     tokens = exchange_code(
-        client_id=CLIENT_ID, code="1234567", code_verifier="v" * 43, post=post
+        client_id=CLIENT_ID,
+        code="1234567",
+        code_verifier="v" * 43,
+        redirect_uri=loopback_redirect_uri(),
+        post=post,
     )
 
     assert tokens.access_token == "at"
@@ -161,6 +224,8 @@ def test_the_exchange_sends_the_verifier_and_no_secret():
     assert call["data"]["grant_type"] == "authorization_code"
     assert call["data"]["code"] == "1234567"
     assert call["data"]["code_verifier"] == "v" * 43
+    # RFC 6749 4.1.3: named at the exchange when it was named at authorisation.
+    assert call["data"]["redirect_uri"] == loopback_redirect_uri()
     assert "client_secret" not in call["data"]
 
 

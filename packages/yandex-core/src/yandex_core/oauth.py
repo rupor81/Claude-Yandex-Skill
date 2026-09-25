@@ -11,12 +11,16 @@ Two facts shape everything here.
 of a client secret, so there is no application secret -- none to store, none to
 leak, and none for a reader to helpfully add later.
 
-**The redirect currently used is the fixed one, and that is a choice, not a
-constraint.**  An earlier version of this docstring said a localhost redirect was
-refused by the registration form, and called that measured. It was not measured
--- it was an ambiguous reply, interpreted. Only applications registered for API
-access have a fixed redirect; a web-service application takes a loopback address.
-See the correction in spec 2.1's change log before building on either.
+**The browser comes back to this machine.**  The command opens the browser, Yandex
+lets the operator sign in however it offers -- password, QR code, Yandex ID -- and
+then sends the browser to a loopback address where :mod:`yandex_core.loopback` is
+waiting. That is the standard desktop flow, and it is what the operator asked for.
+
+An earlier version sent them to a page that displayed a code to paste by hand,
+justified by a claim that the registration form refuses a localhost redirect. That
+claim was never measured; see spec 2.1's change log. Only applications registered
+*for API access* have a fixed redirect -- which is why the application must be
+registered as a **web service**, with exactly :func:`loopback_redirect_uri`.
 """
 
 from __future__ import annotations
@@ -34,14 +38,15 @@ from .errors import AuthError, PolicyError, ProtocolError, TransportError
 
 __all__ = [
     "AUTHORIZE_URL",
+    "LOOPBACK_PORT",
     "TOKEN_URL",
-    "VERIFICATION_REDIRECT",
     "LoginRequest",
     "Tokens",
     "checked_state",
+    "code_from_callback",
     "default_post",
     "exchange_code",
-    "extract_code",
+    "loopback_redirect_uri",
     "refresh_access_token",
     "start_login",
 ]
@@ -49,9 +54,20 @@ __all__ = [
 AUTHORIZE_URL = "https://oauth.yandex.ru/authorize"
 TOKEN_URL = "https://oauth.yandex.ru/token"
 
-#: The redirect fixed for API-access applications. Not the only option -- a
-#: web-service application may register a loopback address instead.
-VERIFICATION_REDIRECT = "https://oauth.yandex.ru/verification_code"
+#: The port the browser comes back to. Fixed rather than chosen at random, because
+#: Yandex matches the redirect exactly -- port included -- against the one the
+#: application was registered with, and the operator registers it once.
+LOOPBACK_PORT = 8765
+
+
+def loopback_redirect_uri(port: int = LOOPBACK_PORT) -> str:
+    """The address to register, and the one the browser is sent back to.
+
+    `localhost` rather than `127.0.0.1` because that is what a person types into
+    a registration form; the listener binds the IPv4 loopback it resolves to.
+    """
+    return f"http://localhost:{port}/callback"
+
 
 #: RFC 7636 puts the verifier's floor at 43 characters. 32 random bytes in
 #: base64url is 43, which is the floor and is plenty.
@@ -77,6 +93,9 @@ class LoginRequest:
     url: str
     state: str
     code_verifier: str
+    #: Named again at the exchange, as RFC 6749 4.1.3 requires when it was named
+    #: here -- so it travels with the login rather than being re-derived.
+    redirect_uri: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +116,12 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def start_login(*, client_id: str, scopes: Sequence[str]) -> LoginRequest:
+def start_login(
+    *,
+    client_id: str,
+    scopes: Sequence[str],
+    redirect_uri: str | None = None,
+) -> LoginRequest:
     """Build the URL the operator opens, and the secrets that prove it was ours.
 
     The scopes are in the URL in plain sight on purpose: the operator is about
@@ -110,6 +134,7 @@ def start_login(*, client_id: str, scopes: Sequence[str]) -> LoginRequest:
             "https://oauth.yandex.ru with the rights `mail:imap_full` and "
             "`mail:smtp`, then run `yandex-mcp login mail` again."
         )
+    redirect = redirect_uri or loopback_redirect_uri()
     verifier = _b64url(secrets.token_bytes(_VERIFIER_BYTES))
     state = _b64url(secrets.token_bytes(16))
     challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
@@ -117,7 +142,7 @@ def start_login(*, client_id: str, scopes: Sequence[str]) -> LoginRequest:
         {
             "response_type": "code",
             "client_id": client_id,
-            "redirect_uri": VERIFICATION_REDIRECT,
+            "redirect_uri": redirect,
             "scope": " ".join(scopes),
             "state": state,
             "code_challenge": challenge,
@@ -125,7 +150,10 @@ def start_login(*, client_id: str, scopes: Sequence[str]) -> LoginRequest:
         }
     )
     return LoginRequest(
-        url=f"{AUTHORIZE_URL}?{query}", state=state, code_verifier=verifier
+        url=f"{AUTHORIZE_URL}?{query}",
+        state=state,
+        code_verifier=verifier,
+        redirect_uri=redirect,
     )
 
 
@@ -144,29 +172,47 @@ def checked_state(*, issued: str, returned: str) -> None:
         )
 
 
-def extract_code(pasted: str) -> str:
-    """The code out of whatever the operator copied from their browser.
+def code_from_callback(answer: dict[str, str], *, issued_state: str) -> str:
+    """The authorization code the browser came back with, once it is proven ours.
 
-    They are copying by hand from a page. Refusing a trailing newline, or the
-    whole URL when that is what the browser put on the clipboard, would be this
-    server being fussy about the one step it already asks a human to perform.
+    The state is checked *first*, before the answer is read for anything else:
+    a callback we did not cause is not one whose error message or code we act on.
+
+    Raises:
+        ProtocolError: the state is missing or foreign, Yandex reported a
+            problem with the request, or the answer carries neither code nor
+            error.
+        AuthError: the operator declined.
     """
-    text = (pasted or "").strip()
-    if not text:
-        raise ProtocolError("No authorization code was entered.")
-    if "://" in text:
-        parts = urllib.parse.urlsplit(text)
-        for blob in (parts.query, parts.fragment):
-            found = dict(urllib.parse.parse_qsl(blob)).get("code")
-            if found:
-                return found
-        raise ProtocolError(
-            "That address carries no `code`. Copy the code Yandex displays, or "
-            "the whole address of the page it displays it on."
+    checked_state(issued=issued_state, returned=answer.get("state", ""))
+
+    error = (answer.get("error") or "").strip()
+    if error == "access_denied":
+        raise AuthError(
+            "Access was declined in the browser, so nothing was authorised and "
+            "nothing was stored. Run the login again if that was not intended."
         )
-    if any(character.isspace() for character in text):
-        raise ProtocolError("An authorization code contains no spaces.")
-    return text
+    if error:
+        described = (answer.get("error_description") or "").strip()
+        detail = f"{error}: {described}" if described else error
+        hint = ""
+        if "redirect" in detail.lower():
+            hint = (
+                " The application's Redirect URI must be exactly "
+                f"{loopback_redirect_uri()} -- scheme, host, port and path -- and "
+                "it must be registered as a web service, not for API access."
+            )
+        raise ProtocolError(
+            f"Yandex refused the sign-in request ({detail}). Nothing was stored.{hint}"
+        )
+
+    code = (answer.get("code") or "").strip()
+    if not code:
+        raise ProtocolError(
+            "The browser came back without an authorization code or a reason. "
+            "Nothing was stored. Run the login again."
+        )
+    return code
 
 
 def default_post(url: str, data: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -275,6 +321,7 @@ def exchange_code(
     client_id: str,
     code: str,
     code_verifier: str,
+    redirect_uri: str | None = None,
     post: Post = default_post,
 ) -> Tokens:
     """Spend the authorization code for tokens.
@@ -292,14 +339,17 @@ def exchange_code(
             token, in which case nothing was stored.
         TransportError: the endpoint could not be reached.
     """
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "code_verifier": code_verifier,
+    }
+    if redirect_uri:
+        form["redirect_uri"] = redirect_uri
     payload = _call(
         post,
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": client_id,
-            "code_verifier": code_verifier,
-        },
+        form,
         during="exchange the authorization code",
         relogin_hint=(
             "That authorization code is wrong, already used, or expired -- they "
