@@ -2,7 +2,7 @@
 title: 'Story 2.1 — Authorise the mailbox and list its folders'
 type: 'feature'
 created: '2026-09-09'
-status: 'review'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: '514b7e058d1edf490ec9e0f42dd0849616c48646'
 context:
@@ -274,6 +274,23 @@ placeholder written in epic 1 and became wrong advice the moment mail was built.
 And `test_layering.py` asserted that `tools/` imports no `mcp` while AD-1's
 actual rule is that `tools/` imports no *protocol library* -- an `import caldav`
 in a tool module would have passed for all of epic 1.
+
+## Verification (live, 2026-09-25)
+
+Measured against the operator's real mailbox, after `yandex-mcp setup mail` with an
+app password of type Mail and IMAP switched on:
+
+- **The app password signs in over IMAP `LOGIN`.** The one claim this story's last
+  amendment left open is now measured, not assumed. `yandex-mcp verify` reports
+  the mailbox reachable with 26 folders.
+- **The hierarchy delimiter is `|`.** The fake in `tests/unit/conftest.py` was built
+  on that from the documentation; it held.
+- **Cyrillic folder names arrive decoded** -- `Archive|Календарь` -- so modified
+  UTF-7 is handled below us, as the roundtrip measurement said.
+- **Paging a real folder list terminates** at `limit=2` with no folder on two pages.
+
+All three live mail tests pass. The account holds only what it held before: the
+mail live tests write nothing.
 
 ## Suggested Review Order
 

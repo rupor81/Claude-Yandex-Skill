@@ -59,10 +59,15 @@ both mistakes with one error:
 ## Install
 
 ```bash
-uv sync --no-editable
+uv sync
 ```
 
-**`--no-editable` is not optional on macOS.** See [Install modes](#install-modes) below.
+If this folder lives in `~/Documents` or on the Desktop with iCloud sync on, do this once
+first — see [The environment](#the-environment) for why:
+
+```bash
+mkdir .venv.nosync && ln -s .venv.nosync .venv
+```
 
 ## Configure
 
@@ -121,33 +126,29 @@ and Yandex 360 domain accounts.
 
 Add `"env": {"YANDEX_MCP_PROFILE": "work"}` to pin a profile.
 
-## Install modes
+## The environment
 
-Editable installs do not work reliably on macOS here, and the failure is silent enough
-to have cost this project a false verification.
+**iCloud hides files inside dot-folders in `~/Documents`,** and Python 3.13 skips hidden
+`.pth` files — so an ordinary `uv sync` produced an environment whose console scripts failed
+with `ModuleNotFoundError` for packages that were plainly installed.
 
-Something on macOS re-applies the `UF_HIDDEN` flag to the `.pth` files under `.venv`,
-within seconds and repeatedly. Python 3.13's `site.addpackage` explicitly checks that
-flag and skips hidden `.pth` files, so the workspace packages never get onto the path
-and every console script fails with `ModuleNotFoundError`. No `chflags` remedy holds —
-the flag returns between two shell prompts.
+Measured, not guessed: a file created in `~/Documents/<project>/.anything/` is flagged hidden
+within seconds; the same file in a plain folder, in a dot-folder outside `~/Documents`, or in
+a folder ending in `.nosync` is not. `.nosync` is iCloud's documented opt-out.
 
-The split this project settled on:
+So the environment lives in `.venv.nosync`, and `.venv` is a symlink to it. Everything that
+expects `.venv` — uv, your MCP client config — keeps working, editable installs work again,
+and iCloud stops uploading a few hundred megabytes of dependencies as a side effect.
 
-| Purpose | Command | Why |
-|---|---|---|
-| Running the connectors | `uv sync --no-editable` | Removes the `.pth` mechanism entirely; survives a deliberately hidden `.pth` |
-| Running the tests | any sync | `pyproject.toml` sets pytest's `pythonpath`, so the suite imports from source regardless |
-| Editing the source | re-run `uv sync --no-editable` | Non-editable means source edits do **not** take effect until the next sync |
-
-If a console script reports `ModuleNotFoundError` for a package that is plainly
-installed, this is why. Re-run the sync; do not reach for `PYTHONPATH`, which hides the
-problem rather than fixing it and produces verification that proves nothing.
+For most of epic 1 this was diagnosed only as "something re-applies the hidden flag", and
+worked around with `uv sync --no-editable`. The workaround held until someone typed a plain
+`uv run`, which silently rebuilt the environment editable and broke every connector at once.
+The cause, once found, needed no workaround.
 
 ## Tests
 
 ```bash
-env -u PYTHONPATH uv run --no-sync pytest tests/unit -q
+env -u PYTHONPATH uv run pytest tests/unit -q
 ```
 
 The `env -u PYTHONPATH` is deliberate. A suite that passes only because a variable
@@ -157,7 +158,7 @@ Live tests run against a real account, create and destroy their own throwaway ca
 and verify by re-listing:
 
 ```bash
-env -u PYTHONPATH YANDEX_MCP_LIVE_TESTS=1 uv run --no-sync pytest tests/live -q
+env -u PYTHONPATH YANDEX_MCP_LIVE_TESTS=1 uv run pytest tests/live -q
 ```
 
 **Leave several minutes between full live runs.** Yandex's rate limit is per account

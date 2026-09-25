@@ -25,9 +25,11 @@ yandex-mcp-cli = { workspace = true }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
-# Load the workspace packages from source. The editable installs alone are not
-# enough here: on macOS the .pth files intermittently acquire the UF_HIDDEN flag
-# and Python 3.13 then skips them, so the suite would fail to import.
+# Load the workspace packages from source, so the suite imports what is in the
+# tree whatever state the installed environment is in. Originally a workaround:
+# iCloud hides files in dot-folders under ~/Documents, and Python 3.13 skips a
+# hidden .pth. The root cause is fixed now (README, "The environment"); this stays
+# because a suite that depends on an install step can pass against a stale one.
 pythonpath = [
     # `tests/` so the rules the live suite obeys can be unit-tested without one.
     "tests",

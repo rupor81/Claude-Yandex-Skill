@@ -97,6 +97,13 @@ calendar-specific limits and stay open with their reasoning intact.
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-verify-a-configured-account.md`
   summary: Editable installs are unusable here — something re-applies the macOS UF_HIDDEN flag to the .venv .pth files within seconds, and Python 3.13's site.addpackage silently skips hidden .pth files, so every console script fails with ModuleNotFoundError.
   evidence: Root cause read directly from site.py in the installed interpreter. Neither uv nor file creation reliably sets the flag; it returns between two shell prompts, so no chflags remedy holds. Worked around by installing the workspace non-editable (`uv sync --no-editable`), which removes the .pth mechanism entirely and survives a deliberately hidden .pth. The cost is real: source edits no longer take effect until the next sync, so development and day-to-day use now want different install modes. A durable choice — UV_NO_EDITABLE for operators, editable plus pytest's pythonpath for development — should be made and documented rather than left to whoever last ran a sync.
+  root cause (2026-09-25, measured): iCloud Desktop & Documents sync flags files inside
+    dot-folders under ~/Documents as hidden within seconds. A file in a plain folder, in a
+    dot-folder outside ~/Documents, or in a folder ending `.nosync` is not flagged. The
+    environment now lives in `.venv.nosync` with `.venv` a symlink to it; editable installs
+    work, and a plain `uv run` no longer breaks every connector. The epic 1 entry called the
+    agent "something" and settled for a workaround -- which failed the first time the
+    operator typed an ordinary `uv run`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-7-update-an-event-with-an-explicit-scope.md`
   summary: The live suite cannot be run back to back. This server's rate limit is per account and does not reset between runs, so the second and third run in quick succession fail somewhere — and never in the same place twice.

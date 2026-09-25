@@ -9,7 +9,10 @@
 # Python
 __pycache__/
 *.py[cod]
-.venv/
+# `.venv` is a symlink to `.venv.nosync` here -- see README, "The environment".
+# No trailing slash: `.venv/` matches only a directory, and a symlink is not one.
+.venv
+.venv.nosync/
 venv/
 *.egg-info/
 .pytest_cache/

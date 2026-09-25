@@ -65,6 +65,10 @@ Measured: the account's Calendar app password is refused by IMAP and SMTP, with
 IMAP is a switch in Mail's settings, so Mail needs a password of its own, of type
 Mail, with IMAP switched on. `setup mail` says both; the refusal says both.
 
+**Measured 2026-09-25, live:** a Mail-type app password with IMAP switched on signs
+in over `LOGIN`; the mailbox lists 26 folders; the delimiter is `|`; Cyrillic names
+arrive decoded. Story 2.1 is done on that evidence.
+
 The OAuth work is not wasted: PKCE, the token exchange, refresh and the loopback
 listener stay in `yandex_core` for **Disk**, which has no password route.
 
