@@ -1,6 +1,6 @@
 """One real call against a real Yandex mailbox.
 
-Skipped unless `YANDEX_MCP_LIVE_TESTS=1` *and* the profile has been authorised,
+Skipped unless `YANDEX_MCP_LIVE_TESTS=1` *and* a mail app password is stored,
 because everything else in this suite runs with no network and no credentials.
 
     YANDEX_MCP_LIVE_TESTS=1 uv run pytest tests/live -q
@@ -22,7 +22,6 @@ import pytest
 from yandex_core.config import load_profile
 from yandex_core.credentials import get_secret
 from yandex_core.errors import YandexError
-from yandex_core.oauth import refresh_access_token
 from yandex_core.results import Page
 from yandex_mail_mcp.client.imap_client import IMAPMailClient
 from yandex_mail_mcp.tools.folders import build_mail_folders_list
@@ -33,62 +32,36 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _authorised_profile():
+def _mail_profile():
     """The profile, or a skip naming exactly what has not been done yet.
 
     A hard failure here would read as "the mail connector is broken" on a
-    machine where nobody has run the login, which is a different thing entirely.
+    machine where nobody has run the setup, which is a different thing entirely.
     """
     try:
         profile = load_profile()
-    except YandexError as exc:
-        pytest.skip(f"no profile: {exc}")
-    if not profile.oauth_client_id:
-        pytest.skip(
-            "the profile has no OAuth client_id -- register an application at "
-            "https://oauth.yandex.ru and run `yandex-mcp login mail`"
-        )
-    try:
         get_secret("mail", profile.name)
     except YandexError as exc:
-        pytest.skip(f"the mailbox is not authorised: {exc}")
+        pytest.skip(f"mail is not set up -- run `yandex-mcp setup mail`: {exc}")
     return profile
 
 
 def _client():
-    profile = _authorised_profile()
+    profile = _mail_profile()
 
-    async def access_token() -> str:
-        return refresh_access_token(
-            client_id=profile.oauth_client_id or "",
-            refresh_token=get_secret("mail", profile.name),
-            profile=profile.name,
-        ).access_token
+    async def password() -> str:
+        return get_secret("mail", profile.name)
 
     return profile, IMAPMailClient(
         host=profile.imap_host,
         port=profile.imap_port,
         login=profile.login,
-        access_token_provider=access_token,
+        password_provider=password,
     )
-
-
-def test_a_real_refresh_token_yields_a_live_access_token():
-    """The renewal is what makes the stored grant worth storing."""
-    profile = _authorised_profile()
-
-    tokens = refresh_access_token(
-        client_id=profile.oauth_client_id or "",
-        refresh_token=get_secret("mail", profile.name),
-        profile=profile.name,
-    )
-
-    assert tokens.access_token
-    assert tokens.access_token != get_secret("mail", profile.name)
 
 
 def test_a_real_mailbox_lists_its_real_folders():
-    """The vertical slice: OAuth, XOAUTH2, LIST and STATUS, end to end."""
+    """The vertical slice: app password, LOGIN, LIST and STATUS, end to end."""
     _, client = _client()
 
     async def call():

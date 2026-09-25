@@ -2,8 +2,11 @@
 
 Two measured facts about this server shape the module.
 
-``imap.yandex.ru:993`` advertises ``AUTH=XOAUTH2``, so the OAuth token is used
-directly and no SASL is hand-rolled.  Its capability line carries **no** ``SORT``,
+``imap.yandex.ru:993`` advertises ``AUTH=PLAIN``, and the mailbox signs in with an
+app password over ``LOGIN`` -- the way mail programs connect to Yandex. An earlier
+version used OAuth (XOAUTH2), which needed a registered application; the operator
+asked why, and there was no answer beyond an unmeasured claim that IMAP would not
+take an app password. OAuth stays in the core, for Disk.  Its capability line carries **no** ``SORT``,
 ``THREAD``, ``ESEARCH`` or ``UTF8=ACCEPT``: there is no server-side ordering to
 lean on, and ordering therefore belongs to ``tools/`` where AD-9 already puts it.
 
@@ -52,7 +55,7 @@ _STATUS_OPTIONS = ("MESSAGES", "UNSEEN")
 #: give a machine-readable code for it, so the wording is all there is.
 _POLICY_MARKERS = ("organization", "organisation", "policy", "disabled by")
 
-TokenProvider = Callable[[], Awaitable[str]]
+PasswordProvider = Callable[[], Awaitable[str]]
 
 #: Given every folder the server listed, which of them to spend a STATUS on.
 CountSelector = Callable[[Sequence["FolderRef"]], Sequence[str]]
@@ -77,9 +80,9 @@ class FolderRef:
 class IMAPMailClient:
     """One IMAP connection per call, exposed as async methods.
 
-    The token is fetched through a provider rather than held: it expires, and a
-    client that cached one would start failing halfway through a session with an
-    error about credentials that are perfectly good.
+    The password is fetched through a provider rather than held, so it is read
+    from the keychain per call and never sits in a long-lived object -- the same
+    discipline the calendar client keeps.
     """
 
     def __init__(
@@ -88,13 +91,13 @@ class IMAPMailClient:
         host: str,
         port: int,
         login: str,
-        access_token_provider: TokenProvider,
+        password_provider: PasswordProvider,
         timeout: int = 30,
     ) -> None:
         self._host = host
         self._port = port
         self._login = login
-        self._token_provider = access_token_provider
+        self._password_provider = password_provider
         self._timeout = timeout
 
     async def list_folders(self, *, count_for: CountSelector) -> list[FolderRef]:
@@ -105,17 +108,17 @@ class IMAPMailClient:
         this module deciding which folders matter -- that decision is paging,
         and paging lives above.
         """
-        token = await self._token_provider()
+        password = await self._password_provider()
         return await anyio.to_thread.run_sync(
-            lambda: self._list_folders_blocking(token, count_for)
+            lambda: self._list_folders_blocking(password, count_for)
         )
 
     # -- blocking half -----------------------------------------------------
 
     def _list_folders_blocking(
-        self, token: str, count_for: CountSelector
+        self, password: str, count_for: CountSelector
     ) -> list[FolderRef]:
-        with self._connected(token) as box:
+        with self._connected(password) as box:
             try:
                 listed = box.folder.list()
             except ImapToolsError as exc:
@@ -166,11 +169,11 @@ class IMAPMailClient:
             unseen=_count(answer, "UNSEEN"),
         )
 
-    def _connected(self, token: str) -> object:
+    def _connected(self, password: str) -> object:
         """A logged-in mailbox, or this project's taxonomy instead of the library's.
 
         ``initial_folder=None`` matters: ``imap_tools`` defaults it to ``INBOX``
-        and *selects* that folder while logging in. Listing folders needs no
+        and *selects* that folder while signing in. Listing folders needs no
         selection, and the SELECT is a round trip nobody asked for on a metered
         connection -- and it fails outright on an account with no ``INBOX``.
         """
@@ -182,7 +185,7 @@ class IMAPMailClient:
                 f"host is unavailable ({type(exc).__name__})."
             ) from exc
         try:
-            return box.xoauth2(self._login, token, initial_folder=None)
+            return box.login(self._login, password, initial_folder=None)
         except MailboxLoginError as exc:
             raise _login_refused(exc, login=self._login, host=self._host) from exc
         except (OSError, TimeoutError) as exc:
@@ -216,21 +219,26 @@ def _folder_from(item: object) -> FolderRef:
 
 
 def _login_refused(exc: Exception, *, login: str, host: str) -> Exception:
-    """Tell "your token is wrong" apart from "your organisation forbids this".
+    """Tell "the sign-in was refused" apart from "your organisation forbids this".
 
-    They send the operator to different places, and only one of them is
-    something they can fix themselves. Nothing in the message quotes the token:
-    errors get pasted into issues and logs.
+    Measured live, Yandex answers two different problems with one message:
+    "[AUTHENTICATIONFAILED] LOGIN invalid credentials or IMAP is disabled". Their
+    fixes are in different places, so both are named. The password is never
+    quoted: errors get pasted into issues and logs.
     """
     detail = f"{exc}".lower()
     if any(marker in detail for marker in _POLICY_MARKERS):
         return PolicyError(
-            f"This organisation's policy does not allow this application to "
-            f"sign in to {login} on {host}. That is a Yandex 360 administrator "
-            "setting, not a problem with the authorisation -- ask them to "
-            "permit external clients, or to allow this application."
+            f"This organisation's policy does not allow mail programs to sign in "
+            f"to {login} on {host}. That is a Yandex 360 administrator setting, "
+            "not a problem with the password -- ask them to allow IMAP access "
+            "for mail programs."
         )
     return AuthError(
-        f"{host} refused the mail authorisation for {login}. Run "
-        "`yandex-mcp login mail` to authorise again."
+        f"{host} refused the sign-in for {login}. Yandex gives one message for "
+        "two different causes, so check both: the app password must be one "
+        "created for Mail (Почта) -- a password made for Calendar is refused "
+        "here -- and IMAP access must be switched on in Yandex Mail, under "
+        "Settings, Mail programs. Then run `yandex-mcp setup mail` to store the "
+        "right password."
     )

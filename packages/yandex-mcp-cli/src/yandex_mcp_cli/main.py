@@ -17,7 +17,6 @@ import argparse
 import getpass
 import os
 import sys
-import webbrowser
 
 from yandex_core.config import (
     DEFAULT_CALDAV_URL,
@@ -27,71 +26,36 @@ from yandex_core.config import (
 )
 from yandex_core.credentials import delete_secret, store_secret
 from yandex_core.errors import YandexError
-from yandex_core.loopback import CallbackListener
-from yandex_core.oauth import (
-    LOOPBACK_PORT,
-    code_from_callback,
-    exchange_code,
-    loopback_redirect_uri,
-    start_login,
-)
-from yandex_core.oauth import (
-    default_post as oauth_post,
-)
 
 from .verify import render_results, run_checks
 
 __all__ = ["build_parser", "main"]
 
-#: What the mail connector asks for, and nothing more. `mail:imap_full` covers
-#: reading and deleting; `mail:smtp` covers sending. Both are requested at login
-#: because widening the grant later means another trip through the browser for
-#: the operator, and this epic's write stories will need the second one.
-MAIL_SCOPES = ("mail:imap_full", "mail:smtp")
+MAIL_APP_PASSWORD_EXPLANATION = """\
+Yandex Mail is connected the way mail programs connect to it: with an app
+password. No application needs to be registered.
 
-LOGIN_MAIL_DESCRIPTION = (
-    "Authorise the mailbox over OAuth and store the refresh token. Yandex IMAP "
-    "will not take a password you can create by hand, the way the calendar does."
+Two things to do in Yandex first. Yandex answers both mistakes with the same
+error, so do both:
+
+  1. Create an app password for *Mail* (Почта) at
+     https://id.yandex.ru/security/app-passwords
+     Its type matters: a password created for Calendar is refused by IMAP.
+  2. Switch IMAP access on in Yandex Mail: Settings -> Mail programs, allow
+     access from the imap.yandex.ru server.
+
+On a Yandex 360 account an administrator can forbid mail programs entirely. If
+so, the server will say it is organisation policy rather than a wrong password.
+
+The password is stored in your system keychain (falling back to a 0600 file
+under the config directory). It never appears in this repository, in tool
+arguments, or in logs.
+"""
+
+SETUP_MAIL_DESCRIPTION = (
+    "Store the Yandex Mail app password. Mail programs connect to Yandex this "
+    "way; no registered application is needed."
 )
-
-REGISTER_APPLICATION_EXPLANATION = """\
-This profile has no Yandex OAuth application yet, so there is nothing to sign in
-as. Registering one takes a minute and is done once:
-
-  1. Open https://oauth.yandex.ru and create an application.
-  2. Choose the platform "Web services" -- not the kind for API access, whose
-     return address Yandex fixes to a page you would have to copy a code from.
-  3. Set its Redirect URI to exactly:  {redirect_uri}
-  4. Give it the rights `mail:imap_full` and `mail:smtp`.
-  5. Copy its ClientID and paste it below. It is remembered afterwards, so this
-     is the only time you are asked.
-
-A ClientID is not a secret: it travels in the sign-in address by design, so it
-is stored in your config file where you can read and edit it.
-"""
-
-LOGIN_MAIL_STEPS = """\
-Opening your browser to sign in to Yandex. Sign in however you normally do --
-password, QR code, Yandex ID -- and approve the access. The browser comes back
-here on its own when you are done.
-"""
-
-LOGIN_MAIL_EXPLANATION = """\
-This is the standard desktop sign-in: the command opens your browser, you sign in
-to Yandex however it offers, and the browser returns to a listener on this
-machine at {redirect_uri}. Nothing is pasted by hand.
-
-You need a registered application once. Register it as a *Web service* with
-exactly that Redirect URI and the rights `mail:imap_full` and `mail:smtp`; this
-command asks for its ClientID the first time and remembers it.
-
-This connector is a *public client*: it proves itself with PKCE rather than with
-an application secret, so there is no secret to store or to leak.
-
-The refresh token is stored in your system keychain (falling back to a 0600 file
-under the config directory). The access token is not stored at all: it lasts
-about an hour and is renewed silently whenever a mail tool runs.
-"""
 
 APP_PASSWORD_EXPLANATION = """\
 Yandex CalDAV does not accept OAuth access tokens: a bearer token that works for
@@ -139,15 +103,6 @@ SETUP_CALENDAR_DESCRIPTION = (
     "OAuth tokens, so an app password must be created by hand in Yandex ID first."
 )
 
-#: How long the command waits for the browser to come back. Long enough to find a
-#: phone for a QR code; short enough that a forgotten terminal does not hold the
-#: port indefinitely.
-SIGN_IN_TIMEOUT_SECONDS = 300
-
-#: Opens a URL in the operator's browser. A name of its own so tests can play the
-#: browser -- and play it the way Yandex does, by sending it back with a code.
-open_browser = webbrowser.open
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -186,48 +141,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calendar.set_defaults(handler=setup_calendar)
 
-    login = commands.add_parser(
-        "login",
-        help="Authorise a service over OAuth.",
-        description="Authorise one Yandex service that requires OAuth.",
-    )
-    login_services = login.add_subparsers(dest="service", required=True)
-
-    login_mail = login_services.add_parser(
+    mail = services.add_parser(
         "mail",
-        help="Authorise the mailbox and store its refresh token.",
-        description=LOGIN_MAIL_DESCRIPTION,
-        epilog=LOGIN_MAIL_EXPLANATION.format(redirect_uri=loopback_redirect_uri()),
+        help="Store the mail app password.",
+        description=SETUP_MAIL_DESCRIPTION,
+        epilog=MAIL_APP_PASSWORD_EXPLANATION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    login_mail.add_argument(
+    mail.add_argument(
         "--profile",
-        default=None,
+        default="default",
+        help="Profile to write (default: default).",
+    )
+    mail.add_argument(
+        "--login",
         help=(
-            "Profile to authorise (default: the profile selected by "
-            "YANDEX_MCP_PROFILE, or the configured default)."
+            "Yandex login or full email address. Taken from the profile if it "
+            "already has one, prompted for otherwise."
         ),
     )
-    login_mail.add_argument(
-        "--client-id",
-        default=None,
-        help=(
-            "ClientID of your Yandex OAuth application. Public by design -- it "
-            "travels in the authorization URL -- so it is an argument, and it "
-            "is remembered in the profile afterwards."
-        ),
-    )
-    login_mail.add_argument(
-        "--port",
-        type=int,
-        default=LOOPBACK_PORT,
-        help=(
-            f"Port the browser returns to (default: {LOOPBACK_PORT}). Only change "
-            "it if you registered a different one: Yandex matches the Redirect "
-            "URI exactly, port included."
-        ),
-    )
-    login_mail.set_defaults(handler=login_mail_command)
+    mail.set_defaults(handler=setup_mail)
 
     verify = commands.add_parser(
         "verify",
@@ -304,76 +237,53 @@ def setup_calendar(args: argparse.Namespace) -> int:
     return 0
 
 
-def login_mail_command(args: argparse.Namespace) -> int:
-    """Sign in to Yandex in the browser and store what comes back.
+def setup_mail(args: argparse.Namespace) -> int:
+    """Explain the two steps in Yandex, then store the mail app password.
 
-    The order is deliberate. The listener is bound *before* the browser opens, so
-    a busy port is reported while the operator has done nothing yet. The code is
-    exchanged *before* anything is written, so a login that fails leaves the
-    previous authorisation exactly as it was.
+    An existing profile keeps its login and everything else in it: setting up
+    Mail must never cost the operator a working Calendar.
     """
-    profile = load_profile(args.profile)
-    redirect_uri = loopback_redirect_uri(args.port)
-    client_id = (args.client_id or profile.oauth_client_id or "").strip()
-    if not client_id:
-        # Asked for rather than demanded after a flag: a placeholder like
-        # `<ClientID>` pasted into zsh is read as a redirection.
-        print(REGISTER_APPLICATION_EXPLANATION.format(redirect_uri=redirect_uri))
-        client_id = input("ClientID of your Yandex OAuth application: ").strip()
-    if not client_id:
-        print(
-            "No ClientID was given, so there is nothing to sign in as. Register "
-            "an application at https://oauth.yandex.ru as a Web service, with the "
-            f"Redirect URI {redirect_uri} and the rights `mail:imap_full` and "
-            "`mail:smtp`, then run `yandex-mcp login mail` again. Nothing was "
-            "stored.",
-            file=sys.stderr,
-        )
+    print(MAIL_APP_PASSWORD_EXPLANATION)
+
+    try:
+        existing: Profile | None = load_profile(args.profile)
+    except YandexError:
+        existing = None
+
+    login = (args.login or (existing.login if existing else "") or "").strip()
+    if not login:
+        login = input("Yandex login or email: ").strip()
+    if not login:
+        print("A login is required. Nothing was stored.", file=sys.stderr)
         return 2
 
-    with CallbackListener(port=args.port) as listener:
-        request = start_login(
-            client_id=client_id, scopes=MAIL_SCOPES, redirect_uri=redirect_uri
-        )
-        print(LOGIN_MAIL_STEPS)
-        # Printed as well as opened: the browser may open on another screen, or
-        # not at all on a machine with no desktop.
-        print(f"If it does not open, visit:\n\n  {request.url}\n")
-        sys.stdout.flush()
-        open_browser(request.url)
-        answer = listener.wait(timeout=SIGN_IN_TIMEOUT_SECONDS)
+    password = getpass.getpass("Mail app password (input hidden): ").strip()
+    if not password:
+        print("An app password is required. Nothing was stored.", file=sys.stderr)
+        return 2
 
-    code = code_from_callback(answer, issued_state=request.state)
-    tokens = exchange_code(
-        client_id=client_id,
-        code=code,
-        code_verifier=request.code_verifier,
-        redirect_uri=request.redirect_uri,
-        post=oauth_post,
+    profile = (
+        existing.model_copy(update={"login": login})
+        if existing is not None
+        else Profile(name=args.profile, login=login)
     )
-
-    location = store_secret("mail", profile.name, tokens.refresh_token or "")
+    location = store_secret("mail", args.profile, password)
     try:
-        path = write_profile(
-            profile.model_copy(update={"oauth_client_id": client_id}),
-            make_default=False,
-        )
+        path = write_profile(profile, make_default=existing is None)
     except BaseException:
-        # A stored token with no profile naming it is an orphan nothing will
-        # ever read or clean up, so it does not outlive the failure.
         try:
-            delete_secret("mail", profile.name)
+            delete_secret("mail", args.profile)
         except Exception as cleanup_failure:  # noqa: BLE001 - reported, not hidden
             print(
-                f"warning: the refresh token could not be removed after the "
+                f"warning: the app password could not be removed after the "
                 f"profile write failed ({cleanup_failure}); remove it by hand.",
                 file=sys.stderr,
             )
         raise
 
     # Deliberately reports where, never what.
-    print(f"Signed in. Refresh token stored in: {location}")
-    print(f"Profile {profile.name!r} updated in: {path}")
+    print(f"\nMail app password stored in: {location}")
+    print(f"Profile {args.profile!r} written to: {path}")
     print("Check it with: yandex-mcp verify")
     return 0
 

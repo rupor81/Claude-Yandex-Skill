@@ -39,7 +39,7 @@ recoverable from each other and guessing is catastrophic in one direction.
 - Python 3.13 (pinned in `.python-version`)
 - [`uv`](https://docs.astral.sh/uv/)
 - A Yandex account
-- An **app password** for CalDAV, and a registered **OAuth application** for Mail
+- An **app password** for Calendar, and another for Mail — Yandex scopes them by type
 
 Yandex CalDAV rejects OAuth bearer tokens — a token that works for every other Yandex
 API is refused by the calendar endpoint. The only credential it accepts is an app
@@ -48,19 +48,13 @@ password, and app passwords can only be created by hand at
 can disable them entirely; the server then reports organisation policy rather than a
 wrong password.
 
-Mail is the opposite: IMAP will not take an app password, so it signs in with OAuth — the
-ordinary way: the command opens your browser, you sign in to Yandex however you normally do
-(password, QR code, Yandex ID), and the browser returns you to the command.
+Mail connects the same way, the way mail programs connect to Yandex: with an app password.
+No application needs to be registered. Two things to do in Yandex, because Yandex answers
+both mistakes with one error:
 
-That needs an application registered once at <https://oauth.yandex.ru>:
-
-- platform **Web services** — not the kind for API access, whose return address Yandex fixes
-  to a page you would have to copy a code from;
-- Redirect URI exactly `http://localhost:8765/callback`;
-- rights `mail:imap_full` and `mail:smtp`.
-
-The connector is a **public client**: it proves itself with PKCE, so there is no application
-secret to store or to leak.
+- create the app password with the type **Mail** (Почта) — one made for Calendar is refused
+  by IMAP (measured);
+- switch IMAP access on in Yandex Mail: *Settings → Mail programs*.
 
 ## Install
 
@@ -80,16 +74,14 @@ The command explains how to create the app password, then reads it from a hidden
 prompt. It is stored in the system keychain, falling back to a `0600` file under the
 config directory. It never appears in this repository, in tool arguments, or in logs.
 
-For Mail, sign in instead of setting up:
+And the same for Mail:
 
 ```bash
-uv run yandex-mcp login mail
+uv run yandex-mcp setup mail
 ```
 
-The first time, it explains the one-time registration and asks for the application's
-ClientID at a prompt, then remembers it. After that it opens your browser, you sign in and
-approve, and the browser comes back on its own. The refresh token goes to the keychain; the
-access token is not stored at all, and is renewed silently whenever a mail tool runs.
+It reuses the profile's login and stores the mail password in its own keychain slot, so a
+working calendar is left exactly as it was.
 
 Then check that it actually works — one real call per service:
 
@@ -110,7 +102,7 @@ and Yandex 360 domain accounts.
 | `YANDEX_MCP_PROFILE` | Which profile to use; otherwise the file's default |
 | `YANDEX_MCP_CONFIG_DIR` | Where the config and fallback secret file live |
 | `YANDEX_MCP_CALENDAR_<PROFILE>_PASSWORD` | Overrides the stored calendar app password |
-| `YANDEX_MCP_MAIL_<PROFILE>_PASSWORD` | Overrides the stored mail refresh token |
+| `YANDEX_MCP_MAIL_<PROFILE>_PASSWORD` | Overrides the stored mail app password |
 
 ## Wire it into a client
 
@@ -178,12 +170,12 @@ and never twice in the same place.
 packages/
   yandex-core/          contracts shared by every connector:
                         errors, Page/Chunk results, cursors, risk registry,
-                        credentials, OAuth with PKCE, server construction
+                        credentials, OAuth with PKCE (for Disk), server construction
   yandex-calendar-mcp/  the calendar server
     client/             CalDAV; the only place that touches the network
     tools/              MCP tools; filtering and validation live here
   yandex-mail-mcp/      the mail server, same shape over IMAP
-  yandex-mcp-cli/       yandex-mcp setup / login / verify
+  yandex-mcp-cli/       yandex-mcp setup / verify
 tests/unit/             no network
 tests/live/             a real account, opt-in
 ```

@@ -575,11 +575,11 @@ def test_the_setup_hint_names_the_service_and_a_non_default_profile():
     assert verify_module.setup_hint("calendar", "default") == (
         "Run `yandex-mcp setup calendar` to configure it."
     )
-    # Mail is authorised, not set up: `yandex-mcp setup mail` does not exist and
-    # never did. This line asserted it until epic 2 built the command it was
-    # guessing at, which is exactly when a placeholder turns into wrong advice.
+    # `setup mail` exists now: Mail connects with an app password, as Calendar
+    # does. For a while it was `login mail` (OAuth), which needed a registered
+    # application; the operator asked why, and there was no good answer.
     assert verify_module.setup_hint("mail", "work") == (
-        "Run `yandex-mcp login mail --profile work` to configure it."
+        "Run `yandex-mcp setup mail --profile work` to configure it."
     )
     assert verify_module.setup_hint("disk", None) == (
         "Run `yandex-mcp setup disk` to configure it."
@@ -730,72 +730,52 @@ def _line_for(service: str, out: str) -> str:
 
 
 # -- mail, epic 2 ---------------------------------------------------------
+#
+# Mail connects with an app password, as Calendar does. The check is one real
+# IMAP sign-in and LIST, and nothing else: counts cost a request per folder.
 
 
 @pytest.fixture
 def install_mail(monkeypatch):
-    """Stand in for both halves of the mail check: the token and the IMAP call."""
+    """Stand in for the IMAP client, with the real constructor's signature."""
 
-    def install(*, folders=None, raises=None, refresh_raises=None, sleep=None):
-        captured = {}
-
-        def refresh(*, client_id, refresh_token, profile=None, **kwargs):
-            captured["client_id"] = client_id
-            captured["refresh_token"] = refresh_token
-            captured["profile"] = profile
-            if refresh_raises is not None:
-                raise refresh_raises
-            from yandex_core.oauth import Tokens
-
-            return Tokens(access_token="live-access-token", expires_in=3600)
+    def install(*, folders=None, raises=None, sleep=None):
+        captured = {"asked_for_counts": []}
 
         class FakeMailClient:
-            def __init__(self, *, host, port, login, access_token_provider):
+            def __init__(self, *, host, port, login, password_provider):
                 captured["host"] = host
                 captured["port"] = port
                 captured["login"] = login
-                captured["provider"] = access_token_provider
+                captured["provider"] = password_provider
 
             async def list_folders(self, *, count_for):
                 if sleep is not None:
                     import asyncio
 
                     await asyncio.sleep(sleep)
-                captured["token"] = await self.provider_token()
+                captured["password"] = await captured["provider"]()
                 if raises is not None:
                     raise raises
-                return list(folders or [])
-
-            async def provider_token(self):
-                return await captured["provider"]()
+                listed = [_NamedFolder(name) for name in (folders or [])]
+                captured["asked_for_counts"].extend(count_for(listed))
+                return listed
 
         monkeypatch.setattr(
             verify_module, "_load_mail_client_class", lambda: FakeMailClient
         )
-        monkeypatch.setattr(verify_module, "refresh_access_token", refresh)
         FakeMailClient.captured = captured
         return FakeMailClient
 
     return install
 
 
-def _mail_ready(monkeypatch):
-    """A profile with an OAuth application, and a stored refresh token."""
-    from yandex_core.config import Profile, write_profile
-    from yandex_core.credentials import store_secret
-
-    write_profile(
-        Profile(
-            name="default",
-            login=LOGIN,
-            caldav_url=CALDAV_URL,
-            oauth_client_id="client-abc",
-        )
-    )
-    store_secret("mail", "default", "stored-refresh-token")
+def _mail_ready():
+    write_profile(Profile(name="default", login=LOGIN, caldav_url=CALDAV_URL))
+    store_secret("mail", "default", "stored-mail-password")
 
 
-def test_mail_reads_as_unconfigured_before_any_login(
+def test_mail_reads_as_unconfigured_before_setup(
     configured, install_client, install_mail, capsys
 ):
     """Nothing is broken; nothing is set up. Those are different lines."""
@@ -805,62 +785,75 @@ def test_mail_reads_as_unconfigured_before_any_login(
     code, out, _ = run(capsys)
 
     assert code == 0, "an unconfigured service failed the command"
-    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
-    assert "unconfigured" in lines["mail"]
-    assert "not yet built" not in lines["mail"], "mail is built now"
+    line = _line_for("mail", out)
+    assert "unconfigured" in line
+    assert "yandex-mcp setup mail" in line
+    assert "not yet built" not in line
 
 
 def test_mail_reports_the_folders_it_actually_reached(
-    configured, install_client, install_mail, capsys, monkeypatch
+    configured, install_client, install_mail, capsys
 ):
     install_client(calendars=[])
-    fake = install_mail(folders=[object(), object(), object()])
-    _mail_ready(monkeypatch)
+    fake = install_mail(folders=["INBOX", "Sent", "Spam"])
+    _mail_ready()
 
     code, out, _ = run(capsys)
 
     assert code == 0
-    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
-    assert "reachable" in lines["mail"]
-    assert "3" in lines["mail"]
+    line = _line_for("mail", out)
+    assert "reachable" in line
+    assert "3" in line
     assert fake.captured["host"] == "imap.yandex.ru"
     assert fake.captured["port"] == 993
-    assert fake.captured["client_id"] == "client-abc"
-    assert fake.captured["refresh_token"] == "stored-refresh-token"
+    assert fake.captured["password"] == "stored-mail-password"
 
 
-def test_a_revoked_mail_authorisation_fails_the_run_and_names_the_repair(
-    configured, install_client, install_mail, capsys, monkeypatch
+def test_a_reachability_check_asks_for_no_folder_counts(
+    configured, install_client, install_mail, capsys
 ):
-    """A revoked token is broken, not absent -- so it fails, unlike unconfigured."""
+    """Counts cost one request each -- measured. Reachability needs none."""
+    install_client(calendars=[])
+    fake = install_mail(folders=["INBOX", "Sent"])
+    _mail_ready()
+
+    run(capsys)
+
+    assert fake.captured["asked_for_counts"] == []
+
+
+def test_a_refused_mail_password_fails_the_run_and_names_the_repair(
+    configured, install_client, install_mail, capsys
+):
+    """A refused password is broken, not absent -- so it fails, unlike unconfigured."""
     install_client(calendars=[])
     install_mail(
-        refresh_raises=AuthError("Run `yandex-mcp login mail` to authorise again.")
+        raises=AuthError(
+            "IMAP refused it. Run `yandex-mcp setup mail` to store another."
+        )
     )
-    _mail_ready(monkeypatch)
+    _mail_ready()
 
     code, out, _ = run(capsys)
 
     assert code != 0
-    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
-    assert "failed" in lines["mail"]
-    assert "login mail" in lines["mail"]
+    line = _line_for("mail", out)
+    assert "failed" in line
+    assert "setup mail" in line
 
 
 def test_a_broken_mailbox_does_not_stop_the_calendar_from_reporting(
-    configured, install_client, install_mail, capsys, monkeypatch
+    configured, install_client, install_mail, capsys
 ):
-    """Each service is checked and reported independently."""
     install_client(calendars=[FakeCalendar("Personal")])
     install_mail(raises=TransportError("imap.yandex.ru is unreachable"))
-    _mail_ready(monkeypatch)
+    _mail_ready()
 
     code, out, _ = run(capsys)
 
     assert code != 0
-    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
-    assert "reachable" in lines["calendar"]
-    assert "failed" in lines["mail"]
+    assert "reachable" in _line_for("calendar", out)
+    assert "failed" in _line_for("mail", out)
 
 
 def test_a_mailbox_that_never_answers_is_reported_as_timed_out(
@@ -868,158 +861,54 @@ def test_a_mailbox_that_never_answers_is_reported_as_timed_out(
 ):
     install_client(calendars=[])
     install_mail(sleep=5)
-    _mail_ready(monkeypatch)
+    _mail_ready()
     monkeypatch.setattr(verify_module, "CHECK_TIMEOUT_SECONDS", 0.05)
 
     code, out, _ = run(capsys)
 
     assert code != 0
-    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
-    assert "timed out" in lines["mail"]
+    assert "timed out" in _line_for("mail", out)
 
 
-def test_no_stored_token_reaches_the_report(
-    configured, install_client, install_mail, capsys, monkeypatch
-):
-    install_client(calendars=[])
-    install_mail(refresh_raises=AuthError("refused"))
-    _mail_ready(monkeypatch)
-
-    _, out, err = run(capsys)
-
-    assert "stored-refresh-token" not in out + err
-
-
-def test_a_reachability_check_asks_for_no_folder_counts(
-    configured, install_client, install_mail, capsys, monkeypatch
-):
-    """Counts cost one request each -- measured. Reachability needs none of them.
-
-    The check exists to prove the mailbox answers a LIST. Paying per folder to
-    learn numbers nobody asked for would make `verify` the most expensive
-    command in the tool.
-    """
-    asked: list = []
-
-    install_client(calendars=[])
-
-    class Spy:
-        def __init__(self, *, host, port, login, access_token_provider):
-            self._provider = access_token_provider
-
-        async def list_folders(self, *, count_for):
-            listed = [_NamedFolder("INBOX"), _NamedFolder("Sent")]
-            await self._provider()
-            asked.extend(count_for(listed))
-            return listed
-
-    monkeypatch.setattr(verify_module, "_load_mail_client_class", lambda: Spy)
-    monkeypatch.setattr(
-        verify_module,
-        "refresh_access_token",
-        lambda **kwargs: _FakeTokens("live-access-token"),
-    )
-    _mail_ready(monkeypatch)
-
-    code, _, _ = run(capsys)
-
-    assert code == 0
-    assert asked == [], f"the check asked for counts on {asked}"
-
-
-def test_a_mailbox_with_a_client_id_but_no_token_says_to_log_in(
-    configured, install_client, install_mail, capsys, monkeypatch
-):
-    from yandex_core.config import Profile, write_profile
-
-    install_client(calendars=[])
-    install_mail()
-    write_profile(
-        Profile(
-            name="default", login=LOGIN, caldav_url=CALDAV_URL, oauth_client_id="abc"
-        )
-    )
-
-    code, out, _ = run(capsys)
-
-    assert code == 0, "an unconfigured service failed the command"
-    assert "login mail" in _line_for("mail", out)
-
-
-def test_a_mailbox_with_a_token_but_no_application_says_to_register_one(
-    configured, install_client, install_mail, capsys, monkeypatch
-):
-    """The odd half-state: a token stored, and no application to present it as.
-
-    Without its own line this reads as "no credential", and the operator runs a
-    login that refuses for a reason the report never mentioned.
-    """
-    install_client(calendars=[])
-    install_mail()
-    store_secret("mail", "default", "stored-refresh-token")
-
-    code, out, _ = run(capsys)
-
-    assert code == 0
-    line = _line_for("mail", out)
-    assert "unconfigured" in line
-    assert "oauth.yandex.ru" in line, (
-        "the operator is not told to register an application"
-    )
-
-
-def test_a_token_quoted_by_a_failure_is_redacted_from_the_report(
-    configured, install_client, install_mail, capsys, monkeypatch
+def test_a_password_quoted_by_a_failure_is_redacted_from_the_report(
+    configured, install_client, install_mail, capsys
 ):
     """Some libraries put the credential they were given into their own message."""
     install_client(calendars=[])
-    install_mail(
-        refresh_raises=AuthError("rejected the token stored-refresh-token outright")
-    )
-    _mail_ready(monkeypatch)
+    install_mail(raises=AuthError("rejected stored-mail-password outright"))
+    _mail_ready()
 
     code, out, err = run(capsys)
 
     assert code != 0
-    assert "stored-refresh-token" not in out + err
+    assert "stored-mail-password" not in out + err
     assert REDACTED in out
+
+
+def test_a_world_readable_mail_password_is_a_failure_not_an_absence(
+    configured, install_client, install_mail, capsys, monkeypatch
+):
+    """The password is fine; its permissions are not, and setup would replace it."""
+    from yandex_core.config import config_dir
+
+    install_client(calendars=[])
+    install_mail()
+    _mail_ready()
+    fallback = config_dir() / "credentials" / "mail.default"
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    if not fallback.exists():
+        fallback.write_text("stored-mail-password", encoding="utf-8")
+    fallback.chmod(0o644)
+
+    code, out, _ = run(capsys)
+
+    line = _line_for("mail", out)
+    assert code == 1
+    assert "failed" in line
+    assert "chmod 600" in line
+    assert "yandex-mcp setup" not in line, "told to replace a password that is fine"
 
 
 class _NamedFolder:
     def __init__(self, name):
         self.name = name
-
-
-class _FakeTokens:
-    def __init__(self, access_token):
-        self.access_token = access_token
-
-
-def test_a_world_readable_mail_token_is_a_failure_not_an_absence(
-    configured, install_client, install_mail, capsys, monkeypatch
-):
-    """The grant is fine; its permissions are not, and a login would replace it.
-
-    Reading this as "unconfigured" would send the operator through the browser
-    again to re-authorise something that was never revoked -- and leave the file
-    just as readable afterwards.
-    """
-    from yandex_core.config import config_dir
-
-    install_client(calendars=[])
-    install_mail()
-    _mail_ready(monkeypatch)
-    fallback = config_dir() / "credentials" / "mail.default"
-    if not fallback.exists():  # the keychain took it; force the file path
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        fallback.write_text("stored-refresh-token", encoding="utf-8")
-        monkeypatch.setattr(verify_module, "_load_mail_client_class", lambda: object)
-    fallback.chmod(0o644)
-
-    code, out, _ = run(capsys)
-
-    mail_line = _line_for("mail", out)
-    assert code == 1
-    assert "failed" in mail_line
-    assert "chmod 600" in mail_line
-    assert "yandex-mcp login" not in mail_line, "told to re-authorise a valid grant"

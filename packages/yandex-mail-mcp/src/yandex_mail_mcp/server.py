@@ -1,8 +1,7 @@
 """The Yandex mail MCP server: transport and wiring, nothing else.
 
 Every decision of substance lives a layer down. This module builds the
-application, resolves the profile once at start-up, turns the stored refresh
-token into a live access token on demand, registers the tools through the risk
+application, resolves the profile once at start-up, registers the tools through the risk
 registry, and hands the process to stdio.
 """
 
@@ -16,17 +15,16 @@ from mcp.server.mcpserver import MCPServer
 from yandex_core.app import build_server, configure_logging, register_tool
 from yandex_core.config import Profile, load_profile
 from yandex_core.credentials import get_secret
-from yandex_core.errors import ProtocolError, YandexError
-from yandex_core.oauth import refresh_access_token
+from yandex_core.errors import YandexError
 
 from .client.imap_client import IMAPMailClient
 from .tools.folders import build_mail_folders_list
 
 __all__ = ["SERVICE", "build_mail_server", "main"]
 
-#: The service name under which the *refresh* token is stored. The access token
-#: is never stored: it expires within the hour, and a stale one on disk is a
-#: credential that looks usable and is not.
+#: The service name under which the mail app password is stored. Its own slot,
+#: not the calendar's: Yandex scopes app passwords by type, and one created for
+#: Calendar is refused by IMAP -- measured.
 SERVICE = "mail"
 
 INSTRUCTIONS = (
@@ -57,7 +55,7 @@ def build_mail_server(profile: Profile | None = None) -> MCPServer:
             host=resolved.imap_host,
             port=resolved.imap_port,
             login=resolved.login,
-            access_token_provider=lambda: _access_token(resolved),
+            password_provider=lambda: _password(resolved),
         )
 
     server = build_server(name="yandex-mail-mcp", instructions=INSTRUCTIONS)
@@ -65,30 +63,13 @@ def build_mail_server(profile: Profile | None = None) -> MCPServer:
     return server
 
 
-async def _access_token(profile: Profile) -> str:
-    """A live access token, renewed silently from the stored refresh token.
+async def _password(profile: Profile) -> str:
+    """The mail app password, read per call through `credentials` (AD-6).
 
-    Read lazily, per call, for two reasons. A missing authorisation surfaces as
-    an actionable tool error rather than a start-up crash with no context; and
-    an access token lasts about an hour, so one fetched at start-up would go
-    stale under a long-running server and fail with a message about credentials
-    that are in fact perfectly good.
+    Lazily, so a missing password surfaces as an actionable tool error naming
+    `yandex-mcp setup mail`, rather than a start-up crash with no context.
     """
-    if not profile.oauth_client_id:
-        raise ProtocolError(
-            f"Profile {profile.name!r} has no OAuth `client_id`, so this "
-            "mailbox cannot be authorised. Register an application at "
-            "https://oauth.yandex.ru with the rights `mail:imap_full` and "
-            "`mail:smtp`, then run `yandex-mcp login mail`."
-        )
-    # Read inside `credentials`, which is the only module allowed to (AD-6).
-    stored = get_secret(SERVICE, profile.name)
-    tokens = refresh_access_token(
-        client_id=profile.oauth_client_id,
-        refresh_token=stored,
-        profile=profile.name,
-    )
-    return tokens.access_token
+    return get_secret(SERVICE, profile.name)
 
 
 def main() -> int:

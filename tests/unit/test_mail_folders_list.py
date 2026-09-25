@@ -32,10 +32,10 @@ LOGIN = "me@yandex.ru"
 RUSSIAN_FOLDERS = ("Входящие", "Отправленные", "Спам", "Удалённые", "Черновики")
 
 
-def _client(box_token="live-access-token", **kwargs):
+def _client(box_token="app-password", **kwargs):
     tokens: list = []
 
-    async def token_provider():
+    async def password_provider():
         tokens.append(box_token)
         return box_token
 
@@ -43,7 +43,7 @@ def _client(box_token="live-access-token", **kwargs):
         host="imap.yandex.ru",
         port=993,
         login=LOGIN,
-        access_token_provider=token_provider,
+        password_provider=password_provider,
         **kwargs,
     )
     return client, tokens
@@ -116,13 +116,14 @@ def test_the_hierarchy_delimiter_is_reported_so_a_path_can_be_built(monkeypatch)
 # -- authentication, which must never look like an empty mailbox ----------
 
 
-def test_the_access_token_is_obtained_without_anybody_being_asked(monkeypatch):
+def test_the_mailbox_signs_in_with_the_stored_app_password(monkeypatch):
+    """Read per call, through the provider -- never held by the client."""
     box = FakeMailBox(folders=["INBOX"])
 
     _, _, tokens = _list(box, monkeypatch)
 
-    assert tokens == ["live-access-token"], "the token provider was not consulted"
-    assert box.authenticated_as == (LOGIN, "live-access-token")
+    assert tokens == ["app-password"], "the password provider was not consulted"
+    assert box.authenticated_as == (LOGIN, "app-password")
 
 
 def test_no_folder_is_selected_just_to_list_folders(monkeypatch):
@@ -174,12 +175,12 @@ def test_an_unreachable_host_is_a_transport_error_not_an_empty_page(monkeypatch)
     assert "imap.yandex.ru" in str(caught.value)
 
 
-def test_no_token_reaches_an_error_message(monkeypatch):
+def test_no_password_reaches_an_error_message(monkeypatch):
     box = FakeMailBox(
         login_raises=MailboxLoginError(("NO", [b"AUTHENTICATIONFAILED"]), "NO")
     )
     install_fake_mailbox(monkeypatch, box)
-    client, _ = _client(box_token="SECRET-ACCESS-TOKEN")
+    client, _ = _client(box_token="SECRET-APP-PASSWORD")
 
     async def provider():
         return client
@@ -188,7 +189,7 @@ def test_no_token_reaches_an_error_message(monkeypatch):
     with pytest.raises(AuthError) as caught:
         anyio.run(lambda: tool())
 
-    assert "SECRET-ACCESS-TOKEN" not in str(caught.value)
+    assert "SECRET-APP-PASSWORD" not in str(caught.value)
 
 
 # -- counts cost one request each, so the page is the bound ---------------
@@ -342,3 +343,33 @@ def test_a_client_that_ignores_the_window_is_refused_rather_than_answered(monkey
         anyio.run(lambda: tool())
 
     assert "selector" in str(caught.value).lower()
+
+
+def test_a_refused_login_names_both_causes_yandex_gives(monkeypatch):
+    """Measured live: Yandex answers one message for two different problems.
+
+    "[AUTHENTICATIONFAILED] LOGIN invalid credentials or IMAP is disabled" -- and
+    the two fixes are in different places. An app password created for another
+    service (Calendar, say) is refused by IMAP; IMAP access itself is a switch in
+    the mailbox's settings. Naming only one sends the operator to re-create a
+    password that was never the problem, or the other way round.
+    """
+    box = FakeMailBox(
+        login_raises=MailboxLoginError(
+            (
+                "NO",
+                [
+                    b"[AUTHENTICATIONFAILED] LOGIN invalid credentials or IMAP is disabled"
+                ],
+            ),
+            "NO",
+        )
+    )
+
+    with pytest.raises(AuthError) as caught:
+        _list(box, monkeypatch)
+
+    message = str(caught.value)
+    assert "Почта" in message or "Mail" in message, "the password type is not named"
+    assert "IMAP" in message, "the IMAP switch is not named"
+    assert "yandex-mcp setup mail" in message

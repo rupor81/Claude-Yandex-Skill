@@ -19,14 +19,14 @@ LOGIN = "me@yandex.ru"
 
 
 def _client(**kwargs):
-    async def token_provider():
-        return "live-access-token"
+    async def password_provider():
+        return "app-password"
 
     return IMAPMailClient(
         host="imap.yandex.ru",
         port=993,
         login=LOGIN,
-        access_token_provider=token_provider,
+        password_provider=password_provider,
         **kwargs,
     )
 

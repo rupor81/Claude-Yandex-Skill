@@ -185,6 +185,19 @@ def write_profile(profile: Profile, *, make_default: bool = True) -> Path:
     # has already preserved them.
     if profile.oauth_client_id:
         entry["oauth_client_id"] = profile.oauth_client_id
+    # Hosts and ports are written only when they differ from the defaults, so a
+    # plain profile stays plain. Until 2026-09-25 they were never written at all:
+    # a caller passing a non-default `imap_host` lost it without a word, which is
+    # a silent drop of exactly the kind this project exists to refuse.
+    for field, default in (
+        ("imap_host", DEFAULT_IMAP_HOST),
+        ("imap_port", DEFAULT_IMAP_PORT),
+        ("smtp_host", DEFAULT_SMTP_HOST),
+        ("smtp_port", DEFAULT_SMTP_PORT),
+    ):
+        value = getattr(profile, field)
+        if value != default:
+            entry[field] = value
     entry.pop("name", None)
     profiles[profile.name] = entry
 

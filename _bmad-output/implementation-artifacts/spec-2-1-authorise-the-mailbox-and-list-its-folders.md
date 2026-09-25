@@ -18,8 +18,9 @@ context:
 password the operator can simply create by hand — it wants an OAuth token, which
 expires, and which nothing in this project yet knows how to obtain or renew.
 
-**Approach:** `yandex-mcp login mail` runs the Authorization Code flow with PKCE and
-stores the refresh token. Every mail tool obtains a live access token from that refresh
+**Approach:** (amended -- see the change log) `yandex-mcp setup mail` stores a Mail app
+password, as `setup calendar` does for Calendar. Originally: `yandex-mcp login mail` ran the Authorization Code flow with PKCE and
+stored the refresh token. Every mail tool obtains a live access token from that refresh
 token without prompting. `mail_folders_list` proves the whole chain end to end by
 returning the account's real folders — the vertical slice story 1.1 was for Calendar.
 
@@ -188,6 +189,27 @@ returning the account's real folders — the vertical slice story 1.1 was for Ca
   client secret despite PKCE. Neither is assumed.
   **Avoids:** a second trip through the same mistake. Both open questions are named
   here so they are measured, not inferred.
+
+- **Amendment (2026-09-25, renegotiated by the operator) -- Mail signs in with an
+  app password, not OAuth.** The operator asked why an application had to be
+  registered at all, when mail programs connect to Yandex with an app password.
+  There was no good answer. The premise that IMAP "will not take an app password"
+  was never measured -- it was asserted, and it contradicted a measurement already
+  in hand: `imap.yandex.ru` advertises `AUTH=PLAIN`.
+  **Measured 2026-09-25:** the account's *Calendar* app password is refused by IMAP
+  and SMTP -- "[AUTHENTICATIONFAILED] LOGIN invalid credentials or IMAP is
+  disabled". That does not establish that app passwords fail for Mail; Yandex names
+  two causes in one message, and both are expected here: app passwords are scoped
+  by type, and IMAP access is a switch in the mailbox's settings. What it does
+  establish is that Mail needs **its own** password, of type Mail.
+  **Changed:** `yandex-mcp setup mail` replaces `login mail`; the IMAP client signs
+  in with `LOGIN`; the refusal message names both causes and both fixes. The OAuth
+  flow, PKCE and the loopback listener stay in `yandex_core` for Disk, which has no
+  password route.
+  **Still to be measured on the first real setup:** that a Mail-type app password
+  with IMAP enabled signs in. Not assumed.
+  **Avoids:** a registration step the operator does not need, justified by a claim
+  nobody checked -- the third unmeasured claim in this story, all in the same place.
 
 ## Design Notes
 

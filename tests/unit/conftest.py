@@ -513,8 +513,10 @@ def install_fake_dav_client(
 # Modelled on what `imap_tools` 1.15.0 and the live Yandex server were observed
 # to do, never on what the client under test finds convenient:
 #
-# * `MailBox(host, port, timeout)` then `.xoauth2(login, token, initial_folder)`,
-#   which returns itself and raises `MailboxLoginError` when the server refuses.
+# * `MailBox(host, port, timeout)` then `.login(login, password, initial_folder)`,
+#   which returns itself and raises `MailboxLoginError` when the server refuses --
+#   measured live: "[AUTHENTICATIONFAILED] LOGIN invalid credentials or IMAP is
+#   disabled".
 # * `folder.list()` answers `FolderInfo(name, delim, flags)` with the name
 #   already decoded from modified UTF-7 -- verified by roundtrip, including
 #   Cyrillic and a name containing the hierarchy delimiter.
@@ -586,10 +588,16 @@ class FakeMailBox:
         self.logged_out = 0
         self.folder = FakeFolderManager(self)
 
-    def xoauth2(self, username, access_token, initial_folder="INBOX"):
+    def login(self, username, password, initial_folder="INBOX"):
+        """`imap_tools`' LOGIN, which is how an app password signs in.
+
+        Deliberately the only sign-in this fake offers: a client that drifted back
+        to XOAUTH2 would find no method here and fail, rather than pass against
+        a fake that accepted either.
+        """
         if self.login_raises is not None:
             raise self.login_raises
-        self.authenticated_as = (username, access_token)
+        self.authenticated_as = (username, password)
         self.initial_folder = initial_folder
         if initial_folder is not None:
             self.folder.set(initial_folder)

@@ -209,3 +209,15 @@ def test_hosts_written_by_hand_into_the_file_are_honoured():
     )
 
     assert load_profile().imap_host == "imap.example.ru"
+
+
+def test_a_non_default_host_given_to_write_profile_is_not_silently_dropped():
+    """Found by a mail-setup test: hosts were never written, so one passed in was
+    lost with no error. Defaults still stay out of the file."""
+    write_profile(
+        Profile(name="personal", login="me@yandex.ru", imap_host="imap.example.ru")
+    )
+    from yandex_core.config import config_path
+
+    assert load_profile().imap_host == "imap.example.ru"
+    assert "smtp_host" not in config_path().read_text(), "a default was written"

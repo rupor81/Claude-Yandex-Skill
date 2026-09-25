@@ -53,6 +53,27 @@ users and has never been measured by this project. AD-9 already routes around it
 date, filter in `tools/` — so nothing depends on it working. Do not add a text-match
 parameter to `client/` on the strength of a successful one-off test.
 
+## How Mail signs in -- settled 2026-09-25, after two wrong turns
+
+**Mail uses an app password, like Calendar.** No application is registered. The
+operator asked why one was needed, and there was no good answer: the premise that
+IMAP "will not take an app password" was never measured, and `imap.yandex.ru`
+advertises `AUTH=PLAIN`, which is how an app password signs in.
+
+Measured: the account's Calendar app password is refused by IMAP and SMTP, with
+"invalid credentials or IMAP is disabled". Yandex scopes app passwords by type, and
+IMAP is a switch in Mail's settings, so Mail needs a password of its own, of type
+Mail, with IMAP switched on. `setup mail` says both; the refusal says both.
+
+The OAuth work is not wasted: PKCE, the token exchange, refresh and the loopback
+listener stay in `yandex_core` for **Disk**, which has no password route.
+
+The two wrong turns, for whoever reads this next: first, a redirect-URI
+"measurement" that was an interpretation of an ambiguous reply, which produced a
+paste-the-code flow; then OAuth itself, which rested on an unchecked claim about
+IMAP. Both were the same defect -- the first plausible explanation, recorded as
+fact -- and both were caught by the operator asking "why?".
+
 ## The redirect URI -- a correction
 
 This section first said the redirect was not ours to choose, and that the flow

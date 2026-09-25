@@ -52,7 +52,6 @@ from yandex_core.errors import (
     TransportError,
     YandexError,
 )
-from yandex_core.oauth import refresh_access_token
 
 __all__ = [
     "CHECKS",
@@ -128,11 +127,11 @@ def _cause_for(exc: BaseException) -> str:
     return "unexpected"
 
 
-#: Not every service is configured by `setup`. Mail is authorised with `login`,
-#: because what it stores is an OAuth grant and not a password anyone can type.
-#: A hint naming a command that does not exist is worse than none: the operator
-#: reads it as the fix, runs it, and gets an argparse error about `setup mail`.
-_CONFIGURE_COMMAND = {"mail": "login mail"}
+#: The command that configures each service, where it is not `setup <service>`.
+#: Empty today: Mail went back to an app password and `setup mail`. The table
+#: stays because Disk will be OAuth, and a hint naming a command that does not
+#: exist is worse than none -- the operator runs it and gets an argparse error.
+_CONFIGURE_COMMAND: dict[str, str] = {}
 
 
 def setup_hint(service: str, profile: str | None = None) -> str:
@@ -299,12 +298,10 @@ def _load_mail_client_class() -> type:
 
 
 def check_mail(profile_name: str | None = None) -> ServiceResult:
-    """Renew the token and make one real ``list_folders`` call.
+    """One real IMAP sign-in and LIST, with the stored mail app password.
 
-    Both halves are real on purpose. A check that only renewed the token would
-    report a mailbox reachable when IMAP itself is refused -- and a check that
-    only dialled IMAP could not get a token to dial it with. Between them they
-    are the whole chain story 2.1 exists to prove.
+    Counts are not asked for: they cost one request per folder, measured, and
+    reachability needs none of them.
     """
     service = "mail"
     profile = _profile_label(profile_name)
@@ -336,23 +333,6 @@ def check_mail(profile_name: str | None = None) -> ServiceResult:
 
     profile = loaded.name
 
-    if not loaded.oauth_client_id:
-        # No application registered yet. Nothing is broken; the login has simply
-        # not been done, which is the same state as no stored credential.
-        return _unconfigured(
-            service,
-            profile,
-            NotConfigured(
-                "No OAuth application is configured for mail.",
-                reason=(
-                    "no OAuth application is configured for mail -- register "
-                    "one at https://oauth.yandex.ru with the rights "
-                    "`mail:imap_full` and `mail:smtp`; the login command asks "
-                    "for its ClientID"
-                ),
-            ),
-        )
-
     try:
         stored = get_secret(service, profile)
     except CredentialNotFound as exc:
@@ -366,7 +346,7 @@ def check_mail(profile_name: str | None = None) -> ServiceResult:
         host=loaded.imap_host,
         port=loaded.imap_port,
         login=loaded.login,
-        access_token_provider=lambda: _mail_access_token(loaded, stored),
+        password_provider=lambda: _stored(stored),
     )
 
     try:
@@ -403,18 +383,9 @@ def check_mail(profile_name: str | None = None) -> ServiceResult:
     )
 
 
-async def _mail_access_token(loaded: object, stored: str) -> str:
-    """One renewal, inside the check's own deadline.
-
-    ``count_for`` above returns nothing on purpose: this is a reachability
-    check, and folder counts cost one request each. Proving the mailbox answers
-    a LIST is the whole question.
-    """
-    return refresh_access_token(
-        client_id=loaded.oauth_client_id,  # type: ignore[attr-defined]
-        refresh_token=stored,
-        profile=loaded.name,  # type: ignore[attr-defined]
-    ).access_token
+async def _stored(password: str) -> str:
+    """The password already read above, handed to the client's provider."""
+    return password
 
 
 def check_disk(profile_name: str | None = None) -> ServiceResult:
