@@ -18,6 +18,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import anyio
 import pytest
+from livescratch import new_scratch_name
 
 from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
 from yandex_calendar_mcp.tools.calendars import build_calendar_list
@@ -433,10 +434,8 @@ def test_creating_a_real_event_reports_what_the_server_stored_and_leaves_no_trac
     account that this test is allowed to assert: that it is unchanged when the
     test is over.
     """
-    import uuid
-
     before = _listed_calendars()
-    scratch_name = f"yandex-mcp-live-{uuid.uuid4().hex[:8]}"
+    scratch_name = new_scratch_name()
 
     with _dav_client() as client:
         client.principal().make_calendar(name=scratch_name)
@@ -598,13 +597,11 @@ def _live_series_document(start):
 
 def test_changing_a_real_series_and_one_real_instance_of_it():
     """The whole of story 1.7 against the real account, inside its own calendar."""
-    import uuid
-
     from yandex_calendar_mcp.tools.events import build_calendar_event_update
     from yandex_core.errors import Conflict
 
     before = _listed_calendars()
-    scratch_name = f"yandex-mcp-live-{uuid.uuid4().hex[:8]}"
+    scratch_name = new_scratch_name()
 
     with _dav_client() as client:
         client.principal().make_calendar(name=scratch_name)
@@ -797,13 +794,11 @@ def _live_delete_series_document(start):
 
 def test_cancelling_one_real_instance_and_then_removing_the_real_series():
     """The whole of story 1.8 against the real account, inside its own calendar."""
-    import uuid
-
     from yandex_calendar_mcp.tools.events import build_calendar_event_delete
     from yandex_core.errors import Conflict
 
     before = _listed_calendars()
-    scratch_name = f"yandex-mcp-live-{uuid.uuid4().hex[:8]}"
+    scratch_name = new_scratch_name()
 
     with _dav_client() as client:
         client.principal().make_calendar(name=scratch_name)

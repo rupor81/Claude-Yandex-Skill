@@ -23,7 +23,9 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import anyio
 import pytest
+from livescratch import stale_report, stale_scratch_calendars
 
 #: How long the account's budget wants between full runs. Not measured to the
 #: second -- four runs inside an hour was enough to move the failure around, and
@@ -64,6 +66,8 @@ def _rate_limit_notice(request: pytest.FixtureRequest) -> Iterator[None]:
         else:  # pragma: no cover -- only under -p no:terminal
             print(f"WARNING: {message}")
 
+    _report_leftovers(request)
+
     yield
 
     # Stamped after the run, not before: what matters is when the account last
@@ -74,3 +78,45 @@ def _rate_limit_notice(request: pytest.FixtureRequest) -> Iterator[None]:
     except OSError:
         # Not being able to remember is not a reason to fail a passing suite.
         pass
+
+
+def _report_leftovers(request: pytest.FixtureRequest) -> None:
+    """Say so when an earlier run left something on the real account.
+
+    This project has leaked a calendar twice: once because a cleanup used the
+    wrong URL, and once because the network went away mid-run and no `finally`
+    survives that. Both were found by a person reading the account afterwards,
+    which is not a mechanism.
+
+    It reports and does not remove. A name match is a heuristic, not proof of
+    ownership, and a delete is the least recoverable thing this project does --
+    quietly removing collections from somebody's real account on a name match
+    would be the "harm with no sign of harm" the whole suite exists to prevent.
+    What the leak actually cost was that nobody noticed; being told fixes that.
+
+    Every failure here is swallowed. The check is a courtesy before the suite
+    runs; the suite's own tests are what report a broken account.
+    """
+    try:
+        from yandex_calendar_mcp.client.caldav_client import CalDAVCalendarClient
+        from yandex_core.config import load_profile
+        from yandex_core.credentials import get_secret
+
+        profile = load_profile()
+        client = CalDAVCalendarClient(
+            url=profile.caldav_url,
+            username=profile.login,
+            password=get_secret("calendar", profile.name),
+        )
+        names = [ref.name for ref in anyio.run(client.list_calendars)]
+    except Exception:
+        return
+
+    report = stale_report(stale_scratch_calendars(names))
+    if not report:
+        return
+    reporter = request.config.pluginmanager.getplugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"\n{report}\n", yellow=True, bold=True)
+    else:  # pragma: no cover -- only under -p no:terminal
+        print(report)

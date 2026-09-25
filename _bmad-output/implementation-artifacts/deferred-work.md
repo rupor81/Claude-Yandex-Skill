@@ -44,9 +44,7 @@
   summary: An event cannot be moved between calendars, a series' recurrence cannot be changed, attendees cannot be added or removed, and a text field cannot be cleared through the tool.
   evidence: Named only in a docstring until now, which is not where scope decisions belong. Moving an event between calendars is a delete and a create, and this server has no delete — doing it as a copy would leave the original behind on any partial failure. Changing an RRULE rewrites every future instance of a series other people are also in, and needs the same explicit-scope treatment the times got. Attendees send mail on the operator's behalf, held back from story 1.6 for the same reason. Clearing a field is the one that is nearly free: `client/compose.py` already distinguishes "not named" from `None` and now removes the property for `None`, but the tool's parameters use `None` as "omitted", so a second spelling — a sentinel, or an explicit `clear` list — has to be chosen before it can be offered.
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-1-8-delete-an-event-with-an-explicit-scope.md`
-  summary: A live test left a calendar on the real account when the network dropped mid-run, because its cleanup could not reach the server either.
-  evidence: Found by reading the account rather than by any assertion. The tests now create their throwaway calendar inside the block whose cleanup removes it, which closes the ordinary case, but no `finally` survives a network that is gone. A stale-calendar sweep at the start of a live run — remove anything named `yandex-mcp-live-*` older than an hour — would make the suite self-healing instead of relying on every run ending well.
+
 
 ## Resolved
 
@@ -65,6 +63,26 @@
   minutes to ninety seconds and made two consecutive full runs green. Disabling the caldav
   library's automatic retry for writes, done for correctness in story 1.6, is what moved the
   symptom onto the write test and made the aggregate cause visible.
+
+### Closed while epic 2 was under way
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-8-delete-an-event-with-an-explicit-scope.md`
+  summary: A live test left a calendar on the real account when the network dropped mid-run, because its cleanup could not reach the server either.
+  evidence: Found by reading the account rather than by any assertion. The tests now create their throwaway calendar inside the block whose cleanup removes it, which closes the ordinary case, but no `finally` survives a network that is gone. A stale-calendar sweep at the start of a live run — remove anything named `yandex-mcp-live-*` older than an hour — would make the suite self-healing instead of relying on every run ending well.
+  closed: 2026-09-25. **Not as proposed, and the difference matters twice over.**
+    The entry asked to "remove anything named `yandex-mcp-live-*` older than an hour".
+    Neither half of that was implementable as written. The names it was written about --
+    `yandex-mcp-live-f57b5924` -- carry no time at all, and CalDAV promises no creation
+    date for a collection, so nothing could be aged. Throwaway names now carry a UTC
+    stamp (`yandex-mcp-live-20260925T120000Z-ab12cd34`), which makes age readable with
+    no extra request; a name from before the stamp is reported as *age unknown* rather
+    than assumed recent, because assuming recent would hide exactly the leak this was
+    written for. And it reports rather than removes: a name match is a heuristic, not
+    proof of ownership, and a sweep that quietly deleted collections from the operator's
+    real account would be the harm-without-a-sign-of-harm this suite exists to prevent.
+    What the leak actually cost was that nobody noticed it; being told is the fix for
+    that. Verified against the live account -- silent on a clean one, and the historical
+    leak name is caught -- and seven mutations are caught by `tests/unit/test_live_scratch_names.py`.
 
 ### Closed by the epic 1 retrospective (2026-09-07)
 
