@@ -401,7 +401,10 @@ def test_a_message_stored_in_a_zone_behind_the_query_is_not_lost(monkeypatch):
     box = _box([FakeMessage(uid=42, when=stored)])
 
     page = _run(
-        box, monkeypatch, start=start.isoformat(), end=(start + timedelta(hours=1)).isoformat()
+        box,
+        monkeypatch,
+        start=start.isoformat(),
+        end=(start + timedelta(hours=1)).isoformat(),
     )
 
     assert [m.uid for m in page.items] == [42]
