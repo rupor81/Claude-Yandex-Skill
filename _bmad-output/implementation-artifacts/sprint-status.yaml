@@ -71,7 +71,7 @@ development_status:
   # Epic 2: Mail connector, end to end
   epic-2: in-progress
   2-1-authorise-the-mailbox-and-list-its-folders: done
-  2-2-list-message-headers-over-a-date-range: backlog
+  2-2-list-message-headers-over-a-date-range: done
   2-3-read-a-message-body-with-honest-truncation: backlog
   2-4-inspect-and-download-attachments: backlog
   2-5-correct-the-shared-core-against-a-second-protocol: backlog

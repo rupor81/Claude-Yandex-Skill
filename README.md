@@ -6,7 +6,7 @@ transport-specific live in a shared core, so the same tools can later be served 
 HTTP with OAuth without being rewritten.
 
 **Status:** the Calendar connector is complete — seven tools, 12 live tests against a
-real account. The Mail connector is under way: it is authorised and lists its folders.
+real account. The Mail connector is under way: it lists folders and message headers.
 Disk is planned.
 
 ---
@@ -23,6 +23,7 @@ Disk is planned.
 | `calendar_event_update` | destructive | Changes an event, conditionally, with an explicit scope |
 | `calendar_event_delete` | destructive | Removes an event, with an explicit scope |
 | `mail_folders_list` | read | Which folders the mailbox has, and how much is in them |
+| `mail_messages_list` | read | Message headers in a date range, newest first, filterable by sender and subject |
 
 Two rules shape every one of them:
 

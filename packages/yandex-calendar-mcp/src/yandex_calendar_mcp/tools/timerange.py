@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from yandex_core.errors import ProtocolError
+from yandex_core.instants import checked_instant
 from yandex_core.paging import decode_position_cursor
 
 __all__ = [
@@ -59,35 +60,6 @@ IncompleteReason = Literal["more_pages", "range_truncated", "unreadable_data"]
 #: name rather than narrowed: a quietly shortened window returns an answer that
 #: looks complete for a question nobody asked.
 MAX_RANGE_DAYS = 366
-
-
-def checked_instant(value: object, name: str) -> datetime:
-    """A required, timezone-aware moment.
-
-    Strings are accepted so the function behaves the same when called directly
-    as it does through the protocol, where pydantic parses them. A naive value
-    is refused here, before any request is made: a moment with no offset means
-    something different to everyone who reads it.
-    """
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise ProtocolError(
-                f"`{name}` is not an ISO 8601 timestamp: {value!r}."
-            ) from exc
-    if not isinstance(value, datetime):
-        raise ProtocolError(
-            f"`{name}` must be an ISO 8601 timestamp with an explicit UTC offset, "
-            f"not {type(value).__name__}."
-        )
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ProtocolError(
-            f"`{name}` has no UTC offset. Give an explicit one, for example "
-            f"2026-06-01T00:00:00+03:00; a naive timestamp means a different "
-            "moment to every reader."
-        )
-    return value
 
 
 def checked_calendar_url(calendar_url: object) -> str | None:

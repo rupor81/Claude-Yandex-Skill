@@ -6,8 +6,11 @@ the operator's real keychain or config. Both are cut off here for every test.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 import urllib.parse
+from dataclasses import dataclass as _dataclass
+from dataclasses import field as _field
 
 import pytest
 
@@ -633,3 +636,188 @@ def install_fake_mailbox(monkeypatch, box, *, module=None):
 
     monkeypatch.setattr(module or imap_client, "MailBox", factory)
     return built
+
+
+# -- messages, story 2.2 ------------------------------------------------------
+#
+# Shapes observed from the operator's INBOX on 2026-09-25: INTERNALDATE with a
+# +0300 offset, FLAGS carrying Yandex's own `encrypted` keyword on every message,
+# the header block as a literal, and BODYSTRUCTURE inline. SEARCH SINCE/BEFORE is
+# day-granular and BEFORE is exclusive -- measured.
+
+_PLAIN = b'("text" "plain" ("charset" "utf-8") NIL NIL "8bit" 512 12 NIL NIL NIL NIL)'
+_WITH_PDF = (
+    b'(("text" "plain" ("charset" "utf-8") NIL NIL "base64" 120 2 NIL NIL NIL NIL)'
+    b'("application" "pdf" ("name" "~") NIL NIL "base64" 88120 NIL'
+    b' ("attachment" ("filename" "~")) NIL NIL)'
+    b' "mixed" ("boundary" "~") NIL NIL NIL)'
+)
+
+
+@_dataclass
+class FakeMessage:
+    uid: int
+    when: _dt.datetime
+    subject: str = "hello"
+    sender: str = "a@example.ru"
+    to: str = "me@yandex.ru"
+    flags: tuple = ("\\Seen", "encrypted")
+    size: int = 1000
+    attachment: bool = False
+    structure: bytes | None = None
+
+    def header_bytes(self) -> bytes:
+        return (
+            f"From: {self.sender}\r\nTo: {self.to}\r\nSubject: {self.subject}\r\n\r\n"
+        ).encode()
+
+    def bodystructure(self) -> bytes:
+        if self.structure is not None:
+            return self.structure
+        return _WITH_PDF if self.attachment else _PLAIN
+
+
+_MON = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+]
+
+
+def _imap_date(value: _dt.datetime) -> str:
+    offset = value.utcoffset() or _dt.timedelta(0)
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    minutes = abs(minutes)
+    return (
+        f"{value.day:02d}-{_MON[value.month - 1]}-{value.year} "
+        f"{value:%H:%M:%S} {sign}{minutes // 60:02d}{minutes % 60:02d}"
+    )
+
+
+def _day(token) -> _dt.date:
+    text = token.decode() if isinstance(token, bytes) else token
+    day, mon, year = text.split("-")
+    return _dt.date(int(year), _MON.index(mon) + 1, int(day))
+
+
+@_dataclass
+class FakeIMAPClient:
+    """The imaplib object under `MailBox.client`, answering as Yandex was seen to."""
+
+    box: object
+    searched: list = _field(default_factory=list)
+    fetched: list = _field(default_factory=list)
+
+    def response(self, code):
+        if code == "UIDVALIDITY":
+            return ("UIDVALIDITY", [str(self.box.uidvalidity).encode()])
+        return (code, [None])
+
+    def _messages(self):
+        return self.box.messages_by_folder.get(self.box.current_folder, [])
+
+    def uid(self, command, *args):
+        command = command.upper()
+        if command == "SEARCH":
+            self.searched.append(args)
+            if self.box.search_raises is not None:
+                raise self.box.search_raises
+            criteria = [a.decode() if isinstance(a, bytes) else a for a in args]
+            since = before = None
+            for i, word in enumerate(criteria):
+                if word.upper() == "SINCE":
+                    since = _day(criteria[i + 1])
+                if word.upper() == "BEFORE":
+                    before = _day(criteria[i + 1])
+            uids = [
+                m.uid
+                for m in self._messages()
+                # day-granular, on the date as stored -- as the server does
+                if (since is None or m.when.date() >= since)
+                and (before is None or m.when.date() < before)
+            ]
+            return ("OK", [" ".join(str(u) for u in sorted(uids)).encode()])
+        if command == "FETCH":
+            wanted_raw, items = args[0], args[1]
+            self.fetched.append((wanted_raw, items))
+            if self.box.fetch_raises is not None:
+                raise self.box.fetch_raises
+            wanted = {
+                int(u)
+                for u in (
+                    wanted_raw.decode() if isinstance(wanted_raw, bytes) else wanted_raw
+                ).split(",")
+                if u
+            }
+            out = []
+            for seq, m in enumerate(self._messages(), start=1):
+                if m.uid not in wanted:
+                    continue
+                if "BODYSTRUCTURE" in items:
+                    out.append(
+                        f"{seq} (UID {m.uid} BODYSTRUCTURE ".encode()
+                        + m.bodystructure()
+                        + b")"
+                    )
+                else:
+                    header = m.header_bytes()
+                    flags = " ".join(m.flags)
+                    prefix = (
+                        f'{seq} (UID {m.uid} INTERNALDATE "{_imap_date(m.when)}" '
+                        f"RFC822.SIZE {m.size} FLAGS ({flags}) "
+                        f"BODY[HEADER.FIELDS (FROM TO SUBJECT)] {{{len(header)}}}"
+                    ).encode()
+                    out.append((prefix, header))
+                    out.append(b")")
+            return ("OK", out)
+        raise AssertionError(f"unexpected IMAP command {command}")
+
+
+def _set_folder(self, folder, readonly=False):
+    """`folder.set`, which the real library turns into SELECT or EXAMINE."""
+    box = self._box
+    # Both records: `selected` is what story 2.1's "no needless SELECT" test
+    # reads, `selections` keeps whether it was read-only.
+    box.selected.append(folder)
+    if not hasattr(box, "selections"):
+        box.selections = []
+    box.selections.append((folder, readonly))
+    if (
+        getattr(box, "messages_by_folder", None)
+        and folder not in box.messages_by_folder
+    ):
+        from imap_tools.errors import MailboxFolderSelectError
+
+        raise MailboxFolderSelectError(
+            ("NO", [b"[CLIENTBUG] EXAMINE No such folder."]), "OK"
+        )
+    box.current_folder = folder
+    count = len(getattr(box, "messages_by_folder", {}).get(folder, []))
+    return ("OK", [str(count).encode()])
+
+
+FakeFolderManager.set = _set_folder
+
+
+def with_messages(box, folder="INBOX", messages=(), uidvalidity=1731419406):
+    """Give a FakeMailBox a folder of messages, and the IMAP client that serves them."""
+    if not hasattr(box, "messages_by_folder"):
+        box.messages_by_folder = {}
+    box.messages_by_folder[folder] = list(messages)
+    box.uidvalidity = uidvalidity
+    box.current_folder = None
+    box.selections = []
+    box.search_raises = None
+    box.fetch_raises = None
+    box.client = FakeIMAPClient(box)
+    return box

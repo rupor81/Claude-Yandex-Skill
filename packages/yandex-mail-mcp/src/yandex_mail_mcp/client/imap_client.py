@@ -20,27 +20,40 @@ passes a selector and this module asks for exactly what comes back from it.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 
 import anyio.to_thread
 from imap_tools import MailBox
 from imap_tools.errors import (
     ImapToolsError,
+    MailboxFolderSelectError,
     MailboxFolderStatusError,
     MailboxLoginError,
 )
 
 from yandex_core.errors import (
     AuthError,
+    NotFound,
     PolicyError,
     ProtocolError,
     TransportError,
 )
 
+from .headers import (
+    attachment_presence,
+    decode_header_value,
+    header_fields,
+    parse_addresses,
+    parse_fetch_response,
+)
+
 __all__ = [
     "NOSELECT_FLAG",
     "FolderRef",
+    "HeaderRecord",
     "IMAPMailClient",
+    "MessageScan",
 ]
 
 #: A folder marked with this is a node in the hierarchy, not a mailbox: it
@@ -75,6 +88,51 @@ class FolderRef:
     #: Absence with no reason would be indistinguishable from a count of zero
     #: that this server simply failed to report.
     counts_note: str | None = None
+
+
+#: Header items asked for when reading a message's headers. PEEK, always: a
+#: listing that marked mail read would change the operator's mailbox by looking.
+_HEADER_ITEMS = (
+    "(UID INTERNALDATE RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT)])"
+)
+
+#: UIDs per FETCH command, so one command line stays well inside what servers
+#: accept. The scan budget in `tools/` bounds the total; this bounds one request.
+_FETCH_CHUNK = 200
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderRecord:
+    """One message's headers, decoded, and nothing from its body."""
+
+    uid: int
+    date: datetime | None
+    sender: tuple[str, str] | None
+    to: tuple[tuple[str, str], ...]
+    subject: str
+    flags: tuple[str, ...]
+    size: int | None
+
+
+@dataclass(slots=True)
+class MessageScan:
+    """What one connection learned about a folder's messages in a date window."""
+
+    #: Every UID the date search returned, ascending as the server gives them.
+    uids: list[int]
+    uidvalidity: int | None
+    #: Headers for the UIDs the caller chose to read.
+    read: list[HeaderRecord] = field(default_factory=list)
+    #: Attachment presence for the UIDs the caller chose to keep. ``None`` is
+    #: "could not be told", never "no".
+    attachments: dict[int, bool | None] = field(default_factory=dict)
+
+
+#: Given every UID in the window and the folder's UIDVALIDITY, the UIDs to read.
+ChooseFn = Callable[[list[int], "int | None"], list[int]]
+#: Given the headers read, the UIDs to return -- the only ones whose
+#: BODYSTRUCTURE is fetched.
+KeepFn = Callable[[list[HeaderRecord]], list[int]]
 
 
 class IMAPMailClient:
@@ -113,6 +171,29 @@ class IMAPMailClient:
             lambda: self._list_folders_blocking(password, count_for)
         )
 
+    async def list_messages(
+        self,
+        *,
+        folder: str,
+        since: date,
+        before: date,
+        choose: ChooseFn,
+        keep: KeepFn,
+    ) -> MessageScan:
+        """One read-only connection: date search, bounded header read, structure.
+
+        The server is asked for dates and nothing else (AD-12). Which UIDs are
+        read, and which are kept, is decided above through ``choose`` and
+        ``keep`` -- paging and filtering are ``tools/``' business -- so this
+        module spends exactly the requests those decisions call for.
+        """
+        password = await self._password_provider()
+        return await anyio.to_thread.run_sync(
+            lambda: self._list_messages_blocking(
+                password, folder, since, before, choose, keep
+            )
+        )
+
     # -- blocking half -----------------------------------------------------
 
     def _list_folders_blocking(
@@ -140,6 +221,93 @@ class IMAPMailClient:
                     continue
                 folders[index] = self._with_counts(box, folders[index])
             return folders
+
+    def _list_messages_blocking(
+        self,
+        password: str,
+        folder: str,
+        since: date,
+        before: date,
+        choose: ChooseFn,
+        keep: KeepFn,
+    ) -> MessageScan:
+        with self._connected(password) as box:
+            try:
+                # EXAMINE, not SELECT: nothing done through this connection can
+                # set \Seen, whatever a later FETCH asks for.
+                box.folder.set(folder, readonly=True)
+            except MailboxFolderSelectError as exc:
+                raise NotFound(
+                    f"There is no folder named {folder!r} in {self._login}'s "
+                    "mailbox. Folder names are exact, hierarchy included -- list "
+                    "them with `mail_folders_list` and pass one back verbatim."
+                ) from exc
+            client = box.client  # type: ignore[attr-defined]
+            uidvalidity = _uidvalidity(client)
+            try:
+                typ, data = client.uid(
+                    "SEARCH", "SINCE", _imap_day(since), "BEFORE", _imap_day(before)
+                )
+            except ImapToolsError as exc:  # pragma: no cover - imaplib raises its own
+                raise ProtocolError(f"The date search in {folder!r} failed.") from exc
+            if typ != "OK":
+                raise ProtocolError(
+                    f"{self._host} refused the date search in {folder!r} ({typ})."
+                )
+            uids = sorted(int(u) for u in (data[0] or b"").split()) if data else []
+            scan = MessageScan(uids=uids, uidvalidity=uidvalidity)
+
+            chosen = choose(uids, uidvalidity)
+            scan.read = self._headers(client, chosen)
+            kept = keep(scan.read)
+            scan.attachments = self._structures(client, kept)
+            return scan
+
+    def _headers(self, client: object, uids: list[int]) -> list[HeaderRecord]:
+        records: list[HeaderRecord] = []
+        for chunk in _chunks(uids, _FETCH_CHUNK):
+            typ, data = client.uid("FETCH", _uid_set(chunk), _HEADER_ITEMS)  # type: ignore[attr-defined]
+            if typ != "OK":
+                raise ProtocolError(f"{self._host} refused to return message headers.")
+            try:
+                parsed = parse_fetch_response(data)
+            except ValueError as exc:
+                raise ProtocolError(
+                    f"{self._host} returned message headers this server could not "
+                    "read, so none are reported rather than some."
+                ) from exc
+            for raw in parsed:
+                fields = header_fields(raw.header)
+                senders = parse_addresses(fields.get("from"))
+                records.append(
+                    HeaderRecord(
+                        uid=raw.uid,
+                        date=raw.internaldate,
+                        sender=senders[0] if senders else None,
+                        to=tuple(parse_addresses(fields.get("to"))),
+                        subject=decode_header_value(fields.get("subject")),
+                        flags=raw.flags,
+                        size=raw.size,
+                    )
+                )
+        return records
+
+    def _structures(self, client: object, uids: list[int]) -> dict[int, bool | None]:
+        """Attachment presence for exactly these UIDs; unknown where unreadable."""
+        presence: dict[int, bool | None] = dict.fromkeys(uids)
+        for chunk in _chunks(uids, _FETCH_CHUNK):
+            try:
+                typ, data = client.uid("FETCH", _uid_set(chunk), "(UID BODYSTRUCTURE)")  # type: ignore[attr-defined]
+                parsed = parse_fetch_response(data) if typ == "OK" else []
+            except (ImapToolsError, ValueError, OSError):
+                # The headers are already in hand. Losing the page over the one
+                # item that says whether there is a paperclip would trade a
+                # certain answer for an unknown one; it stays unknown instead.
+                continue
+            for raw in parsed:
+                if raw.uid in presence:
+                    presence[raw.uid] = attachment_presence(raw.bodystructure)
+        return presence
 
     def _with_counts(self, box: object, folder: FolderRef) -> FolderRef:
         """One STATUS, or an honest reason there is none.
@@ -242,3 +410,47 @@ def _login_refused(exc: Exception, *, login: str, host: str) -> Exception:
         "Settings, Mail programs. Then run `yandex-mcp setup mail` to store the "
         "right password."
     )
+
+
+_IMAP_MONTHS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+
+
+def _imap_day(value: date) -> str:
+    """IMAP's `date` -- month names in English whatever the process locale."""
+    return f"{value.day:02d}-{_IMAP_MONTHS[value.month - 1]}-{value.year}"
+
+
+def _chunks(items: list[int], size: int) -> list[list[int]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _uid_set(uids: list[int]) -> str:
+    return ",".join(str(u) for u in uids)
+
+
+def _uidvalidity(client: object) -> int | None:
+    """The folder's UIDVALIDITY, as the server announced it on EXAMINE.
+
+    Measured: Yandex sends it, and imaplib keeps it among the untagged responses.
+    ``None`` if a server ever does not; a cursor then cannot vouch for itself,
+    and the tool refuses to resume from one.
+    """
+    try:
+        _, values = client.response("UIDVALIDITY")  # type: ignore[attr-defined]
+        value = values[0] if values else None
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, IndexError):
+        return None

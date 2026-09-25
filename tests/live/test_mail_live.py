@@ -129,3 +129,83 @@ def test_paging_a_real_folder_list_terminates_and_never_dead_ends():
 
 async def _ready(client: IMAPMailClient) -> IMAPMailClient:
     return client
+
+
+# -- story 2.2: headers over a date range ----------------------------------------
+
+
+def _unseen(profile) -> int:
+    """UNSEEN in INBOX, by a read-only STATUS -- itself changes nothing."""
+    from imap_tools import MailBox
+
+    with MailBox(profile.imap_host, profile.imap_port, timeout=30).login(
+        profile.login, get_secret("mail", profile.name), initial_folder=None
+    ) as box:
+        return box.folder.status("INBOX", ["UNSEEN"])["UNSEEN"]
+
+
+def _messages_tool(client):
+    from yandex_mail_mcp.tools.messages import build_mail_messages_list
+
+    return build_mail_messages_list(lambda: _ready(client))
+
+
+def test_listing_a_real_week_marks_nothing_read():
+    """The promise that matters most on somebody's real mailbox."""
+    from datetime import UTC, datetime, timedelta
+
+    profile, client = _client()
+    before = _unseen(profile)
+    end = datetime.now(UTC)
+    start = end - timedelta(days=7)
+
+    page = anyio.run(
+        lambda: _messages_tool(client)(
+            start=start.isoformat(), end=end.isoformat(), limit=50
+        )
+    )
+
+    assert _unseen(profile) == before, "listing changed how many messages are unread"
+    assert page.items, "a real week of INBOX returned nothing"
+    for item in page.items:
+        when = datetime.fromisoformat(item.date)
+        assert start <= when < end, "a message fell outside its own range"
+        assert "�" not in item.subject, "a subject decoded to replacement marks"
+        assert item.has_attachments is not None, "a real structure could not be read"
+    print(
+        f"\nweek: {len(page.items)} returned, remaining={page.remaining}, complete={page.complete}"
+    )
+
+
+def test_a_filtered_month_pages_to_its_end_without_repeats():
+    """NFR3 on real mail: every page honest, the last one complete, nothing twice."""
+    from datetime import UTC, datetime, timedelta
+
+    _, client = _client()
+    end = datetime.now(UTC)
+    start = end - timedelta(days=30)
+    tool = _messages_tool(client)
+
+    async def walk():
+        seen, cursor, calls = [], None, 0
+        while calls < 20:
+            calls += 1
+            page = await tool(
+                start=start.isoformat(),
+                end=end.isoformat(),
+                from_contains="@",
+                limit=100,
+                cursor=cursor,
+            )
+            seen += [m.uid for m in page.items]
+            if page.complete:
+                return seen, calls, True
+            assert page.next_cursor
+            cursor = page.next_cursor
+        return seen, calls, False
+
+    seen, calls, finished = anyio.run(walk)
+
+    assert finished, "paging did not reach the end of a month"
+    assert len(seen) == len(set(seen)), "a message was returned twice"
+    print(f"\nmonth, filtered: {len(seen)} messages over {calls} calls")

@@ -53,6 +53,21 @@ users and has never been measured by this project. AD-9 already routes around it
 date, filter in `tools/` — so nothing depends on it working. Do not add a text-match
 parameter to `client/` on the strength of a successful one-off test.
 
+## Measured for story 2.2 -- 2026-09-25, the operator's real INBOX (read-only)
+
+Taken with `SELECT ... readonly` and `BODY.PEEK`, so nothing was marked read. Only
+counts and timings were printed; no subject or address left the mailbox.
+
+| Measured | Consequence |
+|---|---|
+| `UID SEARCH SINCE/BEFORE` is fast (~100 ms), returns UIDs ascending, and is **not capped**: a year's range, `ALL` and the SELECT count all agree at 2311 | the date bound can be trusted to return everything in range |
+| `BEFORE` is exclusive and day-granular: `SINCE d BEFORE d` is empty, `SINCE d BEFORE d+1` is one day | the tool converts its end instant to the next day's `BEFORE`, then filters exact instants itself |
+| Reading headers costs **~40 ms per message cold** -- `ENVELOPE` 38 ms, `BODY.PEEK[HEADER.FIELDS]` 47 ms, `BODYSTRUCTURE` 19 ms -- and under 1 ms warm | a filtered scan of a year (2311 messages) is ~90 s cold. It cannot be one call; it must be scanned in bounded portions with a cursor |
+| **A correction:** the first run reported `ENVELOPE` at 0.6 ms/message, twenty times faster. It ran second, on a range the server had just warmed. Re-measured cold, in the opposite order, the difference is gone | recorded because it is the same defect as the redirect "measurement": a first result that agreed with what was hoped for |
+| 761 of 817 subjects in 90 days are MIME encoded-words | decoding is not an edge case; it is the ordinary case |
+| `INTERNALDATE` and the `Date` header differ by at most 4 h (0 of 275 over 24 h) | the reported date is `INTERNALDATE`, the one the range was searched by, so a result never appears to fall outside its own range |
+| **Cyrillic `SUBJECT` search did not under-return.** Five frequent Cyrillic words over 90 days: four matched local filtering exactly; one returned 84 against 36, and all 48 extras share the word's stem | Yandex search is *morphological* -- a superset, not a loss. The "misreports on Cyrillic" claim behind AD-12 is not supported by this sample; it is also only five words in one mailbox. AD-12 stands for 2.2 -- filtering stays local -- and server search as a *prefilter* is recorded as an option needing broader evidence, not taken |
+
 ## How Mail signs in -- settled 2026-09-25, after two wrong turns
 
 **Mail uses an app password, like Calendar.** No application is registered. The
