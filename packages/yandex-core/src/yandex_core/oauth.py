@@ -5,17 +5,18 @@ identical flow for Disk, differing only in scopes -- and a server may not import
 another server (AD-2).  Epic 1's rule against speculative generalisation applies
 to shapes nobody has seen twice; this one has two named consumers in the plan.
 
-Two measured facts shape everything here.
+Two facts shape everything here.
 
 **This connector is a public client.**  Yandex accepts ``code_verifier`` in place
 of a client secret, so there is no application secret -- none to store, none to
 leak, and none for a reader to helpfully add later.
 
-**The redirect URI is not ours to choose.**  FR4.1 specified a transient local
-listener; the registration form refuses ``http://localhost:8765/callback``, and
-API-access applications have a fixed, non-editable redirect.  So Yandex displays
-the code and the operator pastes it.  The side effect is a flow that works on a
-machine with no browser, which a listener never would have.
+**The redirect currently used is the fixed one, and that is a choice, not a
+constraint.**  An earlier version of this docstring said a localhost redirect was
+refused by the registration form, and called that measured. It was not measured
+-- it was an ambiguous reply, interpreted. Only applications registered for API
+access have a fixed redirect; a web-service application takes a loopback address.
+See the correction in spec 2.1's change log before building on either.
 """
 
 from __future__ import annotations
@@ -48,7 +49,8 @@ __all__ = [
 AUTHORIZE_URL = "https://oauth.yandex.ru/authorize"
 TOKEN_URL = "https://oauth.yandex.ru/token"
 
-#: The only redirect this platform will deliver to. Measured, not chosen.
+#: The redirect fixed for API-access applications. Not the only option -- a
+#: web-service application may register a loopback address instead.
 VERIFICATION_REDIRECT = "https://oauth.yandex.ru/verification_code"
 
 #: RFC 7636 puts the verifier's floor at 43 characters. 32 random bytes in

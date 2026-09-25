@@ -55,9 +55,9 @@ that is **for API access**: its redirect address is fixed at
 rights `mail:imap_full` and `mail:smtp`. The connector is a **public client**: it proves itself
 with PKCE, so there is no application secret to store or to leak.
 
-Yandex does not accept a `localhost` redirect URI for these applications — measured, not
-assumed — so it displays the authorization code on a page and you paste it back. That is
-also why this works on a machine with no browser.
+For now the application is registered for API access, whose redirect Yandex fixes to a
+page that displays the authorization code; you paste it back. That is a choice, not a
+platform limit — see the correction in story 2.1's change log.
 
 ## Install
 

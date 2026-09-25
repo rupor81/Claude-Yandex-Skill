@@ -70,10 +70,10 @@ it is stored in your config file where you can read and edit it.
 #: long version below is the `--help` epilog: printing both at runtime made the
 #: registration steps appear twice in one run, once from each.
 LOGIN_MAIL_STEPS = """\
-Yandex will show you a code rather than sending it anywhere -- it does not
-accept a `localhost` redirect for these applications, measured rather than
-assumed. Approve the access, then paste back the code it displays; pasting the
-whole address of that page works too.
+Yandex will show you a code rather than sending it anywhere, because an
+application registered for API access has its redirect fixed to that page.
+Approve the access, then paste back the code it displays; pasting the whole
+address of that page works too.
 """
 
 LOGIN_MAIL_EXPLANATION = """\
@@ -87,9 +87,8 @@ You need a registered application once, and only once:
   3. Copy its ClientID. This command asks for it if the profile has none, and
      remembers it afterwards; --client-id is there for scripts.
 
-Yandex does not accept a `localhost` redirect for these applications -- measured,
-not assumed -- so it displays the authorization code on a page instead of sending
-it anywhere. This command prints a URL, you approve it in a browser, and you
+An application registered for API access has its redirect fixed, so Yandex
+displays the authorization code on a page instead of sending it anywhere. This command prints a URL, you approve it in a browser, and you
 paste back the code Yandex shows. Pasting the whole address of that page works
 too. Nothing is ever passed as a command-line argument.
 

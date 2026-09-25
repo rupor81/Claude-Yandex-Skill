@@ -42,7 +42,7 @@ evidence; anything marked unverified is not, and must be measured before it is r
 | `smtp.yandex.ru:465` (implicit TLS) advertises `AUTH LOGIN PLAIN XOAUTH2` | the send path is viable on 465 |
 | **`smtp.yandex.ru:587` closes the connection immediately** — no greeting, no STARTTLS | the conventional submission port is a dead end here. Use 465. A reader who "fixes" this to 587 because 587 is standard will produce a connector that cannot send |
 | Yandex OAuth supports PKCE, and with `code_verifier` the client secret is not required | the connector is a **public client**: there is no application secret to store, and none should be invented. See "The redirect URI" below |
-| **The registration form rejects `http://localhost:8765/callback` as a redirect URI** | FR4.1's "transient local listener" is not achievable on this platform. Amended in story 2.1 |
+| ~~The registration form rejects `http://localhost:8765/callback` as a redirect URI~~ **Withdrawn 2026-09-25 -- never measured.** Only API-access applications have a fixed redirect; a web-service application takes a loopback address with a port. Yandex also documents a Device Flow | FR4.1's transient local listener **is** achievable. See the correction below |
 | Scopes are `mail:imap_full` (read and delete), `mail:imap_ro` (read), `mail:smtp` (send) | the PRD's scope names are correct |
 | `imap_tools` 1.15.0 exposes `MailBox.xoauth2(username, access_token, initial_folder='INBOX')` | a direct fit; no hand-rolled SASL |
 | `imap_tools` decodes modified UTF-7 in `folder.list()` via `imap_tools.imap_utf7`. Verified by roundtrip on `Входящие`, `Отправленные`, `Спам`, `Удалённые`, `Черновики`, and a name containing the hierarchy delimiter | folder names need no decoding at our layer. **This corrects a wrong finding taken minutes earlier**: `imap_tools.utils` has `utf7_encode` and no `utf7_decode`, and generalising from that absence produced "the library cannot decode" — which reading `folder.list()` disproved. One module's contents are not the library's |
@@ -53,20 +53,29 @@ users and has never been measured by this project. AD-9 already routes around it
 date, filter in `tools/` — so nothing depends on it working. Do not add a text-match
 parameter to `client/` on the strength of a successful one-off test.
 
-## The redirect URI, and why the flow changed
+## The redirect URI -- a correction
 
-FR4.1 and story 2.1 both specify a transient local listener. Measured: the Yandex OAuth
-registration form refuses `http://localhost:8765/callback`, and the documentation for
-API-access applications states the redirect URI is fixed at
-`https://oauth.yandex.ru/verification_code` and cannot be edited.
+This section first said the redirect was not ours to choose, and that the flow
+therefore had to be "paste the code Yandex displays". **That was wrong, and it was
+recorded as measured when it was not.** It came from one ambiguous reply to a
+question about the registration form, interpreted as a refusal.
 
-The flow is therefore: the CLI prints the authorization URL, the operator opens it and
-approves, Yandex displays a code, and the operator pastes it into the waiting prompt. It is
-the same shape as the app-password step epic 1 already asks of them, and it works on a
-machine with no browser — which the listener would not have.
+What Yandex's documentation actually establishes:
 
-Nothing else about FR4.1 changes: PKCE protects the exchange, the refresh token goes to the
-keychain, renewal is automatic, and no secret is ever passed as a command-line argument.
+- The redirect is fixed at `https://oauth.yandex.ru/verification_code` **only** for
+  applications registered for API access.
+- An application registered as a **web service** takes a Redirect URI, and a
+  loopback address with a port works if it matches exactly.
+- A **Device Flow** exists: `POST /device/code` returns a short `user_code` and a
+  `verification_url`, and the client polls `/token` with `grant_type=device_code`.
+
+So FR4.1's original design -- open the browser, let the operator sign in however
+Yandex offers (password, QR, Yandex ID), receive the code on a transient loopback
+listener -- stands. It is also what the operator asked for, in those words.
+
+The error compounded: having concluded the redirect was fixed, the operator was
+advised to register an API-access application, which is the one type where it
+*is* fixed. The advice manufactured the constraint it was justified by.
 
 ## Practices carried from epic 1's retrospective
 

@@ -151,6 +151,26 @@ returning the account's real folders — the vertical slice story 1.1 was for Ca
   and discovering it only when a real operator tries to log in. As a side effect the flow
   now works on a machine with no browser, which the listener never would have.
 
+- **Correction (2026-09-25) -- the finding above was not a measurement, and it is
+  withdrawn.** It rested on one ambiguous reply from the operator ("не работающий
+  url") to the question of whether the form accepted a localhost redirect. That
+  reply was *interpreted* as "the form refused it" and then recorded here, in the
+  epic context, and in a commit message as measured. It was never measured.
+  What is actually established, from Yandex's own documentation: the redirect is
+  fixed at `verification_code` **only for applications registered for API
+  access**; an application registered as a web service takes a Redirect URI, and a
+  loopback address with a port is usable if it matches exactly. Yandex also
+  documents a Device Flow (`/device/code`) for devices without a browser.
+  Worse than the false claim, the operator was then advised to register exactly
+  the application type whose redirect is fixed -- which *guaranteed* the paste flow
+  the finding was used to justify.
+  **Consequence:** the paste flow is not a platform constraint. The standard flow --
+  the command opens the browser, the operator signs in, the browser returns to a
+  loopback listener -- is available, and is what the operator asked for.
+  **Avoids:** building on a guarantee nobody measured. This is the same defect
+  class epic 1's retrospective named: the first plausible explanation that agrees
+  with what was expected, recorded as fact.
+
 ## Design Notes
 
 **Why the OAuth flow lives in `yandex_core` and not in the mail package.** Disk needs the

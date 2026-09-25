@@ -93,7 +93,12 @@ def test_every_login_gets_its_own_verifier_and_state():
 
 
 def test_the_url_uses_the_redirect_this_platform_actually_allows():
-    """Measured: the registration form refuses a localhost redirect URI."""
+    """The redirect fixed for API-access applications.
+
+    An earlier docstring here said the registration form refuses a localhost
+    redirect, "measured". It was never measured -- see spec 2.1's change log.
+    This pins today's behaviour; it is not evidence of a platform constraint.
+    """
     request = start_login(client_id=CLIENT_ID, scopes=SCOPES)
 
     assert _query(request.url)["redirect_uri"] == VERIFICATION_REDIRECT
