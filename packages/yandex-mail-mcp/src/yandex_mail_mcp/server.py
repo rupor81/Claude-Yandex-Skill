@@ -19,6 +19,7 @@ from yandex_core.errors import YandexError
 
 from .client.imap_client import IMAPMailClient
 from .tools.folders import build_mail_folders_list
+from .tools.message import build_mail_message_get
 from .tools.messages import build_mail_messages_list
 
 __all__ = ["SERVICE", "build_mail_server", "main"]
@@ -62,6 +63,7 @@ def build_mail_server(profile: Profile | None = None) -> MCPServer:
     server = build_server(name="yandex-mail-mcp", instructions=INSTRUCTIONS)
     register_tool(server, build_mail_folders_list(client_provider))
     register_tool(server, build_mail_messages_list(client_provider))
+    register_tool(server, build_mail_message_get(client_provider))
     return server
 
 

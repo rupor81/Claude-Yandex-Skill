@@ -665,6 +665,8 @@ class FakeMessage:
     size: int = 1000
     attachment: bool = False
     structure: bytes | None = None
+    #: What BODY.PEEK[section] returns, by section -- raw, still transfer-encoded.
+    parts: dict = _field(default_factory=dict)
 
     def header_bytes(self) -> bytes:
         return (
@@ -762,6 +764,19 @@ class FakeIMAPClient:
             out = []
             for seq, m in enumerate(self._messages(), start=1):
                 if m.uid not in wanted:
+                    continue
+                if "BODY.PEEK[" in items and "HEADER" not in items:
+                    section = items.split("BODY.PEEK[", 1)[1].split("]", 1)[0]
+                    if section not in m.parts:
+                        continue  # a section the message does not have: nothing returned
+                    body = m.parts[section]
+                    out.append(
+                        (
+                            f"{seq} (UID {m.uid} BODY[{section}] {{{len(body)}}}".encode(),
+                            body,
+                        )
+                    )
+                    out.append(b")")
                     continue
                 if "BODYSTRUCTURE" in items:
                     out.append(

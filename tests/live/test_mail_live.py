@@ -209,3 +209,77 @@ def test_a_filtered_month_pages_to_its_end_without_repeats():
     assert finished, "paging did not reach the end of a month"
     assert len(seen) == len(set(seen)), "a message was returned twice"
     print(f"\nmonth, filtered: {len(seen)} messages over {calls} calls")
+
+
+# -- story 2.3: reading a message's text -----------------------------------------
+
+
+def _recent(client, limit=25):
+    from datetime import UTC, datetime, timedelta
+
+    end = datetime.now(UTC)
+    return anyio.run(
+        lambda: _messages_tool(client)(
+            start=(end - timedelta(days=14)).isoformat(),
+            end=end.isoformat(),
+            limit=limit,
+        )
+    ).items
+
+
+def _reader(client):
+    from yandex_mail_mcp.tools.message import build_mail_message_get
+
+    return build_mail_message_get(lambda: _ready(client))
+
+
+def test_reading_real_messages_marks_nothing_read():
+    profile, client = _client()
+    before = _unseen(profile)
+    items = _recent(client, limit=10)
+    read = _reader(client)
+
+    formats = []
+    for item in items:
+        result = anyio.run(lambda uid=item.uid: read(uid=uid))
+        formats.append(result.format)
+        assert result.text.strip() or result.notes, (
+            "a blank text with no word about why"
+        )
+        assert "<div" not in result.text.lower() and "<p>" not in result.text.lower()
+
+    assert _unseen(profile) == before, "reading changed how many messages are unread"
+    print(
+        f"\nread {len(items)}: formats {sorted(set(formats))}, unread unchanged at {before}"
+    )
+
+
+def test_a_long_real_message_reassembles_exactly_from_its_segments():
+    """NFR2 on real mail: segments, joined, are the text -- nothing lost or repeated."""
+    _, client = _client()
+    read = _reader(client)
+    target = None
+    for item in _recent(client):
+        whole = anyio.run(lambda uid=item.uid: read(uid=uid, max_chars=50_000))
+        if whole.complete and whole.total_chars > 4_000:
+            target = (item.uid, whole)
+            break
+    if target is None:
+        pytest.skip("no message over 4000 characters in the last two weeks")
+    uid, whole = target
+
+    pieces, cursor, calls = [], None, 0
+    while calls < 100:
+        calls += 1
+        part = anyio.run(lambda c=cursor: read(uid=uid, max_chars=1_000, cursor=c))
+        pieces.append(
+            part.text if part.complete else part.text.split("\n\n[... truncated")[0]
+        )
+        if part.complete:
+            break
+        cursor = part.next_cursor
+
+    assert "".join(pieces) == whole.text
+    print(
+        f"\nuid {uid}: {whole.total_chars} chars ({whole.format}) reassembled from {calls} segments"
+    )
