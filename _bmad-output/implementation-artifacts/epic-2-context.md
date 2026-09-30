@@ -170,3 +170,17 @@ Story 2.1 builds OAuth and is a hard prerequisite for every other story here, an
 epic 3. Read stories (2.2–2.4) precede write stories (2.6–2.9). Story 2.5 needs at least one
 read and one write path in place to have evidence to reason from. Story 2.10 needs the whole
 epic plus epic 1.
+
+## First real run in Claude -- 2026-09-30
+
+Installed as two Desktop Extensions (editing `claude_desktop_config.json` did not
+survive: the running app wrote its own copy back on quit). Asked in plain words,
+"find the results of the meeting with R-Pharm on Accord", Claude went to Yandex
+Mail and Calendar on its own, found four meetings, read the correspondence, and
+reconstructed the outcome of the 07.08 meeting from a follow-up letter -- with no
+cross-service logic on our side. Evidence for story 2.10, not yet its closure.
+
+What it could not do, in its own words: open the attached presentation (story
+2.4) or the recording linked on Yandex Disk (epic 3). It also read the mail
+server's instructions saying "its one tool", three tools later; a test now holds
+each server's instructions to name every tool it registers.

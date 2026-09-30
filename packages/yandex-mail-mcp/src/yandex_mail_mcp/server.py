@@ -30,15 +30,18 @@ __all__ = ["SERVICE", "build_mail_server", "main"]
 SERVICE = "mail"
 
 INSTRUCTIONS = (
-    "Read a Yandex mailbox over IMAP. Its one tool lists the mailbox's folders "
-    "with their message and unread counts, so a later call can name a folder "
-    "exactly as the server spells it. Folder names are hierarchical and this "
-    "server separates the levels with `|`, not `/` -- build a child's name from "
-    "the `delimiter` the listing reports rather than guessing it. A folder that "
-    "reports null counts is not an empty folder: `counts_note` says why the "
-    "counts are absent, and a container in the hierarchy has none of its own. "
-    "The listing is bounded: when `complete` is false, pass `next_cursor` back "
-    "verbatim to get the rest."
+    "Read a Yandex mailbox over IMAP. Nothing here sends, moves, deletes or marks "
+    "mail read. `mail_folders_list` lists folders with message and unread counts; "
+    "`mail_messages_list` lists message headers in a date range, newest first, "
+    "optionally filtered by sender or subject; `mail_message_get` reads one "
+    "message's text, HTML rendered to text, in segments when it is long. "
+    "Folder names are hierarchical and separated by `|`, not `/` -- pass them "
+    "exactly as `mail_folders_list` reports them. Header reading is slow on this "
+    "server, so one `mail_messages_list` call reads a bounded part of the range: "
+    "when `complete` is false -- even with no matches yet -- pass `next_cursor` "
+    "back to read further. Filters match the decoded text exactly as written, so "
+    "try a word's other forms (`встреча`, `встречи`) when a search comes back "
+    "empty. Null counts or a null `has_attachments` mean unknown, never zero."
 )
 
 logger = logging.getLogger(__name__)

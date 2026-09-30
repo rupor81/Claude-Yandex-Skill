@@ -148,3 +148,22 @@ print(mail_client.IMAPMailClient.__name__, mail_tools.FolderSummary.__name__)
     assert result.returncode == 0, result.stderr
     assert "CalDAVCalendarClient CalendarSummary" in result.stdout
     assert "IMAPMailClient FolderSummary" in result.stdout
+
+
+def test_each_server_s_instructions_name_every_tool_it_registers():
+    """The mail server shipped saying "its one tool" while it had three: the first
+    real run in Claude read that. Instructions are what the model reads first."""
+    import anyio
+
+    from yandex_calendar_mcp.server import INSTRUCTIONS as CAL
+    from yandex_calendar_mcp.server import build_calendar_server
+    from yandex_core.config import Profile
+    from yandex_mail_mcp.server import INSTRUCTIONS as MAIL
+    from yandex_mail_mcp.server import build_mail_server
+
+    profile = Profile(name="t", login="t@example.invalid")
+    for build, text in ((build_calendar_server, CAL), (build_mail_server, MAIL)):
+        for tool in anyio.run(build(profile).list_tools):
+            assert tool.name in text, (
+                f"{tool.name} is not named in its server's instructions"
+            )
