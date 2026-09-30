@@ -1,0 +1,17 @@
+{
+  "manifest_version": "0.3",
+  "name": "yandex-calendar",
+  "display_name": "Yandex Calendar",
+  "version": "0.1.0",
+  "description": "Календарь Яндекса: календари, события за период, занятость, создание, изменение и удаление встреч.",
+  "author": { "name": "Aleksandr Denisov" },
+  "license": "MIT",
+  "server": {
+    "type": "binary",
+    "entry_point": "yandex-calendar-mcp",
+    "mcp_config": {
+      "command": "/Users/rupor/Documents/Yandex-Skills/.venv/bin/yandex-calendar-mcp",
+      "args": []
+    }
+  }
+}

@@ -24,3 +24,6 @@ venv/
 
 # BMAD personal install answers (name, language) — installer-managed, per-developer
 _bmad/config.user.toml
+
+# Packed Claude extensions -- rebuilt from extensions/ with `mcpb pack`.
+dist/
