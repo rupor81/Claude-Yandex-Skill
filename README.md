@@ -6,7 +6,7 @@ transport-specific live in a shared core, so the same tools can later be served 
 HTTP with OAuth without being rewritten.
 
 **Status:** the Calendar connector is complete — seven tools, 12 live tests against a
-real account. The Mail connector reads: folders, message headers, and message text.
+real account. The Mail connector reads: folders, message headers, message text, and attachments.
 Disk is planned.
 
 ---
@@ -25,6 +25,8 @@ Disk is planned.
 | `mail_folders_list` | read | Which folders the mailbox has, and how much is in them |
 | `mail_messages_list` | read | Message headers in a date range, newest first, filterable by sender and subject |
 | `mail_message_get` | read | One message's text, HTML rendered, cut into segments when long |
+| `mail_attachments_list` | read | A message's attachments: name, type, size — no content |
+| `mail_attachment_download` | destructive | Saves one attachment to a local folder; replaces a file only when told to |
 
 Two rules shape every one of them:
 

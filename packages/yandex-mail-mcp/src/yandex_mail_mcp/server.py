@@ -18,6 +18,10 @@ from yandex_core.credentials import get_secret
 from yandex_core.errors import YandexError
 
 from .client.imap_client import IMAPMailClient
+from .tools.attachments import (
+    build_mail_attachment_download,
+    build_mail_attachments_list,
+)
 from .tools.folders import build_mail_folders_list
 from .tools.message import build_mail_message_get
 from .tools.messages import build_mail_messages_list
@@ -35,6 +39,10 @@ INSTRUCTIONS = (
     "`mail_messages_list` lists message headers in a date range, newest first, "
     "optionally filtered by sender or subject; `mail_message_get` reads one "
     "message's text, HTML rendered to text, in segments when it is long. "
+    "`mail_attachments_list` names a message's attachments without downloading "
+    "them; `mail_attachment_download` saves one to a local folder (default "
+    "~/Downloads/Yandex Mail) and returns its path, never replacing a file "
+    "unless told to. "
     "Folder names are hierarchical and separated by `|`, not `/` -- pass them "
     "exactly as `mail_folders_list` reports them. Header reading is slow on this "
     "server, so one `mail_messages_list` call reads a bounded part of the range: "
@@ -67,6 +75,8 @@ def build_mail_server(profile: Profile | None = None) -> MCPServer:
     register_tool(server, build_mail_folders_list(client_provider))
     register_tool(server, build_mail_messages_list(client_provider))
     register_tool(server, build_mail_message_get(client_provider))
+    register_tool(server, build_mail_attachments_list(client_provider))
+    register_tool(server, build_mail_attachment_download(client_provider))
     return server
 
 

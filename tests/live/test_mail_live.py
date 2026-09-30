@@ -283,3 +283,39 @@ def test_a_long_real_message_reassembles_exactly_from_its_segments():
     print(
         f"\nuid {uid}: {whole.total_chars} chars ({whole.format}) reassembled from {calls} segments"
     )
+
+
+# -- story 2.4: attachments ----------------------------------------------------------
+
+
+def test_a_real_attachment_downloads_whole_and_marks_nothing_read(tmp_path):
+    """Finds the first message in two weeks with a real attachment and saves it."""
+    from yandex_mail_mcp.tools.attachments import (
+        build_mail_attachment_download,
+        build_mail_attachments_list,
+    )
+
+    profile, client = _client()
+    before = _unseen(profile)
+    listing = build_mail_attachments_list(lambda: _ready(client))
+    target = None
+    for item in _recent(client, limit=50):
+        if item.has_attachments:
+            found = anyio.run(lambda uid=item.uid: listing(uid=uid))
+            if found.attachments:
+                target = (item.uid, found.attachments[0])
+                break
+    if target is None:
+        pytest.skip("no attachment in the last two weeks")
+    uid, attachment = target
+
+    got = anyio.run(
+        lambda: build_mail_attachment_download(lambda: _ready(client))(
+            uid=uid, part=attachment.part, directory=str(tmp_path)
+        )
+    )
+
+    assert got.bytes > 0
+    assert abs(got.bytes - (attachment.size_bytes or 0)) <= max(1024, got.bytes // 50)
+    assert _unseen(profile) == before, "downloading changed the unread count"
+    print(f"\n{attachment.mime_type}: listed ~{attachment.size_bytes}, got {got.bytes}")

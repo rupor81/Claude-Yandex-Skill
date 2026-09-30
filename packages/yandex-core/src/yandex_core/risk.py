@@ -52,6 +52,8 @@ RISK_REGISTRY: dict[str, RiskClass] = {
     "mail_folders_list": RiskClass.READ,
     "mail_messages_list": RiskClass.READ,
     "mail_message_get": RiskClass.READ,
+    "mail_attachments_list": RiskClass.READ,
+    "mail_attachment_download": RiskClass.DESTRUCTIVE,
 }
 
 _ANNOTATIONS: dict[RiskClass, dict[str, bool]] = {

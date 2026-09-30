@@ -42,7 +42,9 @@ from yandex_core.errors import (
 
 from .body import decode_part, html_to_text, text_part
 from .headers import (
+    AttachmentPart,
     attachment_presence,
+    attachments,
     decode_header_value,
     header_fields,
     parse_addresses,
@@ -229,6 +231,24 @@ class IMAPMailClient:
             lambda: self._read_text_blocking(password, folder, uid)
         )
 
+    async def list_attachments(
+        self, *, folder: str, uid: int
+    ) -> tuple[HeaderRecord, list[AttachmentPart]]:
+        """A message's attachments from BODYSTRUCTURE. No content is transferred."""
+        password = await self._password_provider()
+        return await anyio.to_thread.run_sync(
+            lambda: self._list_attachments_blocking(password, folder, uid)
+        )
+
+    async def fetch_attachment(
+        self, *, folder: str, uid: int, section: str
+    ) -> tuple[AttachmentPart, bytes]:
+        """One attachment's decoded bytes -- that part alone, PEEKed."""
+        password = await self._password_provider()
+        return await anyio.to_thread.run_sync(
+            lambda: self._fetch_attachment_blocking(password, folder, uid, section)
+        )
+
     # -- blocking half -----------------------------------------------------
 
     def _list_folders_blocking(
@@ -344,6 +364,54 @@ class IMAPMailClient:
                     )
                 return MessageText(headers[0], uidvalidity, text, "plain", notes)
             return MessageText(headers[0], uidvalidity, "", "none", [NO_TEXT])
+
+    def _message_parts(
+        self, client: object, folder: str, uid: int
+    ) -> tuple[HeaderRecord, list[AttachmentPart]]:
+        headers = self._headers(client, [uid])
+        if not headers:
+            raise NotFound(
+                f"There is no message with UID {uid} in {folder!r}. UIDs come from "
+                "`mail_messages_list` for the same folder."
+            )
+        typ, data = client.uid("FETCH", str(uid), "(UID BODYSTRUCTURE)")  # type: ignore[attr-defined]
+        try:
+            records = parse_fetch_response(data) if typ == "OK" else []
+        except ValueError:
+            records = []
+        if not records:
+            raise ProtocolError(
+                f"{self._host} would not describe the structure of message {uid}, so "
+                "its attachments cannot be listed. That is not the same as none."
+            )
+        return headers[0], attachments(records[0].bodystructure)
+
+    def _list_attachments_blocking(
+        self, password: str, folder: str, uid: int
+    ) -> tuple[HeaderRecord, list[AttachmentPart]]:
+        with self._connected(password) as box:
+            self._examine(box, folder)
+            return self._message_parts(box.client, folder, uid)  # type: ignore[attr-defined]
+
+    def _fetch_attachment_blocking(
+        self, password: str, folder: str, uid: int, section: str
+    ) -> tuple[AttachmentPart, bytes]:
+        with self._connected(password) as box:
+            self._examine(box, folder)
+            client = box.client  # type: ignore[attr-defined]
+            _, parts = self._message_parts(client, folder, uid)
+            part = next((p for p in parts if p.section == section), None)
+            if part is None:
+                raise NotFound(
+                    f"Message {uid} has no attachment at part {section!r}. Parts come "
+                    "from `mail_attachments_list`; the message's own text is not one."
+                )
+            raw = self._section(client, uid, section)
+            if raw is None:
+                raise ProtocolError(
+                    f"{self._host} returned nothing for part {section}."
+                )
+            return part, _transfer_decode(raw, part.encoding)
 
     def _section(self, client: object, uid: int, section: str) -> bytes | None:
         typ, data = client.uid("FETCH", str(uid), f"(BODY.PEEK[{section}])")  # type: ignore[attr-defined]
@@ -543,3 +611,22 @@ def _uidvalidity(client: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError, IndexError):
         return None
+
+
+def _transfer_decode(raw: bytes, encoding: str) -> bytes:
+    import base64
+    import binascii
+    import quopri
+
+    try:
+        if encoding == "base64":
+            return base64.b64decode(b"".join(raw.split()), validate=True)
+        if encoding == "quoted-printable":
+            return quopri.decodestring(raw)
+    except (binascii.Error, ValueError) as exc:
+        # A file is exact or it is useless: no best-effort bytes.
+        raise ProtocolError(
+            f"The attachment claims {encoding} encoding but is not valid {encoding}; "
+            "nothing was written."
+        ) from exc
+    return raw

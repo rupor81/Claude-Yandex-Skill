@@ -26,9 +26,11 @@ from email.parser import BytesHeaderParser
 from email.policy import compat32
 
 __all__ = [
+    "AttachmentPart",
     "FetchRecord",
     "Literal",
     "attachment_presence",
+    "attachments",
     "decode_header_value",
     "parse_addresses",
     "parse_fetch_response",
@@ -361,3 +363,84 @@ def _has_name(params: object) -> bool:
         return False
     keys = [str(k).lower() for k in params[0::2]]
     return "name" in keys or "filename" in keys
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentPart:
+    """One attachment, as BODYSTRUCTURE describes it. No content."""
+
+    section: str
+    filename: str
+    mime_type: str
+    encoding: str
+    #: Encoded size on the wire, as the server reports it.
+    encoded_size: int | None
+
+
+def attachments(structure: object) -> list[AttachmentPart]:
+    """Every part that `attachment_presence` would count, with its section path.
+
+    Same rule, so the list never disagrees with `has_attachments`. An unreadable
+    structure yields nothing here; the tool says so rather than "no attachments".
+    """
+    found: list[AttachmentPart] = []
+    if not isinstance(structure, list) or not structure:
+        return found
+    try:
+        _walk(structure, (), found)
+    except (IndexError, TypeError, AttributeError, ValueError):
+        return []
+    return found
+
+
+def _walk(
+    node: list[object], path: tuple[int, ...], found: list[AttachmentPart]
+) -> None:
+    if isinstance(node[0], list):
+        for index, item in enumerate(node, start=1):
+            if not isinstance(item, list):
+                break
+            _walk(item, (*path, index), found)
+        return
+    if not _leaf_is_attachment(node):
+        return
+    section = ".".join(str(i) for i in path) or "1"
+    kind = str(node[0]).lower()
+    disposition_at = 9 if kind == "text" else 11 if kind == "message" else 8
+    disposition = node[disposition_at] if len(node) > disposition_at else None
+    name = _param(
+        disposition[1]
+        if isinstance(disposition, list) and len(disposition) > 1
+        else None,
+        "filename",
+    ) or _param(node[2], "name")
+    found.append(
+        AttachmentPart(
+            section=section,
+            filename=decode_header_value(name) if name else f"attachment-{section}",
+            mime_type=f"{kind}/{str(node[1]).lower()}",
+            encoding=str(node[5] or "7bit").lower(),
+            encoded_size=node[6] if isinstance(node[6], int) else None,
+        )
+    )
+
+
+def _param(params: object, key: str) -> str | None:
+    """A parameter's value; RFC 2231 `key*` form decoded when that is what was sent."""
+    if not isinstance(params, list):
+        return None
+    pairs = {
+        str(k).lower(): v for k, v in zip(params[0::2], params[1::2], strict=False)
+    }
+    if pairs.get(key):
+        return str(pairs[key])
+    extended = pairs.get(key + "*")
+    if extended:
+        charset, _, rest = str(extended).partition("'")
+        _, _, encoded = rest.partition("'")
+        import urllib.parse
+
+        return urllib.parse.unquote(
+            encoded or str(extended), encoding=charset or "utf-8", errors="replace"
+        )
+    return None
