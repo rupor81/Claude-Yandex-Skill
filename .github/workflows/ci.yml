@@ -73,9 +73,10 @@ jobs:
           # Every registered tool, and nothing that is not in the registry --
           # which is what makes the annotations trustworthy.
           assert sorted(names) == sorted(RISK_REGISTRY), sorted(names)
-          assert sorted(destructive) == [
-              "calendar_event_delete",
-              "calendar_event_update",
-          ], sorted(destructive)
+          # Annotations agree with the registry they are derived from.
+          from yandex_core.risk import RiskClass
+          assert sorted(destructive) == sorted(
+              n for n, r in RISK_REGISTRY.items() if r is RiskClass.DESTRUCTIVE
+          ), sorted(destructive)
           print(f"{len(names)} tools, {len(destructive)} destructive")
           PY
