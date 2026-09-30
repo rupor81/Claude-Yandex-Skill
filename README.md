@@ -129,6 +129,29 @@ stored them. The extensions run the servers from this project's `.venv`, so a co
 change reaches them on the next restart of the extension, with no reinstall. The icons
 are drawn by `extensions/make_icons.py` -- our own mark, not Yandex's logo.
 
+## Remote connector
+
+For Claude's cloud features -- a scheduled task that runs when this Mac is off -- the
+same tools are served over HTTPS from Vercel as one connector, `packages/yandex-remote-mcp`.
+Adding it in Claude opens a Yandex ID sign-in; only logins in `YANDEX_MCP_ALLOWED_LOGINS`
+get a token. Tokens are sealed with the server key rather than stored: rotating
+`YANDEX_MCP_REMOTE_SECRET` revokes them all. Mail and calendar are reached with the app
+passwords in the project's secret settings. `mail_attachment_download` is not offered
+remotely -- a file saved there would land on the server.
+
+```bash
+scripts/stage_vercel.sh && (cd dist/vercel && vercel deploy --prod)
+```
+
+| Variable | What |
+|---|---|
+| `YANDEX_MCP_REMOTE_BASE_URL` | The public address, `https://yandex-mcp.vercel.app` |
+| `YANDEX_MCP_REMOTE_SECRET` | Fernet key sealing every token |
+| `YANDEX_OAUTH_CLIENT_ID`, `YANDEX_OAUTH_CLIENT_SECRET` | A Yandex OAuth *web service* app, Redirect URI `<base>/yandex/callback` |
+| `YANDEX_MCP_ALLOWED_LOGINS` | Comma-separated logins allowed to sign in |
+| `YANDEX_MCP_LOGIN` | The mailbox and calendar account |
+| `YANDEX_MCP_CALENDAR_DEFAULT_PASSWORD`, `YANDEX_MCP_MAIL_DEFAULT_PASSWORD` | Its app passwords |
+
 ## Wire it into a client
 
 ```json

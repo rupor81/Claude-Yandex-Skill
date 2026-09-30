@@ -13,6 +13,7 @@ members = [
     "yandex-mail-mcp",
     "yandex-mcp-cli",
     "yandex-mcp-workspace",
+    "yandex-remote-mcp",
 ]
 
 [[package]]
@@ -1401,6 +1402,7 @@ dependencies = [
     { name = "yandex-core" },
     { name = "yandex-mail-mcp" },
     { name = "yandex-mcp-cli" },
+    { name = "yandex-remote-mcp" },
 ]
 
 [package.dev-dependencies]
@@ -1416,6 +1418,7 @@ requires-dist = [
     { name = "yandex-core", editable = "packages/yandex-core" },
     { name = "yandex-mail-mcp", editable = "packages/yandex-mail-mcp" },
     { name = "yandex-mcp-cli", editable = "packages/yandex-mcp-cli" },
+    { name = "yandex-remote-mcp", editable = "packages/yandex-remote-mcp" },
 ]
 
 [package.metadata.requires-dev]
@@ -1423,4 +1426,27 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.14" },
+]
+
+[[package]]
+name = "yandex-remote-mcp"
+version = "0.1.0"
+source = { editable = "packages/yandex-remote-mcp" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "httpx" },
+    { name = "mcp" },
+    { name = "yandex-calendar-mcp" },
+    { name = "yandex-core" },
+    { name = "yandex-mail-mcp" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", specifier = ">=43" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "mcp", specifier = ">=2" },
+    { name = "yandex-calendar-mcp", editable = "packages/yandex-calendar-mcp" },
+    { name = "yandex-core", editable = "packages/yandex-core" },
+    { name = "yandex-mail-mcp", editable = "packages/yandex-mail-mcp" },
 ]

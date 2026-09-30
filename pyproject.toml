@@ -8,6 +8,7 @@ dependencies = [
     "yandex-calendar-mcp",
     "yandex-mail-mcp",
     "yandex-mcp-cli",
+    "yandex-remote-mcp",
 ]
 
 [dependency-groups]
@@ -21,6 +22,7 @@ yandex-core = { workspace = true }
 yandex-calendar-mcp = { workspace = true }
 yandex-mail-mcp = { workspace = true }
 yandex-mcp-cli = { workspace = true }
+yandex-remote-mcp = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -37,6 +39,7 @@ pythonpath = [
     "packages/yandex-calendar-mcp/src",
     "packages/yandex-mail-mcp/src",
     "packages/yandex-mcp-cli/src",
+    "packages/yandex-remote-mcp/src",
 ]
 
 [build-system]
@@ -60,6 +63,7 @@ src = [
     "packages/yandex-calendar-mcp/src",
     "packages/yandex-mail-mcp/src",
     "packages/yandex-mcp-cli/src",
+    "packages/yandex-remote-mcp/src",
 ]
 
 [tool.ruff.lint]

@@ -28,7 +28,13 @@ from .tools.events import (
 )
 from .tools.freebusy import build_calendar_freebusy_query
 
-__all__ = ["SERVICE", "build_calendar_server", "main"]
+__all__ = [
+    "INSTRUCTIONS",
+    "SERVICE",
+    "build_calendar_server",
+    "main",
+    "register_calendar_tools",
+]
 
 SERVICE = "calendar"
 
@@ -86,19 +92,24 @@ def build_calendar_server(profile: Profile | None = None) -> MCPServer:
     Raises:
         ProtocolError: if a tool is missing from the risk registry, naming it.
     """
-    resolved = profile or load_profile()
+    server = build_server(name="yandex-calendar-mcp", instructions=INSTRUCTIONS)
+    register_calendar_tools(server, profile or load_profile())
+    return server
+
+
+def register_calendar_tools(server: MCPServer, profile: Profile) -> None:
+    """Every calendar tool, on any server -- the local one here, or the remote one."""
 
     async def client_provider() -> CalDAVCalendarClient:
         # Read lazily so a missing password surfaces as an actionable tool error
         # rather than a start-up crash with no context.
-        password = get_secret(SERVICE, resolved.name)
+        password = get_secret(SERVICE, profile.name)
         return CalDAVCalendarClient(
-            url=resolved.caldav_url,
-            username=resolved.login,
+            url=profile.caldav_url,
+            username=profile.login,
             password=password,
         )
 
-    server = build_server(name="yandex-calendar-mcp", instructions=INSTRUCTIONS)
     register_tool(server, build_calendar_list(client_provider))
     register_tool(server, build_calendar_events_list(client_provider))
     register_tool(server, build_calendar_event_get(client_provider))
@@ -106,7 +117,6 @@ def build_calendar_server(profile: Profile | None = None) -> MCPServer:
     register_tool(server, build_calendar_event_create(client_provider))
     register_tool(server, build_calendar_event_update(client_provider))
     register_tool(server, build_calendar_event_delete(client_provider))
-    return server
 
 
 def main() -> int:

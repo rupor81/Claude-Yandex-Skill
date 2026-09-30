@@ -26,7 +26,13 @@ from .tools.folders import build_mail_folders_list
 from .tools.message import build_mail_message_get
 from .tools.messages import build_mail_messages_list
 
-__all__ = ["SERVICE", "build_mail_server", "main"]
+__all__ = [
+    "INSTRUCTIONS",
+    "SERVICE",
+    "build_mail_server",
+    "main",
+    "register_mail_tools",
+]
 
 #: The service name under which the mail app password is stored. Its own slot,
 #: not the calendar's: Yandex scopes app passwords by type, and one created for
@@ -61,23 +67,34 @@ def build_mail_server(profile: Profile | None = None) -> MCPServer:
     Raises:
         ProtocolError: if a tool is missing from the risk registry, naming it.
     """
-    resolved = profile or load_profile()
+    server = build_server(name="yandex-mail-mcp", instructions=INSTRUCTIONS)
+    register_mail_tools(server, profile or load_profile())
+    return server
+
+
+def register_mail_tools(
+    server: MCPServer, profile: Profile, *, local_files: bool = True
+) -> None:
+    """Every mail tool, on any server.
+
+    ``local_files`` is off on the remote server: a download there would land on the
+    host's disk, which nobody can open, while claiming to have saved a file.
+    """
 
     async def client_provider() -> IMAPMailClient:
         return IMAPMailClient(
-            host=resolved.imap_host,
-            port=resolved.imap_port,
-            login=resolved.login,
-            password_provider=lambda: _password(resolved),
+            host=profile.imap_host,
+            port=profile.imap_port,
+            login=profile.login,
+            password_provider=lambda: _password(profile),
         )
 
-    server = build_server(name="yandex-mail-mcp", instructions=INSTRUCTIONS)
     register_tool(server, build_mail_folders_list(client_provider))
     register_tool(server, build_mail_messages_list(client_provider))
     register_tool(server, build_mail_message_get(client_provider))
     register_tool(server, build_mail_attachments_list(client_provider))
-    register_tool(server, build_mail_attachment_download(client_provider))
-    return server
+    if local_files:
+        register_tool(server, build_mail_attachment_download(client_provider))
 
 
 async def _password(profile: Profile) -> str:

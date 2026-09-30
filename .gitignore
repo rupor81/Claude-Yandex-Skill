@@ -27,3 +27,6 @@ _bmad/config.user.toml
 
 # Packed Claude extensions -- rebuilt from extensions/ with `mcpb pack`.
 dist/
+
+# Vercel project link (ids only) -- recreated by `vercel link --project yandex-mcp`.
+deploy/vercel/.vercel/
