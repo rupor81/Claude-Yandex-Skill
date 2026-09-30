@@ -25,12 +25,19 @@ def icon(calendar: bool) -> Image.Image:
     if calendar:
         d.rectangle((0, 96, SIZE, 150), fill=WHITE)
         for x in (150, SIZE - 150):
-            d.rounded_rectangle((x - 18, 60, x + 18, 180), radius=18, fill=WHITE, outline=RED, width=10)
+            d.rounded_rectangle(
+                (x - 18, 60, x + 18, 180), radius=18, fill=WHITE, outline=RED, width=10
+            )
         top = 60
     font = ImageFont.truetype(FONT, 300 if calendar else 360)
     box = d.textbbox((0, 0), "Я", font=font)
     w, h = box[2] - box[0], box[3] - box[1]
-    d.text(((SIZE - w) / 2 - box[0], (SIZE - h) / 2 - box[1] + top), "Я", font=font, fill=WHITE)
+    d.text(
+        ((SIZE - w) / 2 - box[0], (SIZE - h) / 2 - box[1] + top),
+        "Я",
+        font=font,
+        fill=WHITE,
+    )
     return img
 
 
