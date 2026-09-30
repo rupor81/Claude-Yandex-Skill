@@ -44,6 +44,9 @@ DEFAULT_SMTP_HOST = "smtp.yandex.ru"
 DEFAULT_SMTP_PORT = 465
 PROFILE_ENV_VAR = "YANDEX_MCP_PROFILE"
 CONFIG_DIR_ENV_VAR = "YANDEX_MCP_CONFIG_DIR"
+#: Set by a Claude extension from the login its install dialog asked for. Wins
+#: over the file, and is enough on its own: an extension needs no setup command.
+LOGIN_ENV_VAR = "YANDEX_MCP_LOGIN"
 DEFAULT_PROFILE_NAME = "default"
 
 #: A profile name has to survive being a bare TOML key and a filename fragment.
@@ -97,7 +100,22 @@ def selected_profile_name() -> str:
 
 
 def load_profile(name: str | None = None) -> Profile:
-    """Load one profile.
+    """Load one profile, with the login from ``YANDEX_MCP_LOGIN`` when set.
+
+    An empty variable counts as unset: an extension whose optional login field
+    was left blank passes an empty string, and the file then answers as before.
+    """
+    login = os.environ.get(LOGIN_ENV_VAR, "").strip()
+    if not login:
+        return _load_profile_from_file(name)
+    try:
+        return _load_profile_from_file(name).model_copy(update={"login": login})
+    except NotConfigured:
+        return Profile(name=name or selected_profile_name(), login=login)
+
+
+def _load_profile_from_file(name: str | None = None) -> Profile:
+    """Load one profile from the config file.
 
     Raises:
         NotConfigured: if nothing is set up yet -- no config file, or a file with

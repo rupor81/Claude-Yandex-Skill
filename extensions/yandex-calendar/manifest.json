@@ -4,14 +4,38 @@
   "display_name": "Yandex Calendar",
   "version": "0.1.0",
   "description": "Календарь Яндекса: календари, события за период, занятость, создание, изменение и удаление встреч.",
-  "author": { "name": "Aleksandr Denisov" },
+  "author": {
+    "name": "Aleksandr Denisov"
+  },
   "license": "MIT",
   "server": {
     "type": "binary",
     "entry_point": "yandex-calendar-mcp",
     "mcp_config": {
       "command": "/Users/rupor/Documents/Yandex-Skills/.venv/bin/yandex-calendar-mcp",
-      "args": []
+      "args": [],
+      "env": {
+        "YANDEX_MCP_LOGIN": "${user_config.login}",
+        "YANDEX_MCP_CALENDAR_DEFAULT_PASSWORD": "${user_config.app_password}"
+      }
+    }
+  },
+  "icon": "icon.png",
+  "user_config": {
+    "login": {
+      "type": "string",
+      "title": "Логин Яндекса",
+      "description": "Логин или полный адрес, например name@yandex.ru. Можно не заполнять, если уже выполнен `yandex-mcp setup`.",
+      "required": false,
+      "default": ""
+    },
+    "app_password": {
+      "type": "string",
+      "title": "Пароль приложения",
+      "description": "Пароль приложения с типом «Календарь (CalDAV)»: id.yandex.ru/security/app-passwords. Можно не заполнять, если уже выполнен `yandex-mcp setup`.",
+      "sensitive": true,
+      "required": false,
+      "default": ""
     }
   }
 }

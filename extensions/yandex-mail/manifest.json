@@ -4,14 +4,38 @@
   "display_name": "Yandex Mail",
   "version": "0.1.0",
   "description": "Почта Яндекса: папки, заголовки писем за период с фильтром по отправителю и теме, чтение текста писем.",
-  "author": { "name": "Aleksandr Denisov" },
+  "author": {
+    "name": "Aleksandr Denisov"
+  },
   "license": "MIT",
   "server": {
     "type": "binary",
     "entry_point": "yandex-mail-mcp",
     "mcp_config": {
       "command": "/Users/rupor/Documents/Yandex-Skills/.venv/bin/yandex-mail-mcp",
-      "args": []
+      "args": [],
+      "env": {
+        "YANDEX_MCP_LOGIN": "${user_config.login}",
+        "YANDEX_MCP_MAIL_DEFAULT_PASSWORD": "${user_config.app_password}"
+      }
+    }
+  },
+  "icon": "icon.png",
+  "user_config": {
+    "login": {
+      "type": "string",
+      "title": "Логин Яндекса",
+      "description": "Логин или полный адрес, например name@yandex.ru. Можно не заполнять, если уже выполнен `yandex-mcp setup`.",
+      "required": false,
+      "default": ""
+    },
+    "app_password": {
+      "type": "string",
+      "title": "Пароль приложения",
+      "description": "Пароль приложения с типом «Почта»; в Яндекс Почте включите IMAP: Настройки → Почтовые программы. Создать: id.yandex.ru/security/app-passwords. Можно не заполнять, если уже выполнен `yandex-mcp setup`.",
+      "sensitive": true,
+      "required": false,
+      "default": ""
     }
   }
 }

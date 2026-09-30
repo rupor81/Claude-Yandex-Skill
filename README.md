@@ -111,6 +111,22 @@ and Yandex 360 domain accounts.
 | `YANDEX_MCP_CALENDAR_<PROFILE>_PASSWORD` | Overrides the stored calendar app password |
 | `YANDEX_MCP_MAIL_<PROFILE>_PASSWORD` | Overrides the stored mail app password |
 
+## Install as Claude extensions
+
+The simplest way. Build the two packages and double-click them:
+
+```bash
+npx -y @anthropic-ai/mcpb pack extensions/yandex-calendar dist/yandex-calendar.mcpb
+npx -y @anthropic-ai/mcpb pack extensions/yandex-mail dist/yandex-mail.mcpb
+open dist/yandex-calendar.mcpb dist/yandex-mail.mcpb
+```
+
+The install dialog asks for the Yandex login and the app password, and Claude keeps
+them. Both fields may be left blank on a machine where `yandex-mcp setup` has already
+stored them. The extensions run the servers from this project's `.venv`, so a code
+change reaches them on the next restart of the extension, with no reinstall. The icons
+are drawn by `extensions/make_icons.py` -- our own mark, not Yandex's logo.
+
 ## Wire it into a client
 
 ```json

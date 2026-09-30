@@ -221,3 +221,25 @@ def test_a_non_default_host_given_to_write_profile_is_not_silently_dropped():
 
     assert load_profile().imap_host == "imap.example.ru"
     assert "smtp_host" not in config_path().read_text(), "a default was written"
+
+
+def test_a_login_from_the_environment_needs_no_config_file(monkeypatch):
+    """What a Claude extension passes from its install dialog. No setup command."""
+    monkeypatch.setenv("YANDEX_MCP_LOGIN", "me@yandex.ru")
+    profile = load_profile()
+    assert (profile.name, profile.login) == ("default", "me@yandex.ru")
+
+
+def test_a_login_from_the_environment_wins_over_the_file(monkeypatch):
+    write_profile(Profile(name="default", login="old@yandex.ru", caldav_url="https://c.example"))
+    monkeypatch.setenv("YANDEX_MCP_LOGIN", "new@yandex.ru")
+    profile = load_profile()
+    assert profile.login == "new@yandex.ru"
+    assert profile.caldav_url == "https://c.example", "the rest of the file was lost"
+
+
+def test_a_blank_login_variable_is_ignored(monkeypatch):
+    """An optional extension field left blank arrives as an empty string."""
+    write_profile(Profile(name="default", login="me@yandex.ru"))
+    monkeypatch.setenv("YANDEX_MCP_LOGIN", "  ")
+    assert load_profile().login == "me@yandex.ru"
