@@ -231,7 +231,9 @@ def test_a_login_from_the_environment_needs_no_config_file(monkeypatch):
 
 
 def test_a_login_from_the_environment_wins_over_the_file(monkeypatch):
-    write_profile(Profile(name="default", login="old@yandex.ru", caldav_url="https://c.example"))
+    write_profile(
+        Profile(name="default", login="old@yandex.ru", caldav_url="https://c.example")
+    )
     monkeypatch.setenv("YANDEX_MCP_LOGIN", "new@yandex.ru")
     profile = load_profile()
     assert profile.login == "new@yandex.ru"
